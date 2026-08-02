@@ -6,18 +6,6 @@ use crate::layout::PaneId;
 
 use super::responses::{encode_error, encode_success};
 
-/// Placeholder PTY child for a Browser pane's structural slot -- herdr has
-/// no non-PTY pane kind (see plan notes), so every pane needs some PTY
-/// child. `agent-browser`'s daemon detaches via `setsid()` and can't be
-/// this child (see `crate::browser::daemon` docs), so a Browser pane's
-/// actual PTY child is an idle placeholder instead, matching the pattern
-/// `portable-pty`'s own tests use for a do-nothing child
-/// (`src/pty/backend/unix.rs`). Keyboard input isn't routed away from the
-/// PTY yet (MVP scope), so typed keys currently reach this placeholder and
-/// get echoed back into the pane's terminal grid; deferred to the keyboard
-/// input-routing phase.
-const BROWSER_PANE_PLACEHOLDER_ARGV: &[&str] = &["cat"];
-
 /// Owner token this module registers in `AppState.pane_graphics_streams` so
 /// a live Browser-pane screencast can't be stomped by an unrelated external
 /// `pane.graphics.set`/`pane.graphics.stream.*` call against the same pane,
@@ -58,7 +46,7 @@ impl App {
     /// match them once the handle is gone.
     fn retire_browser_pane(&mut self, pane_id: PaneId) {
         self.browser_actors.remove(&pane_id);
-        self.state.browser_panes.remove(&pane_id);
+        self.state.demote_browser_pane(pane_id);
         self.state
             .browser_pane_shutdowns
             .retain(|queued| *queued != pane_id);
@@ -76,7 +64,7 @@ impl App {
     /// Stopping by derived session name means no extra runtime state is
     /// needed, and it stays correct for panes whose actor already exited.
     pub(crate) fn stop_all_browser_sessions(&mut self) {
-        let pane_ids: Vec<PaneId> = self.state.browser_panes.iter().copied().collect();
+        let pane_ids = self.state.browser_pane_ids();
         for pane_id in pane_ids {
             self.retire_browser_pane(pane_id);
             crate::browser::daemon::stop(&crate::browser::daemon::session_name(pane_id));
@@ -121,49 +109,28 @@ impl App {
                 format!("pane {target_pane_id} not found"),
             );
         };
-        let (rows, cols) = self.state.estimate_pane_size();
-        let argv: Vec<String> = BROWSER_PANE_PLACEHOLDER_ARGV
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
         };
-        let result = ws.split_pane_argv_command_with_ratio(
-            target_pane,
-            Direction::Horizontal,
-            0.5,
-            rows.max(4),
-            cols.max(10),
-            None,
-            &argv,
-            Vec::new(),
-            self.state.pane_scrollback_limit_bytes,
-            self.state.host_terminal_theme,
-            true,
-        );
-        let (tab_idx, new_pane) = match result {
-            Some(Ok(result)) => result,
-            Some(Err(err)) => return encode_error(id, "browser_pane_open_failed", err.to_string()),
-            None => {
-                return encode_error(
-                    id,
-                    "pane_not_found",
-                    format!("pane {target_pane_id} not found"),
-                )
-            }
+        let Some((tab_idx, new_pane)) =
+            ws.split_pane_browser(target_pane, Direction::Horizontal, Some(0.5), None, true)
+        else {
+            return encode_error(
+                id,
+                "pane_not_found",
+                format!("pane {target_pane_id} not found"),
+            );
         };
         let pane_id = new_pane.pane_id;
 
-        // Attach the split pane's terminal/runtime before anything else can
-        // fail, so every later failure path has a fully formed pane to hand
-        // to `rollback_browser_pane` instead of leaving a pane in the layout
-        // with no `AppState.terminals` entry.
+        // Register the pane's terminal record before anything else can fail,
+        // so every later failure path has a fully formed pane to hand to
+        // `rollback_browser_pane` instead of leaving a pane in the layout
+        // with no `AppState.terminals` entry. No runtime is inserted: a
+        // Browser pane has no PTY child (see `Tab::split_focused_browser`).
         let mut terminal = new_pane.terminal;
         terminal.set_manual_label("browser".to_string());
         let terminal_id = terminal.id.clone();
-        self.terminal_runtimes
-            .insert(terminal_id.clone(), new_pane.runtime);
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
         self.state.terminals.insert(terminal_id, terminal);
 
@@ -185,7 +152,6 @@ impl App {
             let _ = command_tx.send(crate::browser::BrowserCommand::Navigate(url));
         }
         self.browser_actors.insert(pane_id, command_tx);
-        self.state.browser_panes.insert(pane_id);
         self.state
             .pane_graphics_streams
             .insert(pane_id, BROWSER_STREAM_OWNER.to_string());
@@ -279,7 +245,17 @@ mod tests {
     fn app_with_browser_pane() -> (App, PaneId, std::sync::mpsc::Receiver<BrowserCommand>) {
         let mut app = test_app();
         let mut ws = Workspace::test_new("test");
-        let pane_id = ws.test_split(Direction::Horizontal);
+        let pane_id = ws
+            .split_pane_browser(
+                ws.tabs[0].root_pane,
+                Direction::Horizontal,
+                Some(0.5),
+                None,
+                true,
+            )
+            .expect("split browser pane")
+            .1
+            .pane_id;
         let terminal_ids: Vec<_> = ws.tabs[0]
             .panes
             .values()
@@ -296,7 +272,6 @@ mod tests {
 
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         app.browser_actors.insert(pane_id, command_tx);
-        app.state.browser_panes.insert(pane_id);
         app.state
             .pane_graphics_streams
             .insert(pane_id, BROWSER_STREAM_OWNER.to_string());
@@ -336,7 +311,7 @@ mod tests {
         let error: crate::api::schema::ErrorResponse =
             serde_json::from_str(&response).expect("error response");
         assert_eq!(error.error.code, "feature_disabled");
-        assert!(app.state.browser_panes.is_empty());
+        assert!(app.state.browser_pane_ids().is_empty());
         assert!(app.browser_actors.is_empty());
     }
 
@@ -351,7 +326,7 @@ mod tests {
 
         // Without this the pane keeps swallowing mouse input in
         // `forward_pane_mouse_button` and queuing clicks for a dead actor.
-        assert!(!app.state.browser_panes.contains(&pane_id));
+        assert!(!app.state.is_browser_pane(pane_id));
         assert!(!app.browser_actors.contains_key(&pane_id));
         assert!(app.state.browser_pointer_events.is_empty());
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
@@ -378,7 +353,7 @@ mod tests {
 
         assert!(app.find_pane(pane_id).is_none());
         assert!(!app.state.terminals.contains_key(&terminal_id));
-        assert!(!app.state.browser_panes.contains(&pane_id));
+        assert!(!app.state.is_browser_pane(pane_id));
         assert!(!app.browser_actors.contains_key(&pane_id));
         assert!(!app.state.pane_graphics_streams.contains_key(&pane_id));
         assert!(app.state.browser_pane_shutdowns.is_empty());

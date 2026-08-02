@@ -24,6 +24,13 @@ pub struct NewPane {
     pub runtime: TerminalRuntime,
 }
 
+/// A freshly split Browser pane. No `runtime` field: Browser panes have no
+/// PTY child (see [`Tab::split_focused_browser`]).
+pub struct NewBrowserPane {
+    pub pane_id: PaneId,
+    pub terminal: TerminalState,
+}
+
 enum SplitCommand<'a> {
     Shell {
         command: &'a str,
@@ -417,6 +424,37 @@ impl Tab {
             terminal,
             runtime,
         })
+    }
+
+    /// Splits off a Browser pane: layout slot, `PaneState`, and a
+    /// `TerminalState` for identity, but no PTY child and no
+    /// `TerminalRuntime`. Every runtime lookup for this pane is a graceful
+    /// `None` (see `src/ui/panes.rs`), which is what keeps the pane's grid
+    /// empty under its graphics overlay and means no process can exit and
+    /// take the pane with it.
+    ///
+    /// Infallible, unlike the PTY splits: there is nothing to spawn.
+    pub fn split_focused_browser(
+        &mut self,
+        direction: Direction,
+        ratio: Option<f32>,
+        cwd: Option<PathBuf>,
+    ) -> NewBrowserPane {
+        let new_id = match ratio {
+            Some(ratio) => self.layout.split_focused_with_ratio(direction, ratio),
+            None => self.layout.split_focused(direction),
+        };
+        let actual_cwd =
+            cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
+        let terminal_id = TerminalId::alloc();
+        let terminal = TerminalState::new(terminal_id.clone(), actual_cwd);
+        self.panes
+            .insert(new_id, PaneState::new_browser(terminal_id));
+        self.zoomed = false;
+        NewBrowserPane {
+            pane_id: new_id,
+            terminal,
+        }
     }
 
     #[cfg(test)]

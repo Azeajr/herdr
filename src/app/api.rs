@@ -3,6 +3,9 @@ use std::time::{Duration, Instant};
 mod agent_view;
 mod agents;
 mod browser;
+// Only `AppState::assert_invariants_for_test` needs this outside the module.
+#[cfg(test)]
+pub(crate) use browser::BROWSER_STREAM_OWNER;
 mod env;
 mod integrations;
 mod layouts;

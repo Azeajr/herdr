@@ -1610,6 +1610,46 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Whether `pane_id` is a Browser pane, in any workspace.
+    ///
+    /// `PaneState.kind` is the single source of truth (see
+    /// `crate::pane::PaneKind`), so this scans rather than consulting a
+    /// parallel id set that could drift out of sync with splits, moves,
+    /// snapshots, and restore.
+    pub(crate) fn is_browser_pane(&self, pane_id: PaneId) -> bool {
+        self.workspaces
+            .iter()
+            .any(|ws| ws.pane_state(pane_id).is_some_and(|pane| pane.is_browser()))
+    }
+
+    /// Turns `pane_id` back into an ordinary Terminal pane.
+    ///
+    /// Used when its `agent-browser` session is gone: the pane survives (it
+    /// is still in the layout and still has a `TerminalState`), but it must
+    /// stop claiming to be a Browser pane so input routing, copy mode, and
+    /// agent detection stop treating it specially. It has no runtime, so
+    /// what remains is an inert empty pane the user can close.
+    pub(crate) fn demote_browser_pane(&mut self, pane_id: PaneId) {
+        for ws in &mut self.workspaces {
+            for tab in &mut ws.tabs {
+                if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                    pane.kind = crate::pane::PaneKind::Terminal;
+                }
+            }
+        }
+    }
+
+    /// Every live Browser pane id, in workspace order.
+    pub(crate) fn browser_pane_ids(&self) -> Vec<PaneId> {
+        self.workspaces
+            .iter()
+            .flat_map(|ws| ws.tabs.iter())
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|(_, pane)| pane.is_browser())
+            .map(|(pane_id, _)| *pane_id)
+            .collect()
+    }
+
     pub(crate) fn terminal_id_for_pane(
         &self,
         ws_idx: usize,
@@ -1659,9 +1699,11 @@ impl AppState {
             self.plugin_panes.remove(&pane_id);
             self.pane_graphics_layers.remove(&pane_id);
             self.pane_graphics_streams.remove(&pane_id);
-            if self.browser_panes.remove(&pane_id) {
-                self.browser_pane_shutdowns.push(pane_id);
-            }
+            // Queued unconditionally: this runs after the pane has already
+            // left the layout, so its `PaneState.kind` is no longer readable.
+            // `App.browser_actors` is the filter -- removing a pane id that
+            // never had an actor is a no-op.
+            self.browser_pane_shutdowns.push(pane_id);
         }
     }
 

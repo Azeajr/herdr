@@ -1661,7 +1661,7 @@ impl AppState {
         info: &PaneInfo,
         mouse: MouseEvent,
     ) -> bool {
-        if self.browser_panes.contains(&info.id) {
+        if self.is_browser_pane(info.id) {
             // Only clicks are routed for MVP -- Up/Drag are ignored and
             // motion isn't routed at all (see `forward_pane_mouse_motion`)
             // to avoid a subprocess call per continuous mouse-move event.
@@ -1704,7 +1704,7 @@ impl AppState {
         info: &PaneInfo,
         mouse: MouseEvent,
     ) -> bool {
-        if self.browser_panes.contains(&info.id) {
+        if self.is_browser_pane(info.id) {
             // Not routed to the browser (MVP scope, see
             // `forward_pane_mouse_button`) -- just don't forward as PTY
             // mouse-report bytes to the placeholder pane process.

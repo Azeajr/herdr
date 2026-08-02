@@ -524,7 +524,6 @@ impl App {
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
-            browser_panes: std::collections::HashSet::new(),
             browser_pane_shutdowns: Vec::new(),
             browser_pointer_events: Vec::new(),
             pane_id_aliases: std::collections::HashMap::new(),

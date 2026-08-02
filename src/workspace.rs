@@ -922,6 +922,32 @@ impl Workspace {
         Some(Ok((tab_idx, new_pane)))
     }
 
+    /// Splits a Browser pane off `pane_id`. Mirrors
+    /// [`Self::split_pane_with_runtime`]'s focus and public-numbering
+    /// bookkeeping, but cannot fail because nothing is spawned.
+    ///
+    /// Returns `None` only when `pane_id` is not in this workspace.
+    pub fn split_pane_browser(
+        &mut self,
+        pane_id: PaneId,
+        direction: Direction,
+        ratio: Option<f32>,
+        cwd: Option<PathBuf>,
+        focus_new_pane: bool,
+    ) -> Option<(usize, crate::workspace::tab::NewBrowserPane)> {
+        let tab_idx = self.find_tab_index_for_pane(pane_id)?;
+        let pane_number = self.next_public_pane_number;
+        let tab = &mut self.tabs[tab_idx];
+        let previous_focus = tab.layout.focused();
+        tab.layout.focus_pane(pane_id);
+        let new_pane = tab.split_focused_browser(direction, ratio, cwd);
+        if !focus_new_pane {
+            tab.layout.focus_pane(previous_focus);
+        }
+        self.register_new_pane_with_number(new_pane.pane_id, pane_number);
+        Some((tab_idx, new_pane))
+    }
+
     /// Close the focused pane. Returns true if the workspace should close.
     #[cfg(test)]
     pub fn close_focused(&mut self) -> bool {

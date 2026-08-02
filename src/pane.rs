@@ -46,7 +46,7 @@ pub(crate) use self::terminal::{
     TerminalTextPoint, TerminalWordMotion,
 };
 pub use self::{
-    state::PaneState,
+    state::{PaneKind, PaneState},
     terminal::{InputState, ScrollMetrics, TerminalCursorState},
 };
 

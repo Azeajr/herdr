@@ -61,7 +61,7 @@ impl AppState {
     /// `pane_id` is not a live browser pane or the PNG couldn't be decoded,
     /// so callers know whether a render wake-up is warranted.
     pub(crate) fn apply_browser_frame(&mut self, pane_id: PaneId, data: Vec<u8>) -> bool {
-        if !self.browser_panes.contains(&pane_id) {
+        if !self.is_browser_pane(pane_id) {
             return false;
         }
         let Some((width, height)) = png_dimensions(&data) else {
@@ -1593,12 +1593,6 @@ pub struct AppState {
     pub(crate) installed_plugins: InstalledPluginRegistry,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
-    /// Pane ids that are live Browser panes. Pure marker only -- the
-    /// runtime actor handle lives on `App.browser_actors`, not here (see
-    /// `crate::browser::BrowserActorHandle`); the session name is derived
-    /// from the pane id via `crate::browser::daemon::session_name` rather
-    /// than duplicated into this set.
-    pub(crate) browser_panes: std::collections::HashSet<PaneId>,
     /// Browser pane ids queued for `App.browser_actors` teardown, drained
     /// alongside `terminal_runtime_shutdowns` in
     /// `App::shutdown_detached_terminal_runtimes`.
@@ -1972,7 +1966,6 @@ impl AppState {
             integration_install_messages: Vec::new(),
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
-            browser_panes: std::collections::HashSet::new(),
             browser_pane_shutdowns: Vec::new(),
             browser_pointer_events: Vec::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
@@ -2225,8 +2218,25 @@ impl AppState {
         for &pane_id in self.plugin_panes.keys() {
             assert_live_pane(pane_id, "plugin pane record");
         }
-        for &pane_id in &self.browser_panes {
-            assert_live_pane(pane_id, "browser pane record");
+        // Browser-pane identity lives on `PaneState.kind`, so it cannot
+        // outlive its pane. What can drift is the graphics reservation taken
+        // out in its name.
+        for (&pane_id, owner) in &self.pane_graphics_streams {
+            if owner == crate::app::api::BROWSER_STREAM_OWNER {
+                assert_live_pane(pane_id, "browser graphics stream");
+                assert!(
+                    self.is_browser_pane(pane_id),
+                    "pane {pane_id:?} holds a browser graphics stream but is not a browser pane"
+                );
+            }
+        }
+        for &pane_id in &self
+            .browser_pointer_events
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>()
+        {
+            assert_live_pane(pane_id, "queued browser pointer event");
         }
         if let Some(copy_mode) = &self.copy_mode {
             assert_live_pane(copy_mode.pane_id, "copy mode");
