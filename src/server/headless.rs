@@ -4471,6 +4471,10 @@ impl HeadlessServer {
             std::thread::sleep(Duration::from_millis(50));
         }
 
+        // Stop detached agent-browser daemons before the process exits, since
+        // their actor threads will not survive long enough to do it.
+        self.app.stop_all_browser_sessions();
+
         // Drain remaining API requests with server_unavailable.
         self.drain_api_requests_with_shutdown_check();
 

@@ -30,14 +30,32 @@ pub(crate) struct Response {
 #[derive(Debug)]
 pub(crate) enum CallError {
     Spawn(std::io::Error),
-    Decode(serde_json::Error),
+    /// `agent-browser` produced something other than its `{success,data,error}`
+    /// JSON envelope. Carries the exit status and stderr because the common
+    /// case -- a non-zero exit with empty stdout -- otherwise surfaces only as
+    /// an opaque "EOF while parsing a value" from serde.
+    Decode {
+        status: std::process::ExitStatus,
+        stderr: String,
+        source: serde_json::Error,
+    },
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Spawn(err) => write!(f, "failed to run {BINARY}: {err}"),
-            CallError::Decode(err) => write!(f, "failed to decode {BINARY} output: {err}"),
+            CallError::Decode {
+                status,
+                stderr,
+                source,
+            } => {
+                write!(f, "failed to decode {BINARY} output ({status}): {source}")?;
+                if !stderr.is_empty() {
+                    write!(f, "; stderr: {stderr}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -61,7 +79,11 @@ pub(crate) fn call(
         .args(action_args)
         .output()
         .map_err(CallError::Spawn)?;
-    serde_json::from_slice(&output.stdout).map_err(CallError::Decode)
+    serde_json::from_slice(&output.stdout).map_err(|source| CallError::Decode {
+        status: output.status,
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        source,
+    })
 }
 
 /// Reusable per-session screenshot path so polling doesn't create garbage

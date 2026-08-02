@@ -50,7 +50,10 @@ fn browser_navigate(args: &[String]) -> std::io::Result<i32> {
     }
     let pane_id = super::normalize_pane_id(&args[0]);
     let url = args[1].clone();
-    super::send_ok_request(Method::BrowserNavigate(BrowserNavigateParams { pane_id, url }))
+    super::send_ok_request(Method::BrowserNavigate(BrowserNavigateParams {
+        pane_id,
+        url,
+    }))
 }
 
 fn print_browser_help() {

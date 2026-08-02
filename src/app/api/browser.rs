@@ -37,14 +37,66 @@ impl App {
         }
     }
 
-    /// Handles `AppEvent::BrowserDaemonExited`: clears the pane's graphics
-    /// layer/stream reservation. The pane itself (and its placeholder PTY
-    /// child) is left alone -- only the browser session died, not the pane.
+    /// Handles `AppEvent::BrowserDaemonExited`: retires the pane's Browser
+    /// records so it stops behaving like a Browser pane. The pane itself (and
+    /// its placeholder PTY child) is left alone -- only the browser session
+    /// died, not the pane -- but it must stop being a Browser pane, otherwise
+    /// `forward_pane_mouse_button`/`forward_pane_mouse_motion`
+    /// (`src/app/input/mouse.rs`) keep swallowing its mouse input and queuing
+    /// pointer commands for an actor that is no longer running.
     pub(crate) fn handle_browser_daemon_exited(&mut self, pane_id: PaneId, reason: String) {
         tracing::warn!(pane_id = pane_id.raw(), %reason, "browser pane: agent-browser session exited");
-        self.state.clear_browser_frame(pane_id);
+        self.retire_browser_pane(pane_id);
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
+    }
+
+    /// Drops every Browser-pane record for `pane_id` without touching the
+    /// pane itself. Dropping the actor handle is the actor thread's shutdown
+    /// signal (see `crate::browser::BrowserActorHandle`); the queued shutdown
+    /// and pointer entries are dropped here because nothing else would ever
+    /// match them once the handle is gone.
+    fn retire_browser_pane(&mut self, pane_id: PaneId) {
+        self.browser_actors.remove(&pane_id);
+        self.state.browser_panes.remove(&pane_id);
+        self.state
+            .browser_pane_shutdowns
+            .retain(|queued| *queued != pane_id);
+        self.state
+            .browser_pointer_events
+            .retain(|(queued, _)| *queued != pane_id);
+        self.state.clear_browser_frame(pane_id);
+    }
+
+    /// Stops every live Browser pane's `agent-browser` session. Called on
+    /// server shutdown: the actor threads stop their own session when their
+    /// sender drops, but process exit kills them before they get to run, so
+    /// without this each herdr shutdown leaks a detached browser daemon (see
+    /// `crate::browser::daemon`, which documents the `setsid()` detach).
+    /// Stopping by derived session name means no extra runtime state is
+    /// needed, and it stays correct for panes whose actor already exited.
+    pub(crate) fn stop_all_browser_sessions(&mut self) {
+        let pane_ids: Vec<PaneId> = self.state.browser_panes.iter().copied().collect();
+        for pane_id in pane_ids {
+            self.retire_browser_pane(pane_id);
+            crate::browser::daemon::stop(&crate::browser::daemon::session_name(pane_id));
+        }
+    }
+
+    /// Undoes a partially opened Browser pane after a failure in
+    /// [`App::handle_browser_open`], so a failed open never leaves a pane in
+    /// the workspace layout whose terminal/runtime records are missing.
+    fn rollback_browser_pane(&mut self, ws_idx: usize, pane_id: PaneId) {
+        self.retire_browser_pane(pane_id);
+        let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        if let Some(ws) = self.state.workspaces.get_mut(ws_idx) {
+            // Can't close the workspace: this pane was just split off an
+            // existing sibling, so the tab always keeps at least one pane.
+            ws.close_pane(pane_id);
+        }
+        self.state.remove_plugin_pane_records([pane_id]);
+        self.state.remove_unattached_terminal_ids(terminal_id);
+        self.shutdown_detached_terminal_runtimes();
     }
 
     pub(super) fn handle_browser_open(&mut self, id: String, params: BrowserOpenParams) -> String {
@@ -96,6 +148,18 @@ impl App {
         };
         let pane_id = new_pane.pane_id;
 
+        // Attach the split pane's terminal/runtime before anything else can
+        // fail, so every later failure path has a fully formed pane to hand
+        // to `rollback_browser_pane` instead of leaving a pane in the layout
+        // with no `AppState.terminals` entry.
+        let mut terminal = new_pane.terminal;
+        terminal.set_manual_label("browser".to_string());
+        let terminal_id = terminal.id.clone();
+        self.terminal_runtimes
+            .insert(terminal_id.clone(), new_pane.runtime);
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        self.state.terminals.insert(terminal_id, terminal);
+
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let session = crate::browser::daemon::session_name(pane_id);
         let events = self.event_tx.clone();
@@ -103,6 +167,7 @@ impl App {
             .name(format!("browser-{}", pane_id.raw()))
             .spawn(move || crate::browser::actor::run(pane_id, session, command_rx, events));
         if let Err(err) = thread_result {
+            self.rollback_browser_pane(ws_idx, pane_id);
             return encode_error(
                 id,
                 "browser_pane_open_failed",
@@ -113,14 +178,6 @@ impl App {
             let _ = command_tx.send(crate::browser::BrowserCommand::Navigate(url));
         }
         self.browser_actors.insert(pane_id, command_tx);
-
-        let mut terminal = new_pane.terminal;
-        terminal.set_manual_label("browser".to_string());
-        let terminal_id = terminal.id.clone();
-        self.terminal_runtimes
-            .insert(terminal_id.clone(), new_pane.runtime);
-        self.state.remove_alias_shadowed_by_new_pane(pane_id);
-        self.state.terminals.insert(terminal_id, terminal);
         self.state.browser_panes.insert(pane_id);
         self.state
             .pane_graphics_streams
@@ -134,6 +191,7 @@ impl App {
 
         self.schedule_session_save();
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
+            self.rollback_browser_pane(ws_idx, pane_id);
             return encode_error(id, "browser_pane_open_failed", "browser pane disappeared");
         };
         self.emit_event(crate::api::schema::EventEnvelope {
@@ -168,7 +226,11 @@ impl App {
         params: crate::api::schema::BrowserNavigateParams,
     ) -> String {
         let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return encode_error(id, "pane_not_found", format!("pane {} not found", params.pane_id));
+            return encode_error(
+                id,
+                "pane_not_found",
+                format!("pane {} not found", params.pane_id),
+            );
         };
         let Some(commands) = self.browser_actors.get(&pane_id) else {
             return encode_error(id, "not_browser_pane", "pane is not a Browser pane");
@@ -177,8 +239,120 @@ impl App {
             .send(crate::browser::BrowserCommand::Navigate(params.url))
             .is_err()
         {
-            return encode_error(id, "browser_pane_gone", "browser pane actor is no longer running");
+            return encode_error(
+                id,
+                "browser_pane_gone",
+                "browser pane actor is no longer running",
+            );
         }
         encode_success(id, ResponseResult::Ok {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::browser::BrowserCommand;
+    use crate::workspace::Workspace;
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    /// Adds a second pane to a fresh workspace and registers it as a Browser
+    /// pane, returning the pane and the receiver that keeps its actor channel
+    /// alive so `browser_actors` holds a live sender.
+    fn app_with_browser_pane() -> (App, PaneId, std::sync::mpsc::Receiver<BrowserCommand>) {
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.test_split(Direction::Horizontal);
+        let terminal_ids: Vec<_> = ws.tabs[0]
+            .panes
+            .values()
+            .map(|pane| pane.attached_terminal_id.clone())
+            .collect();
+        app.state.workspaces.push(ws);
+        app.state.active = Some(0);
+        for terminal_id in terminal_ids {
+            app.state.terminals.insert(
+                terminal_id.clone(),
+                crate::terminal::TerminalState::new(terminal_id, "/tmp".into()),
+            );
+        }
+
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        app.browser_actors.insert(pane_id, command_tx);
+        app.state.browser_panes.insert(pane_id);
+        app.state
+            .pane_graphics_streams
+            .insert(pane_id, BROWSER_STREAM_OWNER.to_string());
+        app.state.pane_graphics_layers.insert(
+            pane_id,
+            crate::app::state::PaneGraphicsLayer::new(
+                crate::api::schema::PaneGraphicsFormat::Png,
+                4,
+                4,
+                vec![0u8; 8],
+                crate::api::schema::PaneGraphicsPlacementParams {
+                    viewport_col: 0,
+                    viewport_row: 0,
+                    grid_cols: 0,
+                    grid_rows: 0,
+                },
+            ),
+        );
+        (app, pane_id, command_rx)
+    }
+
+    #[test]
+    fn browser_daemon_exit_stops_the_pane_behaving_like_a_browser_pane() {
+        let (mut app, pane_id, command_rx) = app_with_browser_pane();
+        app.state
+            .browser_pointer_events
+            .push((pane_id, BrowserCommand::Click { x: 1, y: 2 }));
+
+        app.handle_browser_daemon_exited(pane_id, "session died".to_string());
+
+        // Without this the pane keeps swallowing mouse input in
+        // `forward_pane_mouse_button` and queuing clicks for a dead actor.
+        assert!(!app.state.browser_panes.contains(&pane_id));
+        assert!(!app.browser_actors.contains_key(&pane_id));
+        assert!(app.state.browser_pointer_events.is_empty());
+        assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
+        assert!(!app.state.pane_graphics_streams.contains_key(&pane_id));
+        // Dropping the sender is the actor's shutdown signal.
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        // The pane itself survives -- only the browser session died.
+        assert!(app.find_pane(pane_id).is_some());
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn browser_pane_rollback_removes_the_pane_and_its_terminal() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        let terminal_id = app
+            .state
+            .terminal_id_for_pane(0, pane_id)
+            .expect("browser pane terminal");
+
+        app.rollback_browser_pane(0, pane_id);
+
+        assert!(app.find_pane(pane_id).is_none());
+        assert!(!app.state.terminals.contains_key(&terminal_id));
+        assert!(!app.state.browser_panes.contains(&pane_id));
+        assert!(!app.browser_actors.contains_key(&pane_id));
+        assert!(!app.state.pane_graphics_streams.contains_key(&pane_id));
+        assert!(app.state.browser_pane_shutdowns.is_empty());
+        app.state.assert_invariants_for_test();
     }
 }

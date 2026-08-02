@@ -14,21 +14,28 @@ pub(crate) fn session_name(pane_id: PaneId) -> String {
     format!("herdr-browser-{}", pane_id.raw())
 }
 
-fn ok_or_err(action: &str, result: Result<client::Response, CallError>) -> Result<client::Response, String> {
+fn ok_or_err(
+    action: &str,
+    result: Result<client::Response, CallError>,
+) -> Result<client::Response, String> {
     match result {
         Ok(response) if response.success => Ok(response),
-        Ok(response) => Err(response
-            .error
-            .unwrap_or_else(|| format!("{action} failed"))),
+        Ok(response) => Err(response.error.unwrap_or_else(|| format!("{action} failed"))),
         Err(err) => Err(err.to_string()),
     }
 }
 
-/// Launches the browser for this session (stays on `about:blank`).
+/// Launches the browser for this session (stays on `about:blank`). `open`'s
+/// URL argument is optional; called bare it only launches. Verified against
+/// agent-browser 0.33.1.
 pub(crate) fn open(session: &str) -> Result<(), String> {
     ok_or_err("open", client::call(session, &[], &["open"])).map(|_| ())
 }
 
+/// `goto` is an undocumented alias for `open <url>` -- it does not appear in
+/// `agent-browser --help`, but it navigates an already-launched session
+/// without the launch semantics of `open`. Verified against agent-browser
+/// 0.33.1; if a future release drops it, switch to `open <url>`.
 pub(crate) fn navigate(session: &str, url: &str) -> Result<(), String> {
     ok_or_err("navigate", client::call(session, &[], &["goto", url])).map(|_| ())
 }
@@ -52,6 +59,10 @@ pub(crate) fn mouse_button(session: &str, down: bool) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// The CLI signature is `mouse wheel <dy> [dx]` -- vertical delta first, the
+/// opposite of this function's argument order and of `mouse move <x> <y>`.
+/// Verified against agent-browser 0.33.1: `mouse wheel 120 0` reports
+/// `{"deltaX":0,"deltaY":120}`.
 pub(crate) fn wheel(session: &str, delta_x: i32, delta_y: i32) -> Result<(), String> {
     let dx = delta_x.to_string();
     let dy = delta_y.to_string();

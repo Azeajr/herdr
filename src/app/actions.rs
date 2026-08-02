@@ -2719,14 +2719,11 @@ impl AppState {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
-            AppEvent::BrowserFrame { pane_id, data } => {
-                self.apply_browser_frame(pane_id, data);
-                Vec::new()
-            }
-            AppEvent::BrowserDaemonExited { pane_id, .. } => {
-                self.clear_browser_frame(pane_id);
-                Vec::new()
-            }
+            // Both intercepted before this dispatch in App::handle_internal_event
+            // (`src/app/api.rs`), which needs `App.browser_actors` -- a runtime
+            // handle AppState can't reach. Kept for AppEvent exhaustiveness.
+            AppEvent::BrowserFrame { .. } => Vec::new(),
+            AppEvent::BrowserDaemonExited { .. } => Vec::new(),
             AppEvent::UpdateReady {
                 version,
                 install_command,

@@ -8,6 +8,15 @@
 //! relative to its own `src/browser`-equivalent primitives. This module only
 //! owns the browser-session subsystem itself: the per-pane background actor
 //! thread and its `agent-browser` client.
+//!
+//! Known gap -- Browser panes are runtime-only and are not persisted. Nothing
+//! in `src/persist/` records that a pane was a Browser pane, so a saved
+//! session restores it as an ordinary shell pane that still carries the
+//! `"browser"` manual label set in `src/app/api/browser.rs`. Its
+//! `agent-browser` session is not restored; it is stopped at shutdown by
+//! `App::stop_all_browser_sessions`. Closing that gap means adding a marker
+//! to `PaneSnapshot` and respawning the actor during restore, which touches
+//! persisted state and the restore/handoff path.
 
 pub(crate) mod actor;
 pub(crate) mod client;
@@ -19,19 +28,28 @@ pub(crate) enum BrowserCommand {
     Navigate(String),
     /// Pixel-coordinate click (move + mousedown + mouseup), for manual
     /// mouse input routed from `src/app/input/mouse.rs`.
-    Click { x: i32, y: i32 },
+    Click {
+        x: i32,
+        y: i32,
+    },
     /// Not yet sent by any caller (MVP only routes clicks, not continuous
     /// motion -- see `forward_pane_mouse_button`'s doc comment). Kept as
     /// part of the actor's command surface since `daemon::mouse_move`
     /// already exists and this is the obvious next input to wire up.
     #[allow(dead_code)]
-    MouseMove { x: i32, y: i32 },
+    MouseMove {
+        x: i32,
+        y: i32,
+    },
     /// Not yet sent by any caller -- scroll routing depends on each pane's
     /// `wheel_routing` mode (`src/app/input/mouse.rs`'s
     /// `forward_pane_reported_wheel`), which needs more design than MVP
     /// scope covers to wire correctly. `daemon::wheel` is ready for it.
     #[allow(dead_code)]
-    Scroll { delta_x: i32, delta_y: i32 },
+    Scroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
 }
 
 /// Runtime handle for one Browser pane's actor thread, the Browser-pane
