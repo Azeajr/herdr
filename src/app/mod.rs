@@ -96,6 +96,11 @@ impl PaneClickState {
 pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
+    /// Runtime handles for Browser panes' actor threads, keyed by pane id.
+    /// Parallels `terminal_runtimes`: `AppState.browser_panes` holds the
+    /// pure-data marker, this holds the live command-channel handle.
+    pub(crate) browser_actors:
+        std::collections::HashMap<crate::layout::PaneId, crate::browser::BrowserActorHandle>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -519,6 +524,9 @@ impl App {
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
+            browser_panes: std::collections::HashSet::new(),
+            browser_pane_shutdowns: Vec::new(),
+            browser_pointer_events: Vec::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
@@ -725,6 +733,7 @@ impl App {
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
+            browser_actors: std::collections::HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

@@ -45,6 +45,12 @@ impl App {
         for terminal_id in terminal_ids {
             self.shutdown_terminal_runtime(terminal_id);
         }
+        // Dropping the sender is the Browser pane actor's shutdown signal
+        // (see `crate::browser::BrowserActorHandle`); it stops the
+        // `agent-browser` session itself before its thread exits.
+        for pane_id in std::mem::take(&mut self.state.browser_pane_shutdowns) {
+            self.browser_actors.remove(&pane_id);
+        }
     }
 
     pub(crate) fn drain_api_requests(&mut self) -> bool {

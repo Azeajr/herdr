@@ -373,6 +373,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabRename(_) => "tab.rename",
         Method::TabMove(_) => "tab.move",
         Method::TabClose(_) => "tab.close",
+        Method::BrowserOpen(_) => "browser.open",
+        Method::BrowserNavigate(_) => "browser.navigate",
         Method::AgentList(_) => "agent.list",
         Method::AgentGet(_) => "agent.get",
         Method::AgentRead(_) => "agent.read",

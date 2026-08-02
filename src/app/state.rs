@@ -55,6 +55,51 @@ fn pane_graphics_data_fingerprint(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+impl AppState {
+    /// Applies a Browser pane's polled PNG screenshot frame as its graphics
+    /// overlay (see `crate::app::api::browser`). Returns `false` if
+    /// `pane_id` is not a live browser pane or the PNG couldn't be decoded,
+    /// so callers know whether a render wake-up is warranted.
+    pub(crate) fn apply_browser_frame(&mut self, pane_id: PaneId, data: Vec<u8>) -> bool {
+        if !self.browser_panes.contains(&pane_id) {
+            return false;
+        }
+        let Some((width, height)) = png_dimensions(&data) else {
+            return false;
+        };
+        let layer = PaneGraphicsLayer::new(
+            crate::api::schema::PaneGraphicsFormat::Png,
+            width,
+            height,
+            data,
+            crate::api::schema::PaneGraphicsPlacementParams {
+                viewport_col: 0,
+                viewport_row: 0,
+                grid_cols: 0,
+                grid_rows: 0,
+            },
+        );
+        self.pane_graphics_layers.insert(pane_id, layer);
+        self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+        true
+    }
+
+    /// Clears a Browser pane's graphics overlay/stream reservation (its
+    /// `agent-browser` session exited without the pane itself closing).
+    pub(crate) fn clear_browser_frame(&mut self, pane_id: PaneId) {
+        self.pane_graphics_layers.remove(&pane_id);
+        self.pane_graphics_streams.remove(&pane_id);
+        self.pane_graphics_revision = self.pane_graphics_revision.wrapping_add(1);
+    }
+}
+
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let reader = decoder.read_info().ok()?;
+    let info = reader.info();
+    Some((info.width, info.height))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PopupPaneState {
     pub pane_id: PaneId,
@@ -1548,6 +1593,23 @@ pub struct AppState {
     pub(crate) installed_plugins: InstalledPluginRegistry,
     /// Pane ids opened through the plugin pane API.
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
+    /// Pane ids that are live Browser panes. Pure marker only -- the
+    /// runtime actor handle lives on `App.browser_actors`, not here (see
+    /// `crate::browser::BrowserActorHandle`); the session name is derived
+    /// from the pane id via `crate::browser::daemon::session_name` rather
+    /// than duplicated into this set.
+    pub(crate) browser_panes: std::collections::HashSet<PaneId>,
+    /// Browser pane ids queued for `App.browser_actors` teardown, drained
+    /// alongside `terminal_runtime_shutdowns` in
+    /// `App::shutdown_detached_terminal_runtimes`.
+    pub(crate) browser_pane_shutdowns: Vec<PaneId>,
+    /// Pointer input destined for a Browser pane's `agent-browser` session,
+    /// queued here (pure data) by `forward_pane_mouse_button`
+    /// (`src/app/input/mouse.rs`, `impl AppState`, no runtime access) and
+    /// drained by `App::dispatch_browser_pointer_events`
+    /// (`src/app/api/browser.rs`), mirroring `request_clipboard_write`'s
+    /// queue-then-dispatch pattern.
+    pub(crate) browser_pointer_events: Vec<(PaneId, crate::browser::BrowserCommand)>,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, PaneGraphicsLayer>,
     /// Active streaming graphics owner token by pane id.
@@ -1910,6 +1972,9 @@ impl AppState {
             integration_install_messages: Vec::new(),
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
+            browser_panes: std::collections::HashSet::new(),
+            browser_pane_shutdowns: Vec::new(),
+            browser_pointer_events: Vec::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
@@ -2159,6 +2224,9 @@ impl AppState {
         }
         for &pane_id in self.plugin_panes.keys() {
             assert_live_pane(pane_id, "plugin pane record");
+        }
+        for &pane_id in &self.browser_panes {
+            assert_live_pane(pane_id, "browser pane record");
         }
         if let Some(copy_mode) = &self.copy_mode {
             assert_live_pane(copy_mode.pane_id, "copy mode");

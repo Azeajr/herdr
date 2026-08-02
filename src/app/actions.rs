@@ -1659,6 +1659,9 @@ impl AppState {
             self.plugin_panes.remove(&pane_id);
             self.pane_graphics_layers.remove(&pane_id);
             self.pane_graphics_streams.remove(&pane_id);
+            if self.browser_panes.remove(&pane_id) {
+                self.browser_pane_shutdowns.push(pane_id);
+            }
         }
     }
 
@@ -2714,6 +2717,14 @@ impl AppState {
         match event {
             AppEvent::PaneDied { pane_id } => {
                 self.handle_pane_died(pane_id);
+                Vec::new()
+            }
+            AppEvent::BrowserFrame { pane_id, data } => {
+                self.apply_browser_frame(pane_id, data);
+                Vec::new()
+            }
+            AppEvent::BrowserDaemonExited { pane_id, .. } => {
+                self.clear_browser_frame(pane_id);
                 Vec::new()
             }
             AppEvent::UpdateReady {

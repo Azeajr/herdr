@@ -1689,6 +1689,41 @@
           ],
           "type": "object"
         },
+        "BrowserNavigateParams": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "url"
+          ],
+          "type": "object"
+        },
+        "BrowserOpenParams": {
+          "description": "Opens a Browser pane split from `pane_id` (or the focused pane if\nomitted). MVP: no direction/ratio/focus controls yet -- always splits\nright of the target at a 0.5 ratio and focuses the new pane.",
+          "properties": {
+            "pane_id": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "ClientWindowTitleSetParams": {
           "properties": {
             "title": {
@@ -5334,6 +5369,38 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneRenameParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "browser.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "browser.navigate",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserNavigateParams"
             }
           },
           "required": [

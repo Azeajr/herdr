@@ -1656,11 +1656,29 @@ impl AppState {
     }
 
     pub(super) fn forward_pane_mouse_button(
-        &self,
+        &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         info: &PaneInfo,
         mouse: MouseEvent,
     ) -> bool {
+        if self.browser_panes.contains(&info.id) {
+            // Only clicks are routed for MVP -- Up/Drag are ignored and
+            // motion isn't routed at all (see `forward_pane_mouse_motion`)
+            // to avoid a subprocess call per continuous mouse-move event.
+            if let MouseEventKind::Down(_) = mouse.kind {
+                if let Some(layer) = self.pane_graphics_layers.get(&info.id) {
+                    let column = mouse.column.saturating_sub(info.inner_rect.x);
+                    let row = mouse.row.saturating_sub(info.inner_rect.y);
+                    let x = (f64::from(column) / f64::from(info.inner_rect.width.max(1))
+                        * f64::from(layer.image_width)) as i32;
+                    let y = (f64::from(row) / f64::from(info.inner_rect.height.max(1))
+                        * f64::from(layer.image_height)) as i32;
+                    self.browser_pointer_events
+                        .push((info.id, crate::browser::BrowserCommand::Click { x, y }));
+                }
+            }
+            return true;
+        }
         let Some(ws_idx) = self.active else {
             return false;
         };
@@ -1686,6 +1704,12 @@ impl AppState {
         info: &PaneInfo,
         mouse: MouseEvent,
     ) -> bool {
+        if self.browser_panes.contains(&info.id) {
+            // Not routed to the browser (MVP scope, see
+            // `forward_pane_mouse_button`) -- just don't forward as PTY
+            // mouse-report bytes to the placeholder pane process.
+            return true;
+        }
         let Some(ws_idx) = self.active else {
             return false;
         };

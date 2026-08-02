@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 mod agent_view;
 mod agents;
+mod browser;
 mod env;
 mod integrations;
 mod layouts;
@@ -128,6 +129,16 @@ impl App {
         } = ev
         {
             self.handle_git_status_refreshed(results, cache_updates);
+            return;
+        }
+
+        if let AppEvent::BrowserFrame { pane_id, data } = ev {
+            self.handle_browser_frame(pane_id, data);
+            return;
+        }
+
+        if let AppEvent::BrowserDaemonExited { pane_id, reason } = ev {
+            self.handle_browser_daemon_exited(pane_id, reason);
             return;
         }
 
@@ -1107,6 +1118,10 @@ impl App {
             }
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
+            }
+            Method::BrowserOpen(params) => return self.handle_browser_open(request.id, params),
+            Method::BrowserNavigate(params) => {
+                return self.handle_browser_navigate(request.id, params)
             }
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {

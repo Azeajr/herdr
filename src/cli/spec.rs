@@ -39,6 +39,7 @@ pub(super) fn command() -> Command {
         .subcommand(notification_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
+        .subcommand(browser_command())
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
@@ -448,6 +449,23 @@ pub(super) fn agent_kind_values() -> Vec<&'static str> {
         .into_iter()
         .map(crate::detect::agent_label)
         .collect()
+}
+
+fn browser_command() -> Command {
+    Command::new("browser")
+        .about("Control in-app Browser panes")
+        .subcommand(
+            Command::new("open")
+                .about("Split a Browser pane")
+                .arg(Arg::new("url").value_name("url").required(false))
+                .arg(option("pane", "PANE_ID")),
+        )
+        .subcommand(
+            Command::new("navigate")
+                .about("Navigate a Browser pane")
+                .arg(required("pane_id", "pane_id"))
+                .arg(required("url", "url")),
+        )
 }
 
 fn pane_command() -> Command {

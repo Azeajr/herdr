@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agents;
+pub mod browser;
 pub mod common;
 pub mod events;
 pub mod integrations;
@@ -14,6 +15,7 @@ pub mod workspaces;
 pub mod worktrees;
 
 pub use agents::*;
+pub use browser::*;
 pub use common::*;
 pub use events::*;
 pub use integrations::*;
@@ -163,6 +165,10 @@ pub enum Method {
     PaneFocus(PaneTarget),
     #[serde(rename = "pane.rename")]
     PaneRename(PaneRenameParams),
+    #[serde(rename = "browser.open")]
+    BrowserOpen(BrowserOpenParams),
+    #[serde(rename = "browser.navigate")]
+    BrowserNavigate(BrowserNavigateParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]

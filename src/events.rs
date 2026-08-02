@@ -56,6 +56,11 @@ pub struct WorktreeRemoveResult {
 pub enum AppEvent {
     /// A pane's child process exited.
     PaneDied { pane_id: PaneId },
+    /// A Browser pane's `agent-browser` session produced a new polled PNG
+    /// screenshot frame.
+    BrowserFrame { pane_id: PaneId, data: Vec<u8> },
+    /// A Browser pane's `agent-browser` session failed to start or exited.
+    BrowserDaemonExited { pane_id: PaneId, reason: String },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,
