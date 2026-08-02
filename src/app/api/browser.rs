@@ -100,6 +100,13 @@ impl App {
     }
 
     pub(super) fn handle_browser_open(&mut self, id: String, params: BrowserOpenParams) -> String {
+        // A Browser pane is drawn entirely through the pane graphics overlay,
+        // which `src/server/headless.rs` only encodes when this is enabled.
+        // Without the gate an open would silently launch a real browser and
+        // poll it forever while the pane stayed blank.
+        if let Err(response) = super::pane_graphics::require_pane_graphics_enabled(self, &id) {
+            return response;
+        }
         let target_pane_id = match params.pane_id {
             Some(pane_id) => pane_id,
             None => match self.current_public_browser_target_pane_id() {
@@ -309,6 +316,28 @@ mod tests {
             ),
         );
         (app, pane_id, command_rx)
+    }
+
+    #[test]
+    fn browser_open_requires_kitty_graphics() {
+        let mut app = test_app();
+        assert!(!app.state.kitty_graphics_enabled);
+
+        let response = app.handle_browser_open(
+            "1".to_string(),
+            BrowserOpenParams {
+                pane_id: None,
+                url: None,
+            },
+        );
+
+        // Without this the open would launch a real browser and poll it
+        // forever behind a pane that can never draw its frames.
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(&response).expect("error response");
+        assert_eq!(error.error.code, "feature_disabled");
+        assert!(app.state.browser_panes.is_empty());
+        assert!(app.browser_actors.is_empty());
     }
 
     #[test]

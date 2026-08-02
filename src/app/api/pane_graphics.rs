@@ -226,7 +226,10 @@ impl App {
     }
 }
 
-fn require_pane_graphics_enabled(app: &App, id: &str) -> Result<(), String> {
+/// Shared by every surface that composites an image over a pane, including
+/// Browser panes (`super::browser`), which render through the same overlay
+/// and are equally invisible when the feature is off.
+pub(super) fn require_pane_graphics_enabled(app: &App, id: &str) -> Result<(), String> {
     if app.state.kitty_graphics_enabled {
         return Ok(());
     }

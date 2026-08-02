@@ -33,6 +33,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// after ~4 unchanged frames.
 const POLL_INTERVAL_MAX: Duration = Duration::from_secs(2);
 
+/// Consecutive failed screenshots before the session is treated as gone.
+/// A single failure is normal while the page is mid-navigation, but a session
+/// whose browser died fails every capture forever, and until this reports the
+/// death the pane keeps a stale frame and keeps swallowing mouse input (see
+/// `App::handle_browser_daemon_exited`). With the idle backoff this is reached
+/// roughly ten seconds after the browser goes away.
+const MAX_CONSECUTIVE_SCREENSHOT_FAILURES: u32 = 5;
+
 /// Cheap identity for a polled frame, so an unchanged page costs nothing
 /// beyond the poll itself: no channel send, no render wake-up, no re-upload
 /// of the same PNG to the host terminal.
@@ -61,6 +69,7 @@ pub(crate) fn run(
     // POLL_INTERVAL on any input or any actual visual change.
     let mut interval = POLL_INTERVAL;
     let mut last_frame: Option<u64> = None;
+    let mut consecutive_failures: u32 = 0;
 
     loop {
         let command = commands.recv_timeout(interval);
@@ -96,6 +105,7 @@ pub(crate) fn run(
 
         match daemon::screenshot_png(&session) {
             Ok(data) => {
+                consecutive_failures = 0;
                 let fingerprint = frame_fingerprint(&data);
                 if last_frame == Some(fingerprint) {
                     interval = backed_off(interval);
@@ -115,7 +125,20 @@ pub(crate) fn run(
                 // Back off here too: a session that fails every capture must
                 // not spawn subprocesses five times a second forever.
                 interval = backed_off(interval);
-                tracing::warn!(pane_id = pane_id.raw(), %err, "browser pane: screenshot failed");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    pane_id = pane_id.raw(),
+                    %err,
+                    consecutive_failures,
+                    "browser pane: screenshot failed"
+                );
+                if session_looks_dead(consecutive_failures) {
+                    let _ = events.blocking_send(AppEvent::BrowserDaemonExited {
+                        pane_id,
+                        reason: err,
+                    });
+                    break;
+                }
             }
         }
     }
@@ -133,6 +156,12 @@ fn backed_off(interval: Duration) -> Duration {
     (interval * 2).min(POLL_INTERVAL_MAX)
 }
 
+/// Distinguishes a transient capture failure (mid-navigation, page busy) from
+/// a browser that is gone for good.
+fn session_looks_dead(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_SCREENSHOT_FAILURES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +170,15 @@ mod tests {
     fn identical_frames_have_identical_fingerprints() {
         assert_eq!(frame_fingerprint(b"frame"), frame_fingerprint(b"frame"));
         assert_ne!(frame_fingerprint(b"frame"), frame_fingerprint(b"other"));
+    }
+
+    #[test]
+    fn a_single_screenshot_failure_does_not_report_the_session_dead() {
+        assert!(!session_looks_dead(0));
+        assert!(!session_looks_dead(1));
+        assert!(!session_looks_dead(MAX_CONSECUTIVE_SCREENSHOT_FAILURES - 1));
+        assert!(session_looks_dead(MAX_CONSECUTIVE_SCREENSHOT_FAILURES));
+        assert!(session_looks_dead(u32::MAX));
     }
 
     #[test]
