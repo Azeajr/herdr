@@ -85,14 +85,7 @@ impl App {
         if !self.state.is_browser_pane(pane_id) {
             return;
         }
-        match &url {
-            Some(url) => {
-                self.state.browser_pane_urls.insert(pane_id, url.clone());
-            }
-            None => {
-                self.state.browser_pane_urls.remove(&pane_id);
-            }
-        }
+        self.remember_browser_url(pane_id, url.clone());
         let label = url
             .as_deref()
             .and_then(browser_pane_label)
@@ -137,6 +130,30 @@ impl App {
         self.sync_toast_deadline(previous_toast);
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
+    }
+
+    /// Records the page a Browser pane is on, arming the session save when it
+    /// actually moves.
+    ///
+    /// The url is persisted (`crate::persist::snapshot::PaneBrowserSnapshot`),
+    /// so a page change is a session change, and nothing upstream can arm the
+    /// save for us: the page also moves for reasons no api call ever sees, as
+    /// with a redirect or a link the user clicks inside the page. Without
+    /// this the pane restores onto whatever page some unrelated change
+    /// happened to save it on.
+    ///
+    /// Guarded on an actual change because the actor reports the page on a
+    /// poll and `App::schedule_session_save` pushes the debounce out every
+    /// time, so rescheduling on an unchanged page would starve the save for
+    /// as long as the pane is open.
+    fn remember_browser_url(&mut self, pane_id: PaneId, url: Option<String>) {
+        let previous = match &url {
+            Some(url) => self.state.browser_pane_urls.insert(pane_id, url.clone()),
+            None => self.state.browser_pane_urls.remove(&pane_id),
+        };
+        if previous.as_deref() != url.as_deref() {
+            self.schedule_session_save();
+        }
     }
 
     /// Relaunches a failed Browser pane's session in place, back onto the page
@@ -489,8 +506,10 @@ impl App {
             return encode_error(id, response.0, response.1);
         }
         // Remembered so a later relaunch lands back on this page rather than
-        // on `about:blank` (see `App::retry_browser_pane`).
-        self.state.browser_pane_urls.insert(pane_id, url);
+        // on `about:blank` (see `App::retry_browser_pane`). Recorded here
+        // rather than waiting for the actor's page-info poll so the pane
+        // reads back the requested page immediately.
+        self.remember_browser_url(pane_id, Some(url));
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -805,6 +824,65 @@ mod tests {
             Some("https://www.rust-lang.org/learn")
         );
         app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn a_new_page_arms_the_session_save_and_the_same_page_does_not() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        // `test_app` builds a `--no-session` app, which persists nothing.
+        app.no_session = false;
+        assert!(app.session_save_deadline.is_none());
+
+        app.handle_browser_page_info(pane_id, Some("https://example.com/a".to_string()), None);
+
+        // The url is persisted, so a page change is a session change. Nothing
+        // upstream arms this: the navigation may not have come from an api
+        // call at all.
+        let armed = app
+            .session_save_deadline
+            .expect("a new page arms the session save");
+
+        app.handle_browser_page_info(pane_id, Some("https://example.com/a".to_string()), None);
+
+        // The actor reports the page on every poll, and rescheduling pushes
+        // the debounce out, so an unchanged page must leave it alone or the
+        // save never fires while the pane is open.
+        assert_eq!(app.session_save_deadline, Some(armed));
+
+        app.handle_browser_page_info(pane_id, Some("https://example.com/b".to_string()), None);
+        assert!(app.session_save_deadline > Some(armed));
+    }
+
+    #[test]
+    fn navigating_arms_the_session_save_before_the_page_reports_back() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        app.no_session = false;
+        let public = public_pane_id_of(&app, pane_id);
+
+        let response = app.handle_browser_navigate(
+            "1".into(),
+            crate::api::schema::BrowserNavigateParams {
+                pane_id: public,
+                url: "https://example.com/a".to_string(),
+            },
+        );
+
+        assert!(!response.contains("\"error\""), "{response}");
+        // `handle_browser_navigate` records the url itself, so the actor's
+        // page-info poll reports a url that is already current and arms
+        // nothing. If this path did not arm the save, a navigate would never
+        // reach disk on its own.
+        let armed = app
+            .session_save_deadline
+            .expect("navigating arms the session save");
+
+        app.handle_browser_page_info(
+            pane_id,
+            Some("https://example.com/a".to_string()),
+            Some("A".to_string()),
+        );
+
+        assert_eq!(app.session_save_deadline, Some(armed));
     }
 
     #[test]
