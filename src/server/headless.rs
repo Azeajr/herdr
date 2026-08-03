@@ -553,6 +553,7 @@ impl HeadlessServer {
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
             self.app.reap_finished_custom_commands();
+            self.app.sync_browser_viewports();
 
             // If shutdown has been initiated, complete it and exit.
             if self.shutting_down {

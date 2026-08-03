@@ -1604,6 +1604,15 @@ pub struct AppState {
     /// (`src/app/api/browser.rs`), mirroring `request_clipboard_write`'s
     /// queue-then-dispatch pattern.
     pub(crate) browser_input_events: Vec<(PaneId, crate::browser::BrowserCommand)>,
+    /// Last URL each Browser pane was asked to navigate to. Kept so a pane
+    /// whose `agent-browser` session died can be retried back onto the page
+    /// the user was actually on rather than `about:blank`.
+    pub(crate) browser_pane_urls: std::collections::HashMap<PaneId, String>,
+    /// Why a Browser pane's session is gone, for panes that failed after the
+    /// actor exhausted its own relaunch attempts. Present means the pane is
+    /// inert but still a Browser pane: it renders this message instead of a
+    /// frame, and can be retried in place (see `App::retry_browser_pane`).
+    pub(crate) browser_pane_errors: std::collections::HashMap<PaneId, String>,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, PaneGraphicsLayer>,
     /// Active streaming graphics owner token by pane id.
@@ -1968,6 +1977,8 @@ impl AppState {
             plugin_panes: std::collections::HashMap::new(),
             browser_pane_shutdowns: Vec::new(),
             browser_input_events: Vec::new(),
+            browser_pane_urls: std::collections::HashMap::new(),
+            browser_pane_errors: std::collections::HashMap::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
@@ -2237,6 +2248,19 @@ impl AppState {
             .collect::<Vec<_>>()
         {
             assert_live_pane(pane_id, "queued browser pointer event");
+        }
+        for &pane_id in self.browser_pane_urls.keys() {
+            assert_live_pane(pane_id, "browser pane url");
+        }
+        for &pane_id in self.browser_pane_errors.keys() {
+            assert_live_pane(pane_id, "browser pane error");
+            // A failed pane stays a Browser pane precisely so it can be
+            // retried in place; demoting it would strand the error message on
+            // an ordinary shell pane.
+            assert!(
+                self.is_browser_pane(pane_id),
+                "pane {pane_id:?} carries a browser error but is not a browser pane"
+            );
         }
         if let Some(copy_mode) = &self.copy_mode {
             assert_live_pane(copy_mode.pane_id, "copy mode");

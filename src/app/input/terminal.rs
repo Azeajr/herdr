@@ -149,6 +149,14 @@ impl App {
         // of the mouse handler -- a key queued there would not move until the
         // user happened to move the mouse.
         if self.state.is_browser_pane(pane_id) {
+            // A failed pane has no session to type into; its only meaningful
+            // input is the retry offered by the message it is rendering.
+            if self.state.browser_pane_errors.contains_key(&pane_id) {
+                if crate::browser::keys::is_retry_key(&key_event) {
+                    self.retry_browser_pane(pane_id);
+                }
+                return None;
+            }
             if let Some(command) = crate::browser::keys::command_for_key(&key_event) {
                 if let Some(actor) = self.browser_actors.get(&pane_id) {
                     let _ = actor.send(command);

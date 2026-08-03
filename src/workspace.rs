@@ -1539,11 +1539,21 @@ mod tests {
         assert!(first.starts_with('w'));
         assert!(second.starts_with('w'));
         assert_ne!(first, second);
-        assert!(first.len() <= 3, "unexpectedly long workspace id: {first}");
-        assert!(
-            second.len() <= 3,
-            "unexpectedly long workspace id: {second}"
-        );
+        // Length is asserted against the id's own counter value, not a fixed
+        // number of characters: `NEXT_WORKSPACE_ID` is process-global, so how
+        // far it has advanced by the time this test runs depends on how many
+        // workspaces every other test in the binary happened to build.
+        for id in [&first, &second] {
+            let handle = id.strip_prefix('w').expect("w-prefixed handle");
+            let number = decode_public_number(handle).expect("handle decodes");
+            assert_eq!(encode_public_number(number), handle);
+            // The point of base32 is that a handle is never longer than the
+            // decimal number it stands for.
+            assert!(
+                handle.len() <= number.to_string().len(),
+                "unexpectedly long workspace id: {id}"
+            );
+        }
     }
 
     #[test]

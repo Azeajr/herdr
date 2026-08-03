@@ -97,10 +97,24 @@ pub struct App {
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     /// Runtime handles for Browser panes' actor threads, keyed by pane id.
-    /// Parallels `terminal_runtimes`: `AppState.browser_panes` holds the
-    /// pure-data marker, this holds the live command-channel handle.
+    /// Parallels `terminal_runtimes`: `PaneState.kind` holds the pure-data
+    /// marker, this holds the live command-channel handle.
     pub(crate) browser_actors:
         std::collections::HashMap<crate::layout::PaneId, crate::browser::BrowserActorHandle>,
+    /// Last viewport size pushed to each Browser pane's `agent-browser`
+    /// session, so `App::sync_browser_viewports` only spends a subprocess
+    /// call when the pane's pixel size actually changed. Runtime-side cache
+    /// of what a live session was told, not session state.
+    pub(crate) browser_viewports: std::collections::HashMap<crate::layout::PaneId, (u32, u32)>,
+    /// Stands in for the actor thread's end of the command channel under
+    /// `cfg(test)`, where `App::spawn_browser_actor` deliberately starts no
+    /// thread (it would launch a real Chrome). Keeps the sender connected so
+    /// tests see the same channel behaviour as a live actor.
+    #[cfg(test)]
+    pub(crate) test_browser_command_rx: std::collections::HashMap<
+        crate::layout::PaneId,
+        std::sync::mpsc::Receiver<crate::browser::BrowserCommand>,
+    >,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -526,6 +540,8 @@ impl App {
             direct_attach_resize_locks: std::collections::HashSet::new(),
             browser_pane_shutdowns: Vec::new(),
             browser_input_events: Vec::new(),
+            browser_pane_urls: std::collections::HashMap::new(),
+            browser_pane_errors: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
@@ -733,6 +749,9 @@ impl App {
             state,
             terminal_runtimes: restored_terminal_runtimes,
             browser_actors: std::collections::HashMap::new(),
+            browser_viewports: std::collections::HashMap::new(),
+            #[cfg(test)]
+            test_browser_command_rx: std::collections::HashMap::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -1040,6 +1059,7 @@ impl App {
             }
 
             let now = Instant::now();
+            self.sync_browser_viewports();
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
             self.sync_host_keyboard_report_all(&mut host_keyboard_report_all_active)?;
 

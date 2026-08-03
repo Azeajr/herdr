@@ -18,8 +18,17 @@
 //! to `PaneSnapshot` and respawning the actor during restore, which touches
 //! persisted state and the restore/handoff path.
 
+// `App::spawn_browser_actor` starts no thread under `cfg(test)` -- the actor's
+// first act is launching a real headless Chrome, which a unit-test suite must
+// not do. That makes the actor and the CLI wrapper beneath it unreachable from
+// the test build, so their `dead_code` warnings there are an artifact of the
+// seam rather than unused production code. Each module still has its own unit
+// tests, and the live path is covered by the smoke test.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) mod actor;
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) mod client;
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) mod daemon;
 pub(crate) mod keys;
 
@@ -27,6 +36,13 @@ pub(crate) mod keys;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BrowserCommand {
     Navigate(String),
+    /// Resizes the page to the pane's pixel size, so the stretched Kitty
+    /// placement is a 1:1 blit instead of a distortion. Issued by
+    /// `App::sync_browser_viewports` whenever the pane's geometry changes.
+    SetViewport {
+        width: u32,
+        height: u32,
+    },
     /// Pixel-coordinate button press. Paired with [`Self::MouseUp`] rather
     /// than pressing and releasing in one go, so a press followed by
     /// [`Self::MouseMove`] is a real drag.
@@ -61,10 +77,10 @@ pub(crate) enum BrowserCommand {
 /// Runtime handle for one Browser pane's actor thread, the Browser-pane
 /// analog of `TerminalRuntime`: lives on `App.browser_actors` (runtime),
 /// never on `AppState` -- a channel `Sender` is a live resource, not data.
-/// `AppState.browser_panes` holds the corresponding pure-data marker (just
-/// "this pane id is a browser pane"); the session name itself is derived
-/// deterministically from the pane id via [`daemon::session_name`] rather
-/// than stored twice.
+/// `PaneState.kind` holds the corresponding pure-data marker (just "this pane
+/// is a browser pane"); the session name itself is derived deterministically
+/// from the pane id and this server's token via [`daemon::session_name`]
+/// rather than stored twice.
 ///
 /// Dropping the sender is the actor's shutdown signal: its `recv_timeout`
 /// loop (`actor.rs`) sees `Disconnected` and stops the `agent-browser`

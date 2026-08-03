@@ -36,6 +36,17 @@ pub(crate) fn command_for_key(key: &KeyEvent) -> Option<BrowserCommand> {
     )))
 }
 
+/// Whether `key` is the in-place retry for a failed Browser pane, matching
+/// the affordance rendered in `src/ui/panes.rs`. Unmodified only, so it can't
+/// be confused with a keybinding chord that reached the pane.
+pub(crate) fn is_retry_key(key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release
+        && matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 /// Playwright-style key name for `code`, plus whether the name implies Shift.
 fn key_name(code: KeyCode) -> Option<(String, bool)> {
     let name = match code {

@@ -367,10 +367,41 @@ pub(super) fn render_panes(
                 true,
             );
             render_copy_mode_cursor(app, frame, info);
+        } else if let Some(reason) = app.browser_pane_errors.get(&info.id) {
+            render_browser_pane_error(app, frame, info, reason);
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+}
+
+/// Draws the failure state of a Browser pane whose `agent-browser` session is
+/// gone. The pane has no PTY runtime behind it, so without this it renders as
+/// an unexplained blank rectangle.
+fn render_browser_pane_error(app: &AppState, frame: &mut Frame, info: &PaneInfo, reason: &str) {
+    let area = info.inner_rect;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = usize::from(area.width);
+    let lines = vec![
+        Line::from(Span::styled(
+            truncate_end("browser session ended", width),
+            Style::default()
+                .fg(app.palette.red)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            truncate_end(reason, width),
+            Style::default().fg(app.palette.subtext0),
+        )),
+        Line::from(Span::styled(
+            truncate_end("press r to retry", width),
+            Style::default().fg(app.palette.overlay1),
+        )),
+    ];
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect)> {
