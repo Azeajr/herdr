@@ -462,7 +462,7 @@ impl App {
         }
 
         self.dispatch_pending_clipboard_write();
-        self.dispatch_browser_pointer_events();
+        self.dispatch_browser_input_events();
 
         // Sync autoscroll deadline with state (mouse handler may have
         // set or cleared selection_autoscroll during handle_mouse).

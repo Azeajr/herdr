@@ -25,6 +25,11 @@ use super::{
     ScrollbarClickTarget, TAB_DRAG_THRESHOLD, WORKSPACE_DRAG_THRESHOLD,
 };
 
+/// Pixels of page scroll per wheel notch in a Browser pane. Chrome's own
+/// default wheel delta, so a notch scrolls about as far as it would in a
+/// normal browser window.
+const BROWSER_WHEEL_NOTCH_PIXELS: i32 = 100;
+
 pub(super) enum MouseAction {
     NewWorkspace,
     Settings(SettingsAction),
@@ -1655,6 +1660,24 @@ impl AppState {
         }
     }
 
+    /// Maps a screen cell inside a Browser pane to a pixel coordinate in the
+    /// page image.
+    ///
+    /// The placement stretches the image to fill the pane's inner rect
+    /// (`src/ghostty/mod.rs`), so the inverse is a plain linear scale on each
+    /// axis -- no letterboxing to compensate for. Returns `None` before the
+    /// first frame arrives, when there is no image to aim at.
+    fn browser_pixel_position(&self, info: &PaneInfo, column: u16, row: u16) -> Option<(i32, i32)> {
+        let layer = self.pane_graphics_layers.get(&info.id)?;
+        let column = column.saturating_sub(info.inner_rect.x);
+        let row = row.saturating_sub(info.inner_rect.y);
+        let x = (f64::from(column) / f64::from(info.inner_rect.width.max(1))
+            * f64::from(layer.image_width)) as i32;
+        let y = (f64::from(row) / f64::from(info.inner_rect.height.max(1))
+            * f64::from(layer.image_height)) as i32;
+        Some((x, y))
+    }
+
     pub(super) fn forward_pane_mouse_button(
         &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -1662,19 +1685,21 @@ impl AppState {
         mouse: MouseEvent,
     ) -> bool {
         if self.is_browser_pane(info.id) {
-            // Only clicks are routed for MVP -- Up/Drag are ignored and
-            // motion isn't routed at all (see `forward_pane_mouse_motion`)
-            // to avoid a subprocess call per continuous mouse-move event.
-            if let MouseEventKind::Down(_) = mouse.kind {
-                if let Some(layer) = self.pane_graphics_layers.get(&info.id) {
-                    let column = mouse.column.saturating_sub(info.inner_rect.x);
-                    let row = mouse.row.saturating_sub(info.inner_rect.y);
-                    let x = (f64::from(column) / f64::from(info.inner_rect.width.max(1))
-                        * f64::from(layer.image_width)) as i32;
-                    let y = (f64::from(row) / f64::from(info.inner_rect.height.max(1))
-                        * f64::from(layer.image_height)) as i32;
-                    self.browser_pointer_events
-                        .push((info.id, crate::browser::BrowserCommand::Click { x, y }));
+            if let Some((x, y)) = self.browser_pixel_position(info, mouse.column, mouse.row) {
+                let command = match mouse.kind {
+                    MouseEventKind::Down(_) => {
+                        Some(crate::browser::BrowserCommand::MouseDown { x, y })
+                    }
+                    MouseEventKind::Up(_) => Some(crate::browser::BrowserCommand::MouseUp { x, y }),
+                    // A drag is a move with the button already held; the
+                    // press was delivered by the preceding Down.
+                    MouseEventKind::Drag(_) => {
+                        Some(crate::browser::BrowserCommand::MouseMove { x, y })
+                    }
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    self.browser_input_events.push((info.id, command));
                 }
             }
             return true;
@@ -1705,9 +1730,12 @@ impl AppState {
         mouse: MouseEvent,
     ) -> bool {
         if self.is_browser_pane(info.id) {
-            // Not routed to the browser (MVP scope, see
-            // `forward_pane_mouse_button`) -- just don't forward as PTY
-            // mouse-report bytes to the placeholder pane process.
+            // Bare motion (hover) is deliberately not routed: it arrives
+            // continuously and each one would be an `agent-browser`
+            // subprocess. Dragging still works -- it arrives as
+            // `MouseEventKind::Drag` through `forward_pane_mouse_button`.
+            // Swallow it so nothing tries to encode PTY mouse-report bytes
+            // for a pane that has no PTY.
             return true;
         }
         let Some(ws_idx) = self.active else {
@@ -1758,11 +1786,29 @@ impl AppState {
     }
 
     pub(super) fn forward_pane_wheel(
-        &self,
+        &mut self,
         terminal_runtimes: &TerminalRuntimeRegistry,
         info: &PaneInfo,
         mouse: MouseEvent,
     ) -> bool {
+        if self.is_browser_pane(info.id) {
+            // A browser pane has no scrollback of its own -- the page owns
+            // the scrolling, so send the notch on rather than falling through
+            // to host scroll.
+            let delta = match mouse.kind {
+                MouseEventKind::ScrollUp => -BROWSER_WHEEL_NOTCH_PIXELS,
+                MouseEventKind::ScrollDown => BROWSER_WHEEL_NOTCH_PIXELS,
+                _ => return true,
+            };
+            self.browser_input_events.push((
+                info.id,
+                crate::browser::BrowserCommand::Scroll {
+                    delta_x: 0,
+                    delta_y: delta,
+                },
+            ));
+            return true;
+        }
         let Some(ws_idx) = self.active else {
             return false;
         };

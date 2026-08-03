@@ -41,6 +41,11 @@ const POLL_INTERVAL_MAX: Duration = Duration::from_secs(2);
 /// roughly ten seconds after the browser goes away.
 const MAX_CONSECUTIVE_SCREENSHOT_FAILURES: u32 = 5;
 
+/// Ceiling on how many queued commands one batch applies before going back to
+/// poll for a frame. Without it a held-down key could starve the screenshot
+/// loop and freeze the pane's picture while input kept landing.
+const MAX_BATCHED_COMMANDS: usize = 32;
+
 /// Cheap identity for a polled frame, so an unchanged page costs nothing
 /// beyond the poll itself: no channel send, no render wake-up, no re-upload
 /// of the same PNG to the host terminal.
@@ -79,24 +84,12 @@ pub(crate) fn run(
             interval = POLL_INTERVAL;
         }
         match command {
-            Ok(BrowserCommand::Navigate(url)) => {
-                if let Err(err) = daemon::navigate(&session, &url) {
-                    tracing::warn!(pane_id = pane_id.raw(), %err, "browser pane: navigate failed");
-                }
-            }
-            Ok(BrowserCommand::Click { x, y }) => {
-                if let Err(err) = click(&session, x, y) {
-                    tracing::warn!(pane_id = pane_id.raw(), %err, "browser pane: click failed");
-                }
-            }
-            Ok(BrowserCommand::MouseMove { x, y }) => {
-                if let Err(err) = daemon::mouse_move(&session, x, y) {
-                    tracing::warn!(pane_id = pane_id.raw(), %err, "browser pane: mouse move failed");
-                }
-            }
-            Ok(BrowserCommand::Scroll { delta_x, delta_y }) => {
-                if let Err(err) = daemon::wheel(&session, delta_x, delta_y) {
-                    tracing::warn!(pane_id = pane_id.raw(), %err, "browser pane: scroll failed");
+            Ok(first) => {
+                // Every command is a subprocess spawn, so drain whatever else
+                // is already queued and merge it before touching the CLI.
+                // Fast typing otherwise costs one `keyboard type` per key.
+                for command in coalesce(first, &commands) {
+                    apply(pane_id, &session, command);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -146,9 +139,52 @@ pub(crate) fn run(
     daemon::stop(&session);
 }
 
-fn click(session: &str, x: i32, y: i32) -> Result<(), String> {
+/// Drains everything already queued behind `first` and merges adjacent
+/// [`BrowserCommand::TypeText`] into single calls.
+///
+/// Only text merges. Reordering anything else would change meaning -- a click
+/// between two keystrokes moves focus, and a `press Enter` between them
+/// submits.
+fn coalesce(first: BrowserCommand, commands: &Receiver<BrowserCommand>) -> Vec<BrowserCommand> {
+    let mut batch = vec![first];
+    while let Ok(next) = commands.try_recv() {
+        match (batch.last_mut(), next) {
+            (Some(BrowserCommand::TypeText(pending)), BrowserCommand::TypeText(text)) => {
+                pending.push_str(&text);
+            }
+            (_, next) => batch.push(next),
+        }
+        if batch.len() >= MAX_BATCHED_COMMANDS {
+            break;
+        }
+    }
+    batch
+}
+
+fn apply(pane_id: PaneId, session: &str, command: BrowserCommand) {
+    let (action, result) = match command {
+        BrowserCommand::Navigate(url) => ("navigate", daemon::navigate(session, &url)),
+        BrowserCommand::MouseDown { x, y } => ("mouse down", mouse_down(session, x, y)),
+        BrowserCommand::MouseMove { x, y } => ("mouse move", daemon::mouse_move(session, x, y)),
+        BrowserCommand::MouseUp { x, y } => ("mouse up", mouse_up(session, x, y)),
+        BrowserCommand::Scroll { delta_x, delta_y } => {
+            ("scroll", daemon::wheel(session, delta_x, delta_y))
+        }
+        BrowserCommand::TypeText(text) => ("type", daemon::type_text(session, &text)),
+        BrowserCommand::PressKey(key) => ("press", daemon::press_key(session, &key)),
+    };
+    if let Err(err) = result {
+        tracing::warn!(pane_id = pane_id.raw(), action, %err, "browser pane: command failed");
+    }
+}
+
+fn mouse_down(session: &str, x: i32, y: i32) -> Result<(), String> {
     daemon::mouse_move(session, x, y)?;
-    daemon::mouse_button(session, true)?;
+    daemon::mouse_button(session, true)
+}
+
+fn mouse_up(session: &str, x: i32, y: i32) -> Result<(), String> {
+    daemon::mouse_move(session, x, y)?;
     daemon::mouse_button(session, false)
 }
 
@@ -165,6 +201,47 @@ fn session_looks_dead(consecutive_failures: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typing_bursts_merge_into_one_call() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for c in ["e", "l", "l", "o"] {
+            tx.send(BrowserCommand::TypeText(c.to_string())).unwrap();
+        }
+        let batch = coalesce(BrowserCommand::TypeText("h".to_string()), &rx);
+        assert_eq!(batch, vec![BrowserCommand::TypeText("hello".to_string())]);
+    }
+
+    #[test]
+    fn non_text_commands_keep_their_order_and_split_typing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(BrowserCommand::TypeText("i".to_string())).unwrap();
+        tx.send(BrowserCommand::PressKey("Enter".to_string()))
+            .unwrap();
+        tx.send(BrowserCommand::TypeText("b".to_string())).unwrap();
+        tx.send(BrowserCommand::TypeText("c".to_string())).unwrap();
+        let batch = coalesce(BrowserCommand::TypeText("h".to_string()), &rx);
+        // Merging across the Enter would submit "hibc" instead of "hi".
+        assert_eq!(
+            batch,
+            vec![
+                BrowserCommand::TypeText("hi".to_string()),
+                BrowserCommand::PressKey("Enter".to_string()),
+                BrowserCommand::TypeText("bc".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn batching_is_bounded_so_frames_keep_flowing() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..(MAX_BATCHED_COMMANDS * 2) {
+            tx.send(BrowserCommand::PressKey("Tab".to_string()))
+                .unwrap();
+        }
+        let batch = coalesce(BrowserCommand::PressKey("Tab".to_string()), &rx);
+        assert_eq!(batch.len(), MAX_BATCHED_COMMANDS);
+    }
 
     #[test]
     fn identical_frames_have_identical_fingerprints() {

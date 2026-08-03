@@ -525,7 +525,7 @@ impl App {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             browser_pane_shutdowns: Vec::new(),
-            browser_pointer_events: Vec::new(),
+            browser_input_events: Vec::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,

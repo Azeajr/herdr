@@ -51,7 +51,7 @@ impl App {
             .browser_pane_shutdowns
             .retain(|queued| *queued != pane_id);
         self.state
-            .browser_pointer_events
+            .browser_input_events
             .retain(|(queued, _)| *queued != pane_id);
         self.state.clear_browser_frame(pane_id);
     }
@@ -175,12 +175,12 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
-    /// Drains `AppState.browser_pointer_events` (queued by
+    /// Drains `AppState.browser_input_events` (queued by
     /// `forward_pane_mouse_button`, which has no runtime access) and sends
     /// each to its pane's actor. Mirrors
     /// `App::dispatch_pending_clipboard_write`'s queue-then-dispatch shape.
-    pub(crate) fn dispatch_browser_pointer_events(&mut self) {
-        for (pane_id, command) in std::mem::take(&mut self.state.browser_pointer_events) {
+    pub(crate) fn dispatch_browser_input_events(&mut self) {
+        for (pane_id, command) in std::mem::take(&mut self.state.browser_input_events) {
             if let Some(commands) = self.browser_actors.get(&pane_id) {
                 let _ = commands.send(command);
             }
@@ -319,8 +319,8 @@ mod tests {
     fn browser_daemon_exit_stops_the_pane_behaving_like_a_browser_pane() {
         let (mut app, pane_id, command_rx) = app_with_browser_pane();
         app.state
-            .browser_pointer_events
-            .push((pane_id, BrowserCommand::Click { x: 1, y: 2 }));
+            .browser_input_events
+            .push((pane_id, BrowserCommand::MouseDown { x: 1, y: 2 }));
 
         app.handle_browser_daemon_exited(pane_id, "session died".to_string());
 
@@ -328,7 +328,7 @@ mod tests {
         // `forward_pane_mouse_button` and queuing clicks for a dead actor.
         assert!(!app.state.is_browser_pane(pane_id));
         assert!(!app.browser_actors.contains_key(&pane_id));
-        assert!(app.state.browser_pointer_events.is_empty());
+        assert!(app.state.browser_input_events.is_empty());
         assert!(!app.state.pane_graphics_layers.contains_key(&pane_id));
         assert!(!app.state.pane_graphics_streams.contains_key(&pane_id));
         // Dropping the sender is the actor's shutdown signal.

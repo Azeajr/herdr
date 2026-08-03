@@ -138,6 +138,25 @@ impl App {
         let ws_idx = self.state.active?;
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_id = ws.focused_pane_id()?;
+
+        // Browser panes have no PTY to receive bytes. Send the key straight to
+        // the pane's actor, after the keybinding interception above so prefix
+        // and direct bindings still work while a browser pane is focused.
+        //
+        // Sent directly rather than queued into `browser_input_events`: that
+        // queue exists for the mouse path, which runs on `AppState` and has no
+        // reach into `App.browser_actors`, and it is only drained at the end
+        // of the mouse handler -- a key queued there would not move until the
+        // user happened to move the mouse.
+        if self.state.is_browser_pane(pane_id) {
+            if let Some(command) = crate::browser::keys::command_for_key(&key_event) {
+                if let Some(actor) = self.browser_actors.get(&pane_id) {
+                    let _ = actor.send(command);
+                }
+            }
+            return None;
+        }
+
         let terminal_id = ws.terminal_id(pane_id)?.clone();
         let rt =
             self.state

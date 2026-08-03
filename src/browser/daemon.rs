@@ -73,6 +73,25 @@ pub(crate) fn wheel(session: &str, delta_x: i32, delta_y: i32) -> Result<(), Str
     .map(|_| ())
 }
 
+/// Types text into whatever the page currently has focused. `keyboard type`
+/// rather than `type <selector> <text>` because a Browser pane has no notion
+/// of a selector -- the user is looking at pixels and typing at the focus,
+/// exactly what this subcommand is for. Verified against agent-browser
+/// 0.33.1.
+pub(crate) fn type_text(session: &str, text: &str) -> Result<(), String> {
+    ok_or_err(
+        "keyboard type",
+        client::call(session, &[], &["keyboard", "type", text]),
+    )
+    .map(|_| ())
+}
+
+/// Presses a named key or modifier chord (`Enter`, `Control+a`). `press`
+/// already operates on the current focus, so it needs no selector either.
+pub(crate) fn press_key(session: &str, key: &str) -> Result<(), String> {
+    ok_or_err("press", client::call(session, &[], &["press", key])).map(|_| ())
+}
+
 /// Captures a PNG screenshot to a reusable per-session temp file and reads
 /// it back. agent-browser's `screenshot` action has no inline-base64 output
 /// mode (verified locally) -- only a file-path destination.

@@ -21,35 +21,41 @@
 pub(crate) mod actor;
 pub(crate) mod client;
 pub(crate) mod daemon;
+pub(crate) mod keys;
 
 /// Commands accepted by a Browser pane's actor thread.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum BrowserCommand {
     Navigate(String),
-    /// Pixel-coordinate click (move + mousedown + mouseup), for manual
-    /// mouse input routed from `src/app/input/mouse.rs`.
-    Click {
+    /// Pixel-coordinate button press. Paired with [`Self::MouseUp`] rather
+    /// than pressing and releasing in one go, so a press followed by
+    /// [`Self::MouseMove`] is a real drag.
+    MouseDown {
         x: i32,
         y: i32,
     },
-    /// Not yet sent by any caller (MVP only routes clicks, not continuous
-    /// motion -- see `forward_pane_mouse_button`'s doc comment). Kept as
-    /// part of the actor's command surface since `daemon::mouse_move`
-    /// already exists and this is the obvious next input to wire up.
-    #[allow(dead_code)]
+    /// Pointer moved with the button held: `mouse move` without a press, so
+    /// drags, sliders and hover states work.
     MouseMove {
         x: i32,
         y: i32,
     },
-    /// Not yet sent by any caller -- scroll routing depends on each pane's
-    /// `wheel_routing` mode (`src/app/input/mouse.rs`'s
-    /// `forward_pane_reported_wheel`), which needs more design than MVP
-    /// scope covers to wire correctly. `daemon::wheel` is ready for it.
-    #[allow(dead_code)]
+    /// Button released at a position, ending a drag started by [`Self::Click`].
+    MouseUp {
+        x: i32,
+        y: i32,
+    },
     Scroll {
         delta_x: i32,
         delta_y: i32,
     },
+    /// Printable text for the focused element. Adjacent values are merged by
+    /// the actor into one `keyboard type` call, so a burst of typing is not a
+    /// subprocess per character.
+    TypeText(String),
+    /// A named key or modifier chord, already in agent-browser's spelling
+    /// (`Enter`, `Control+a`); see [`keys::command_for_key`].
+    PressKey(String),
 }
 
 /// Runtime handle for one Browser pane's actor thread, the Browser-pane

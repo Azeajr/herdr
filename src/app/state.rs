@@ -1600,10 +1600,10 @@ pub struct AppState {
     /// Pointer input destined for a Browser pane's `agent-browser` session,
     /// queued here (pure data) by `forward_pane_mouse_button`
     /// (`src/app/input/mouse.rs`, `impl AppState`, no runtime access) and
-    /// drained by `App::dispatch_browser_pointer_events`
+    /// drained by `App::dispatch_browser_input_events`
     /// (`src/app/api/browser.rs`), mirroring `request_clipboard_write`'s
     /// queue-then-dispatch pattern.
-    pub(crate) browser_pointer_events: Vec<(PaneId, crate::browser::BrowserCommand)>,
+    pub(crate) browser_input_events: Vec<(PaneId, crate::browser::BrowserCommand)>,
     /// Runtime image layers owned by API clients and composited over panes.
     pub(crate) pane_graphics_layers: std::collections::HashMap<PaneId, PaneGraphicsLayer>,
     /// Active streaming graphics owner token by pane id.
@@ -1967,7 +1967,7 @@ impl AppState {
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
             browser_pane_shutdowns: Vec::new(),
-            browser_pointer_events: Vec::new(),
+            browser_input_events: Vec::new(),
             pane_graphics_layers: std::collections::HashMap::new(),
             pane_graphics_streams: std::collections::HashMap::new(),
             pane_graphics_revision: 0,
@@ -2231,7 +2231,7 @@ impl AppState {
             }
         }
         for &pane_id in &self
-            .browser_pointer_events
+            .browser_input_events
             .iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>()
