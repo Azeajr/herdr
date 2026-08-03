@@ -190,6 +190,42 @@ closes; concurrent set, clear, or stream requests return `stream_conflict`.
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
 
+### Experimental Browser panes
+
+A Browser pane renders a real Chromium page in a pane. Like pane graphics it
+draws through the graphics overlay, so it needs
+`[experimental].kitty_graphics = true` and a client terminal that supports the
+Kitty graphics protocol; otherwise `browser.open` returns `feature_disabled`.
+It also drives a headless Chrome through the external `agent-browser` CLI,
+which must be on `PATH`. At most four Browser panes can be open at once.
+
+```json
+{"id":"browser_open","method":"browser.open","params":{"pane_id":"w1:p1","url":"https://example.com"}}
+{"id":"browser_navigate","method":"browser.navigate","params":{"pane_id":"w1:p2","url":"https://example.com/docs"}}
+{"id":"browser_info","method":"browser.info","params":{"pane_id":"w1:p2"}}
+{"id":"browser_close","method":"browser.close","params":{"pane_id":"w1:p2"}}
+```
+
+`browser.open` splits a new pane off `pane_id` (or the focused pane when
+omitted) and returns it as `.result.pane`; both params are optional and a
+missing `url` opens `about:blank`. `browser.reload`, `browser.back`,
+`browser.forward` and `browser.close` take only `pane_id`. A method targeting a
+pane that is not a Browser pane returns `not_browser_pane`.
+
+`browser.info` returns `.result.page` with `pane_id` and, when known, `url` and
+`title`. It also carries `error` when the pane's browser session has failed and
+the pane is waiting to be retried, so a client can distinguish a pane that is
+between pages from one that needs attention. `browser.navigate` and the history
+methods answer as soon as the command is queued, so read the page back with
+`browser.info` rather than assuming the response means the page has loaded.
+
+A Browser pane has no PTY. It still owns a terminal record, whose label follows
+the page's host and whose title follows the page title, which is how `pane.list`
+surfaces what a Browser pane is showing. Browser panes survive a restart: the
+saved session records the pane and its last url, and Herdr relaunches the
+browser onto that page. Page state below the url — scroll position, form input,
+in-memory cookies — does not survive.
+
 `pane.layout` returns the tab layout snapshot with `workspace_id`, `tab_id`,
 `zoomed`, outer `area`, `focused_pane_id`, pane rects, and split rects/ratios.
 `pane.neighbor` and `pane.edges` include that same layout snapshot so clients

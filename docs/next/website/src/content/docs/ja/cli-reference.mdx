@@ -264,6 +264,35 @@ herdr pane report-metadata <pane_id> \
 
 `--source` と `--applies-to-source` は 80 文字以下で、ASCII の英字、数字、コロン、ドット、アンダースコア、ハイフンのみを含められます。`--ttl-ms` はメタデータを自動失効させ、`1` から `86400000` ミリ秒の間でなければなりません。置き換え・クリア・ペインまたはワークスペースのクローズまで残るべきメタデータでは省略してください。`--seq` により、Herdr は同じ `--source` からの古い報告を無視できます。古い報告は API には受理されますが、ペイン状態には無視されます。ペインまたはワークスペースが存続する間、シーケンス付きトークン報告を送れる異なるソースは最大 32 個で、クリアや失効でもその枠は解放されません。
 
+## ブラウザペイン
+
+ブラウザペインは、実際の Chromium のページをターミナルと並ぶ Herdr のペインの中に描画します。
+
+```bash
+herdr browser open [<url>] [--pane <pane_id>]
+herdr browser navigate <pane_id> <url>
+herdr browser reload <pane_id>
+herdr browser back <pane_id>
+herdr browser forward <pane_id>
+herdr browser info <pane_id>
+herdr browser close <pane_id>
+```
+
+ブラウザペインは実験的機能で、2 つの要件があります。描画にはペイングラフィックスのオーバーレイを使うため、`[experimental].kitty_graphics = true` と、Kitty グラフィックスプロトコルに対応したクライアントターミナルが必要です。これがない場合、`browser open` は `feature_disabled` で失敗します。また、外部の [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI を通じてヘッドレス Chrome を操作するため、これが `PATH` 上に必要です。
+
+`browser open` は `--pane`(省略時はフォーカス中のペイン)から新しいペインを分割し、`.result.pane` で返します。URL を省略するとペインは `about:blank` で開きます。ブラウザペインはそれぞれが完全なブラウザとポーリングスレッドを伴うため、同時に開けるのは最大 4 つです。5 つ目を開こうとする `browser open` は起動せずに失敗します。
+
+`browser info` はペインが表示しているページを報告します。
+
+```bash
+herdr browser info w1:p2
+# {"result":{"page":{"pane_id":"w1:p2","title":"Example Domain","url":"https://example.com/"}}}
+```
+
+ページのホスト名はペインのラベルに、ページタイトルはペインのターミナルタイトルになります。そのため `pane list` やサイドバーでも、別途呼び出すことなくブラウザペインの表示内容が分かります。
+
+ブラウザセッションが停止した場合、Herdr は数回まで再起動を試み、その後はペインをそのまま残して失敗内容を表示します。そのペインで `r` を押すと同じページで再試行します。ペインはその間もレイアウト上の位置を保持するため、復帰したセッションは元の場所に戻ります。
+
 ## エージェント
 
 ペインとエージェントの使い分けや一連の連携例は、[エージェント自動化](/ja/docs/agent-automation/) を参照してください。

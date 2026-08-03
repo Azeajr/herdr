@@ -162,6 +162,23 @@ CLI 的 `herdr api snapshot` 会把当前 `session.snapshot` 响应输出为 JSO
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
 
+### 实验性浏览器窗格
+
+浏览器窗格在窗格中渲染真实的 Chromium 页面。与窗格图形一样,它通过图形叠加层绘制,因此需要 `[experimental].kitty_graphics = true` 以及支持 Kitty 图形协议的客户端终端;否则 `browser.open` 返回 `feature_disabled`。它还通过外部的 `agent-browser` CLI 驱动无头 Chrome,该命令必须在 `PATH` 中。同时最多可以打开四个浏览器窗格。
+
+```json
+{"id":"browser_open","method":"browser.open","params":{"pane_id":"w1:p1","url":"https://example.com"}}
+{"id":"browser_navigate","method":"browser.navigate","params":{"pane_id":"w1:p2","url":"https://example.com/docs"}}
+{"id":"browser_info","method":"browser.info","params":{"pane_id":"w1:p2"}}
+{"id":"browser_close","method":"browser.close","params":{"pane_id":"w1:p2"}}
+```
+
+`browser.open` 从 `pane_id`(省略时为聚焦窗格)分割出一个新窗格,并作为 `.result.pane` 返回;两个参数都是可选的,省略 `url` 时打开 `about:blank`。`browser.reload`、`browser.back`、`browser.forward` 和 `browser.close` 只接受 `pane_id`。针对非浏览器窗格调用这些方法会返回 `not_browser_pane`。
+
+`browser.info` 返回 `.result.page`,其中包含 `pane_id`,以及已知时的 `url` 和 `title`。当窗格的浏览器会话失败并等待重试时,它还会带上 `error`,因此客户端可以区分正在切换页面的窗格和需要处理的窗格。`browser.navigate` 和历史方法在命令入队时即返回,因此不要把响应当作页面加载完成,应使用 `browser.info` 读回页面。
+
+浏览器窗格没有 PTY。它仍然拥有一条终端记录,其标签跟随页面主机名,标题跟随页面标题,`pane.list` 正是借此展示浏览器窗格正在显示的内容。浏览器窗格可以在重启后保留:保存的会话记录该窗格及其最后的 url,Herdr 会在该页面上重新启动浏览器。url 之下的页面状态(滚动位置、表单输入、仅存于内存的 Cookie)不会保留。
+
 `pane.layout` 返回标签页布局快照,包含 `workspace_id`、`tab_id`、`zoomed`、外层 `area`、`focused_pane_id`、窗格矩形和分割矩形/比例。`pane.neighbor` 和 `pane.edges` 也包含同一份布局快照,让客户端不需要私有布局状态就能做出下一步决策。
 
 `pane.process_info` 返回窗格的 shell pid、可用时的前台进程组 id,以及平台暴露时带有 pid、名称、argv/cmdline 和 cwd 的前台进程。

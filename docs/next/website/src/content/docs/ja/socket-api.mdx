@@ -162,6 +162,23 @@ CLI の `herdr api snapshot` は、クライアントやエージェントが簡
 {"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
 ```
 
+### 実験的なブラウザペイン
+
+ブラウザペインは、実際の Chromium のページをペイン内に描画します。ペイングラフィックスと同じくグラフィックスオーバーレイを通じて描画するため、`[experimental].kitty_graphics = true` と、Kitty グラフィックスプロトコルに対応したクライアントターミナルが必要です。これがない場合、`browser.open` は `feature_disabled` を返します。また、外部の `agent-browser` CLI を通じてヘッドレス Chrome を操作するため、これが `PATH` 上に必要です。同時に開けるブラウザペインは最大 4 つです。
+
+```json
+{"id":"browser_open","method":"browser.open","params":{"pane_id":"w1:p1","url":"https://example.com"}}
+{"id":"browser_navigate","method":"browser.navigate","params":{"pane_id":"w1:p2","url":"https://example.com/docs"}}
+{"id":"browser_info","method":"browser.info","params":{"pane_id":"w1:p2"}}
+{"id":"browser_close","method":"browser.close","params":{"pane_id":"w1:p2"}}
+```
+
+`browser.open` は `pane_id`(省略時はフォーカス中のペイン)から新しいペインを分割し、`.result.pane` として返します。どちらのパラメータも省略可能で、`url` を省略すると `about:blank` を開きます。`browser.reload`、`browser.back`、`browser.forward`、`browser.close` は `pane_id` だけを受け取ります。ブラウザペインでないペインを対象にしたメソッドは `not_browser_pane` を返します。
+
+`browser.info` は `.result.page` を返し、`pane_id` と、判明していれば `url` と `title` を含みます。ペインのブラウザセッションが失敗して再試行待ちの場合は `error` も含まれるため、クライアントはページ遷移中のペインと対応が必要なペインを区別できます。`browser.navigate` と履歴系メソッドはコマンドをキューに入れた時点で応答するため、応答をページの読み込み完了とみなさず、`browser.info` でページを読み戻してください。
+
+ブラウザペインに PTY はありません。それでもターミナルレコードは持ち、そのラベルはページのホスト名に、タイトルはページタイトルに追従します。`pane.list` がブラウザペインの表示内容を示せるのはこのためです。ブラウザペインは再起動後も残ります。保存されたセッションがペインと最後の url を記録し、Herdr がそのページでブラウザを再起動します。url より下のページ状態(スクロール位置、フォーム入力、メモリ上のみの Cookie)は保持されません。
+
 `pane.layout` は、`workspace_id`、`tab_id`、`zoomed`、外側の `area`、`focused_pane_id`、ペインの矩形、分割の矩形/比率を含むタブレイアウトのスナップショットを返します。`pane.neighbor` と `pane.edges` は同じレイアウトスナップショットを含むので、クライアントは非公開のレイアウト状態なしに次の判断を下せます。
 
 `pane.process_info` は、ペインのシェル pid、利用可能な場合はフォアグラウンドプロセスグループ id、そしてプラットフォームが公開している場合は pid、名前、argv/cmdline、cwd を含むフォアグラウンドプロセスを返します。

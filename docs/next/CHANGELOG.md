@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added experimental Browser panes: `herdr browser open/navigate/reload/back/forward/info/close` render a real Chromium page in a pane. They require `experimental.kitty_graphics`, a Kitty-graphics client terminal, and the external `agent-browser` CLI, and are capped at four open panes. Browser panes survive a restart on the page they were last on; a session that cannot be started leaves the pane in place showing why, retryable with `r`.
 - Added `ui.pane_scrollbars = false` to hide terminal pane scrollbars and reclaim their reserved column.
 - Added `ui.tab_bar_position = "bottom"` to place the desktop tab row below terminal panes.
 

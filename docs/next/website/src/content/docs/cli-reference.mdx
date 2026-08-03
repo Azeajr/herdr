@@ -277,6 +277,35 @@ Metadata text is normalized before storage. Herdr trims surrounding whitespace, 
 
 `--source` and `--applies-to-source` must be 80 characters or fewer and may contain only ASCII letters, digits, colon, dot, underscore, and hyphen. `--ttl-ms` makes metadata expire automatically and must be between `1` and `86400000` milliseconds. Omit it for metadata that should stay until replaced, cleared, or the pane closes. `--seq` lets Herdr ignore stale reports from the same `--source`; stale reports are accepted by the API but ignored by pane state. A pane or workspace accepts sequenced token reports from at most 32 distinct sources during its lifetime; clearing or expiry does not release those source slots.
 
+## Browser panes
+
+A Browser pane renders a real Chromium page inside a Herdr pane, next to your terminals.
+
+```bash
+herdr browser open [<url>] [--pane <pane_id>]
+herdr browser navigate <pane_id> <url>
+herdr browser reload <pane_id>
+herdr browser back <pane_id>
+herdr browser forward <pane_id>
+herdr browser info <pane_id>
+herdr browser close <pane_id>
+```
+
+Browser panes are experimental and have two requirements. They draw through the pane graphics overlay, so they need `[experimental].kitty_graphics = true` and a client terminal that supports the Kitty graphics protocol; without it `browser open` fails with `feature_disabled`. They also drive a headless Chrome through the external [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI, which must be on `PATH`.
+
+`browser open` splits a new pane off `--pane` (or the focused pane) and returns the new pane in `.result.pane`. With no URL the pane opens on `about:blank`. At most four Browser panes can be open at once, since each one is a full browser plus a polling thread; a further `browser open` fails rather than starting a fifth.
+
+`browser info` reports the page the pane is on:
+
+```bash
+herdr browser info w1:p2
+# {"result":{"page":{"pane_id":"w1:p2","title":"Example Domain","url":"https://example.com/"}}}
+```
+
+The page's host also becomes the pane label and its title becomes the pane's terminal title, so `pane list` and the sidebar show what a Browser pane is displaying without a separate call.
+
+If the browser session dies, Herdr relaunches it a few times and then leaves the pane in place showing the failure. Press `r` in that pane to retry on the same page. The pane keeps its slot in the layout throughout, so a recovered session comes back where it was.
+
 ## Agents
 
 For the pane-versus-agent model and complete orchestration examples, see [Agent automation](/docs/agent-automation/).

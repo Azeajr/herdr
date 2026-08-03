@@ -34,6 +34,8 @@ If the Herdr server stops and starts again, the original pane processes are gone
 
 Snapshot restore does not preserve running shells, servers, tests, or arbitrary processes. Panes that cannot use a stronger restore path come back as new shells in their saved directories.
 
+Experimental Browser panes come back as Browser panes on the page they were last on, in their old place in the layout. The browser process itself is not preserved: Herdr stops it on shutdown and starts a fresh one on the saved url, so page state below the url — scroll position, form input, in-memory cookies — is lost. If `[experimental].kitty_graphics` has been turned off since the session was saved, or the session holds more Browser panes than the four-pane limit allows, the extra panes come back in place showing why they did not start, and `r` retries them.
+
 ## Pane screen history replay
 
 Pane screen history restores recent terminal contents after a full server restart. It restores what Herdr can show, not the old process.

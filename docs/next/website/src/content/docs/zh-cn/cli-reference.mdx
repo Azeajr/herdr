@@ -264,6 +264,35 @@ herdr pane report-metadata <pane_id> \
 
 `--source` 和 `--applies-to-source` 必须不超过 80 个字符,并且只能包含 ASCII 字母、数字、冒号、点、下划线和连字符。`--ttl-ms` 让元数据自动过期,取值必须在 `1` 到 `86400000` 毫秒之间。想让元数据一直保留到被替换、清除或窗格或工作区关闭时,省略它。`--seq` 让 Herdr 忽略来自同一 `--source` 的过期上报;过期上报会被 API 接受,但被窗格状态忽略。每个窗格或工作区在其生命周期内最多接受来自 32 个不同来源的带序号令牌上报,清除或过期不会释放这些来源名额。
 
+## 浏览器窗格
+
+浏览器窗格在 Herdr 窗格中渲染真实的 Chromium 页面,与你的终端并排显示。
+
+```bash
+herdr browser open [<url>] [--pane <pane_id>]
+herdr browser navigate <pane_id> <url>
+herdr browser reload <pane_id>
+herdr browser back <pane_id>
+herdr browser forward <pane_id>
+herdr browser info <pane_id>
+herdr browser close <pane_id>
+```
+
+浏览器窗格是实验性功能,有两个前提。它们通过窗格图形叠加层绘制,因此需要 `[experimental].kitty_graphics = true` 以及支持 Kitty 图形协议的客户端终端;否则 `browser open` 会以 `feature_disabled` 失败。它们还通过外部的 [`agent-browser`](https://www.npmjs.com/package/agent-browser) CLI 驱动无头 Chrome,该命令必须在 `PATH` 中。
+
+`browser open` 从 `--pane`(省略时为聚焦窗格)分割出一个新窗格,并在 `.result.pane` 中返回它。不带 URL 时窗格打开 `about:blank`。由于每个浏览器窗格都是一个完整的浏览器加一个轮询线程,同时最多只能打开四个;再次 `browser open` 会直接失败,而不会启动第五个。
+
+`browser info` 报告窗格当前所在的页面:
+
+```bash
+herdr browser info w1:p2
+# {"result":{"page":{"pane_id":"w1:p2","title":"Example Domain","url":"https://example.com/"}}}
+```
+
+页面的主机名会成为窗格标签,页面标题会成为窗格的终端标题,因此 `pane list` 和侧边栏无需额外调用即可显示浏览器窗格正在显示的内容。
+
+如果浏览器会话终止,Herdr 会重启若干次,之后保留该窗格并显示失败信息。在该窗格中按 `r` 可在同一页面上重试。整个过程中窗格都保留其布局位置,因此恢复后的会话会回到原处。
+
 ## 智能体
 
 窗格与智能体的模型和完整协调示例见[智能体自动化](/zh-cn/docs/agent-automation/)。
