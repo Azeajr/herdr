@@ -9,14 +9,13 @@
 //! owns the browser-session subsystem itself: the per-pane background actor
 //! thread and its `agent-browser` client.
 //!
-//! Known gap -- Browser panes are runtime-only and are not persisted. Nothing
-//! in `src/persist/` records that a pane was a Browser pane, so a saved
-//! session restores it as an ordinary shell pane that still carries the
-//! `"browser"` manual label set in `src/app/api/browser.rs`. Its
-//! `agent-browser` session is not restored; it is stopped at shutdown by
-//! `App::stop_all_browser_sessions`. Closing that gap means adding a marker
-//! to `PaneSnapshot` and respawning the actor during restore, which touches
-//! persisted state and the restore/handoff path.
+//! Browser panes survive a restart. `PaneSnapshot.browser` marks the pane and
+//! records its last url, `src/persist/restore.rs` rebuilds it as a
+//! PTY-less pane, and `App::restore_browser_panes` relaunches the session onto
+//! that url. The `agent-browser` session itself is never handed over: it is
+//! stopped at shutdown by `App::stop_all_browser_sessions` and a fresh one is
+//! launched on the way back up, so page state (scroll position, form input,
+//! cookies held only in memory) does not survive -- only the page does.
 
 // `App::spawn_browser_actor` starts no thread under `cfg(test)` -- the actor's
 // first act is launching a real headless Chrome, which a unit-test suite must

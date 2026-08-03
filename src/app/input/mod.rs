@@ -851,6 +851,7 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         &state.workspaces,
         &state.terminals,
         &terminal_runtimes,
+        &state.browser_pane_urls,
         state.active,
         state.selected,
         state.sidebar_width,

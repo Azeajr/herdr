@@ -44,6 +44,7 @@ impl App {
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
+                &self.state.browser_pane_urls,
                 self.state.active,
                 self.state.selected,
                 self.state.sidebar_width,

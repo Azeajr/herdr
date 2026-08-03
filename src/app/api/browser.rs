@@ -146,15 +146,72 @@ impl App {
             return false;
         }
         let url = self.state.browser_pane_urls.get(&pane_id).cloned();
-        if let Err(err) = self.spawn_browser_actor(pane_id, url) {
-            self.state.browser_pane_errors.insert(
-                pane_id,
-                format!("failed to start browser pane actor: {err}"),
-            );
+        if let Some(reason) = self.launch_browser_session(pane_id, url) {
+            self.state.browser_pane_errors.insert(pane_id, reason);
         }
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
         true
+    }
+
+    /// Starts a Browser pane's session, or reports why it must not be started.
+    ///
+    /// The relaunch path for panes that already exist ([`App::retry_browser_pane`]
+    /// and [`App::restore_browser_panes`]). `handle_browser_open` does its own
+    /// checks because it answers them as API errors before allocating a pane;
+    /// here there is already a pane, so a refusal becomes its visible state.
+    fn launch_browser_session(&mut self, pane_id: PaneId, url: Option<String>) -> Option<String> {
+        // Both conditions can have changed since the session last ran: the
+        // config is reloadable, and other panes may have taken the slots.
+        if !self.state.kitty_graphics_enabled {
+            return Some("browser panes require experimental.kitty_graphics".to_string());
+        }
+        if self.browser_actors.len() >= MAX_BROWSER_PANES {
+            return Some(format!(
+                "at most {MAX_BROWSER_PANES} browser panes can be open at once"
+            ));
+        }
+        self.spawn_browser_actor(pane_id, url)
+            .err()
+            .map(|err| format!("failed to start browser pane actor: {err}"))
+    }
+
+    /// Brings restored Browser panes back to life: reserves each pane's
+    /// graphics stream and relaunches its `agent-browser` session on the page
+    /// it was last on (`src/persist/restore.rs` rebuilds the pane itself).
+    ///
+    /// A pane whose session cannot be started stays a Browser pane in the
+    /// failed state rather than becoming a dead rectangle, so it renders the
+    /// reason and can be retried in place -- the same shape as a session that
+    /// dies at runtime (see [`App::handle_browser_daemon_exited`]).
+    pub(crate) fn restore_browser_panes(&mut self, panes: crate::persist::RestoredBrowserPanes) {
+        if panes.is_empty() {
+            return;
+        }
+        // Ordered so which panes fall outside the cap is stable across runs
+        // rather than a function of hash iteration order.
+        let mut restored: Vec<_> = panes.into_iter().collect();
+        restored.sort_by_key(|(pane_id, _)| pane_id.raw());
+        for (pane_id, url) in restored {
+            // Pane restore may have pruned it (missing cwd, dropped tab).
+            if !self.state.is_browser_pane(pane_id) {
+                continue;
+            }
+            self.state
+                .pane_graphics_streams
+                .insert(pane_id, BROWSER_STREAM_OWNER.to_string());
+            if let Some(url) = url.clone() {
+                self.state.browser_pane_urls.insert(pane_id, url);
+            }
+            // Same refusals a retry answers: a session started here would be
+            // just as invisible or just as expensive, and the config could
+            // have changed since the session was saved.
+            let Some(reason) = self.launch_browser_session(pane_id, url) else {
+                continue;
+            };
+            tracing::warn!(pane_id = pane_id.raw(), %reason, "browser pane: not restoring session");
+            self.state.browser_pane_errors.insert(pane_id, reason);
+        }
     }
 
     /// Starts a Browser pane's actor thread and registers its handle.
@@ -601,6 +658,9 @@ mod tests {
     /// alive so `browser_actors` holds a live sender.
     fn app_with_browser_pane() -> (App, PaneId, std::sync::mpsc::Receiver<BrowserCommand>) {
         let mut app = test_app();
+        // A Browser pane only ever exists because the gate was open when it
+        // was opened; a relaunch checks the flag again.
+        app.state.kitty_graphics_enabled = true;
         let mut ws = Workspace::test_new("test");
         let pane_id = ws
             .split_pane_browser(
@@ -648,6 +708,44 @@ mod tests {
             ),
         );
         (app, pane_id, command_rx)
+    }
+
+    /// Builds an app holding `count` Browser panes with no actors and no
+    /// stream reservations -- exactly the shape `crate::persist::restore`
+    /// hands back before the sessions are relaunched.
+    fn app_with_restored_browser_panes(count: usize) -> (App, Vec<PaneId>) {
+        let mut app = test_app();
+        app.state.kitty_graphics_enabled = true;
+        let mut ws = Workspace::test_new("test");
+        let mut pane_ids = Vec::new();
+        for _ in 0..count {
+            pane_ids.push(
+                ws.split_pane_browser(
+                    ws.tabs[0].root_pane,
+                    Direction::Horizontal,
+                    Some(0.5),
+                    None,
+                    true,
+                )
+                .expect("split browser pane")
+                .1
+                .pane_id,
+            );
+        }
+        let terminal_ids: Vec<_> = ws.tabs[0]
+            .panes
+            .values()
+            .map(|pane| pane.attached_terminal_id.clone())
+            .collect();
+        app.state.workspaces.push(ws);
+        app.state.active = Some(0);
+        for terminal_id in terminal_ids {
+            app.state.terminals.insert(
+                terminal_id.clone(),
+                crate::terminal::TerminalState::new(terminal_id, "/tmp".into()),
+            );
+        }
+        (app, pane_ids)
     }
 
     fn public_pane_id_of(app: &App, pane_id: PaneId) -> String {
@@ -979,6 +1077,26 @@ mod tests {
     }
 
     #[test]
+    fn retrying_a_failed_pane_refuses_once_kitty_graphics_is_off() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        app.handle_browser_daemon_exited(pane_id, "session died".to_string());
+        // The config is reloadable, so the gate that allowed the open can be
+        // shut before the user gets around to retrying.
+        app.state.kitty_graphics_enabled = false;
+
+        assert!(app.retry_browser_pane(pane_id));
+
+        assert!(app.browser_actors.is_empty());
+        let reason = app
+            .state
+            .browser_pane_errors
+            .get(&pane_id)
+            .expect("the refusal replaces the old failure");
+        assert!(reason.contains("kitty_graphics"), "{reason}");
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
     fn retrying_a_healthy_pane_does_nothing() {
         let (mut app, pane_id, command_rx) = app_with_browser_pane();
         assert!(!app.retry_browser_pane(pane_id));
@@ -1068,6 +1186,87 @@ mod tests {
             serde_json::from_str(&response).expect("error response");
         assert_eq!(error.error.code, "browser_pane_limit");
         assert_eq!(app.state.browser_pane_ids().len(), MAX_BROWSER_PANES);
+    }
+
+    #[test]
+    fn restored_browser_panes_relaunch_on_their_saved_url() {
+        let (mut app, pane_ids) = app_with_restored_browser_panes(1);
+        let pane_id = pane_ids[0];
+
+        app.restore_browser_panes(std::collections::HashMap::from([(
+            pane_id,
+            Some("https://example.com".to_string()),
+        )]));
+
+        assert!(app.browser_actors.contains_key(&pane_id));
+        // Without the reservation an unrelated `pane.graphics.set` could
+        // stomp the screencast, exactly as at first open.
+        assert_eq!(
+            app.state
+                .pane_graphics_streams
+                .get(&pane_id)
+                .map(String::as_str),
+            Some(BROWSER_STREAM_OWNER)
+        );
+        assert_eq!(
+            app.state
+                .browser_pane_urls
+                .get(&pane_id)
+                .map(String::as_str),
+            Some("https://example.com")
+        );
+        let relaunched = app
+            .test_browser_command_rx
+            .get(&pane_id)
+            .expect("restore installs an actor channel");
+        assert_eq!(
+            relaunched.try_recv().expect("navigate command"),
+            BrowserCommand::Navigate("https://example.com".to_string())
+        );
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn restored_browser_panes_stay_retryable_without_kitty_graphics() {
+        let (mut app, pane_ids) = app_with_restored_browser_panes(1);
+        let pane_id = pane_ids[0];
+        // The flag can be turned off between the save and the restore.
+        app.state.kitty_graphics_enabled = false;
+
+        app.restore_browser_panes(std::collections::HashMap::from([(
+            pane_id,
+            Some("https://example.com".to_string()),
+        )]));
+
+        // Launching here would poll a real browser forever behind a pane that
+        // can never draw it.
+        assert!(app.browser_actors.is_empty());
+        assert!(app.state.is_browser_pane(pane_id));
+        let reason = app
+            .state
+            .browser_pane_errors
+            .get(&pane_id)
+            .expect("refusal is shown in the pane");
+        assert!(reason.contains("kitty_graphics"), "{reason}");
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn restored_browser_panes_respect_the_pane_cap() {
+        let (mut app, pane_ids) = app_with_restored_browser_panes(MAX_BROWSER_PANES + 1);
+
+        app.restore_browser_panes(pane_ids.iter().map(|id| (*id, None)).collect());
+
+        // A session file can hold more Browser panes than the cap allows;
+        // restoring them all would start more Chromes than `browser.open`
+        // ever lets the user ask for.
+        assert_eq!(app.browser_actors.len(), MAX_BROWSER_PANES);
+        assert_eq!(app.state.browser_pane_errors.len(), 1);
+        // Which panes miss out is by pane id, not hash order, so it is the
+        // same set on every restore of the same file.
+        let refused = pane_ids.last().expect("pane");
+        assert!(app.state.browser_pane_errors.contains_key(refused));
+        app.state.assert_invariants_for_test();
     }
 
     #[test]

@@ -1199,6 +1199,7 @@ impl HeadlessServer {
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
+            &self.app.state.browser_pane_urls,
             self.app.state.active,
             self.app.state.selected,
             self.app.state.sidebar_width,

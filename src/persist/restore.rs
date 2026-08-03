@@ -43,21 +43,33 @@ struct RestoreRuntimeContext<'a> {
     render_dirty: Arc<RenderSignal>,
 }
 
+/// Browser panes rebuilt from a snapshot, keyed by the freshly allocated pane
+/// id, with the url each should be relaunched onto.
+///
+/// Restore only rebuilds the pane; the `agent-browser` session behind it is
+/// started by `App::restore_browser_panes`, which owns the actor threads and
+/// the `experimental.kitty_graphics` gate that decides whether a browser may
+/// run at all.
+pub type RestoredBrowserPanes = HashMap<PaneId, Option<String>>;
+
 type RestoredSession = (
     Vec<Workspace>,
     HashMap<TerminalId, TerminalState>,
     HashMap<TerminalId, TerminalRuntime>,
+    RestoredBrowserPanes,
 );
 type RestoredWorkspace = (
     Workspace,
     Vec<TerminalState>,
     HashMap<TerminalId, TerminalRuntime>,
+    RestoredBrowserPanes,
 );
 type RestoredTab = (
     crate::workspace::Tab,
     Vec<TerminalState>,
     HashMap<TerminalId, TerminalRuntime>,
     HashMap<PaneId, u32>,
+    RestoredBrowserPanes,
 );
 type RestoreFailures<T> = (T, usize);
 
@@ -270,6 +282,7 @@ fn restore_with_imports_and_failures(
     let mut workspaces = Vec::new();
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
+    let mut browser_panes = RestoredBrowserPanes::new();
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
@@ -291,16 +304,22 @@ fn restore_with_imports_and_failures(
             imported_panes,
         );
         failed_imports += workspace_failed_imports;
-        if let Some((workspace, restored_terminals, restored_runtimes)) = restored {
+        if let Some((workspace, restored_terminals, restored_runtimes, restored_browser_panes)) =
+            restored
+        {
             for terminal in restored_terminals {
                 terminals.insert(terminal.id.clone(), terminal);
             }
             terminal_runtimes.extend(restored_runtimes);
+            browser_panes.extend(restored_browser_panes);
             workspaces.push(workspace);
         }
     }
     crate::workspace::reserve_workspace_ids(&workspaces);
-    ((workspaces, terminals, terminal_runtimes), failed_imports)
+    (
+        (workspaces, terminals, terminal_runtimes, browser_panes),
+        failed_imports,
+    )
 }
 
 fn restore_workspace(
@@ -315,6 +334,7 @@ fn restore_workspace(
     let mut tabs = Vec::new();
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
+    let mut browser_panes = RestoredBrowserPanes::new();
     let workspace_id = snap
         .id
         .clone()
@@ -368,7 +388,13 @@ fn restore_workspace(
             &public_pane_ids_by_old_raw,
         );
         failed_imports += tab_failed_imports;
-        let Some((mut tab, restored_terminals, restored_runtimes, reverse_id_map)) = restored_tab
+        let Some((
+            mut tab,
+            restored_terminals,
+            restored_runtimes,
+            reverse_id_map,
+            restored_browser_panes,
+        )) = restored_tab
         else {
             continue;
         };
@@ -395,6 +421,7 @@ fn restore_workspace(
         }
         terminals.extend(restored_terminals);
         terminal_runtimes.extend(restored_runtimes);
+        browser_panes.extend(restored_browser_panes);
         tabs.push(tab);
     }
 
@@ -428,7 +455,7 @@ fn restore_workspace(
             #[cfg(test)]
             test_runtimes: HashMap::new(),
         })
-        .map(|workspace| (workspace, terminals, terminal_runtimes)),
+        .map(|workspace| (workspace, terminals, terminal_runtimes, browser_panes)),
         failed_imports,
     )
 }
@@ -465,6 +492,7 @@ fn restore_tab(
     let mut panes = HashMap::new();
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
+    let mut browser_panes = RestoredBrowserPanes::new();
     let mut failed_imports = 0;
     for id in &pane_ids {
         let old_id = reverse_id_map.get(id);
@@ -497,6 +525,35 @@ fn restore_tab(
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+
+        // A Browser pane has no PTY (see `crate::pane::PaneKind`), so it is
+        // rebuilt as a pane and terminal record only; its `agent-browser`
+        // session is launched afterwards by `App::restore_browser_panes`.
+        // Handled before the agent-resume and history paths because neither
+        // means anything for a pane with no shell.
+        if let Some(browser) = saved_pane.and_then(|pane| pane.browser.as_ref()) {
+            if old_id
+                .and_then(|old_id| imported_panes.remove(old_id))
+                .is_some()
+            {
+                // Handoff export walks `terminal_runtimes`, which a Browser
+                // pane is absent from, so this should be unreachable.
+                // Consumed anyway: an unclaimed import fails strict handoff
+                // restore outright.
+                warn!(
+                    pane_id = id.raw(),
+                    "handoff carried a pane runtime for a browser pane; dropping it"
+                );
+            }
+            let terminal_id = TerminalId::alloc();
+            let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+            terminal.set_manual_label(saved_label.unwrap_or_else(|| "browser".to_string()));
+            panes.insert(*id, PaneState::new_browser(terminal_id));
+            terminals.push(terminal);
+            browser_panes.insert(*id, browser.url.clone());
+            continue;
+        }
+
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -728,6 +785,7 @@ fn restore_tab(
             terminals,
             terminal_runtimes,
             reverse_id_map,
+            browser_panes,
         )),
         failed_imports,
     )
@@ -1195,6 +1253,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            browser: None,
                         },
                     )]),
                     zoomed: false,
@@ -1211,7 +1270,7 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (_workspaces, terminals, _runtimes) = restore(
+        let (_workspaces, terminals, _runtimes, _browser_panes) = restore(
             &snapshot,
             None,
             24,
@@ -1242,6 +1301,201 @@ mod tests {
         assert_eq!(session.source, "herdr:opencode");
         assert_eq!(session.agent, "opencode");
         assert_eq!(session.session_ref.value, "opencode-session");
+    }
+
+    /// Characterization: every saved pane becomes a PTY-backed pane with its
+    /// own runtime. Browser-pane restore makes this conditional, so pin the
+    /// unconditional behaviour for snapshots that carry no browser marker.
+    #[tokio::test]
+    async fn restore_makes_every_unmarked_pane_a_terminal_pane_with_a_runtime() {
+        let cwd = std::env::current_dir().unwrap();
+        let pane = || super::super::snapshot::PaneSnapshot {
+            cwd: cwd.clone(),
+            label: None,
+            agent_name: None,
+            managed_agent_kind: None,
+            agent_session: None,
+            launch_argv: None,
+            browser: None,
+        };
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(10)),
+                        second: Box::new(LayoutSnapshot::Pane(20)),
+                    },
+                    panes: HashMap::from([(10, pane()), (20, pane())]),
+                    zoomed: false,
+                    focused: Some(10),
+                    root_pane: Some(10),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, runtimes, _browser_panes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let tab = &workspaces[0].tabs[0];
+        assert_eq!(tab.panes.len(), 2);
+        assert!(
+            tab.panes.values().all(|pane| !pane.is_browser()),
+            "unmarked panes must restore as PTY panes"
+        );
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(runtimes.len(), 2, "every PTY pane owns a runtime");
+
+        for runtime in runtimes.values() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while runtime.cwd().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_rebuilds_a_marked_pane_as_a_browser_pane_with_no_pty() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w1".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Split {
+                        direction: super::super::snapshot::DirectionSnapshot::Horizontal,
+                        ratio: 0.5,
+                        first: Box::new(LayoutSnapshot::Pane(10)),
+                        second: Box::new(LayoutSnapshot::Pane(20)),
+                    },
+                    panes: HashMap::from([
+                        (
+                            10,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd: cwd.clone(),
+                                label: None,
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: None,
+                                launch_argv: None,
+                                browser: None,
+                            },
+                        ),
+                        (
+                            20,
+                            super::super::snapshot::PaneSnapshot {
+                                cwd: cwd.clone(),
+                                label: Some("example.com".into()),
+                                agent_name: None,
+                                managed_agent_kind: None,
+                                agent_session: None,
+                                launch_argv: None,
+                                browser: Some(super::super::snapshot::PaneBrowserSnapshot {
+                                    url: Some("https://example.com/x".into()),
+                                }),
+                            },
+                        ),
+                    ]),
+                    zoomed: false,
+                    focused: Some(10),
+                    root_pane: Some(10),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, runtimes, browser_panes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let tab = &workspaces[0].tabs[0];
+        let (browser_pane_id, browser_pane) = tab
+            .panes
+            .iter()
+            .find(|(_, pane)| pane.is_browser())
+            .expect("marked pane should restore as a Browser pane");
+        assert_eq!(tab.panes.len(), 2);
+        // The pane keeps its place in the layout next to the shell pane.
+        assert_eq!(
+            tab.panes.values().filter(|pane| pane.is_browser()).count(),
+            1
+        );
+        // A Browser pane has no PTY, so only the shell pane owns a runtime.
+        assert_eq!(terminals.len(), 2);
+        assert_eq!(runtimes.len(), 1);
+        assert!(!runtimes.contains_key(&browser_pane.attached_terminal_id));
+        assert_eq!(
+            terminals[&browser_pane.attached_terminal_id]
+                .manual_label
+                .as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            browser_panes,
+            HashMap::from([(*browser_pane_id, Some("https://example.com/x".to_string()))])
+        );
+
+        for runtime in runtimes.values() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while runtime.cwd().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+        }
     }
 
     #[tokio::test]
@@ -1276,6 +1530,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                browser: None,
                             },
                         ),
                         (
@@ -1287,6 +1542,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                browser: None,
                             },
                         ),
                     ]),
@@ -1304,7 +1560,7 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (workspaces, _terminals, _runtimes) = restore(
+        let (workspaces, _terminals, _runtimes, _browser_panes) = restore(
             &snapshot,
             None,
             24,
@@ -1340,6 +1596,7 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    browser: None,
                 },
             )
         };
@@ -1355,6 +1612,7 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            browser: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1411,7 +1669,7 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (workspaces, terminals, _runtimes) = restore(
+        let (workspaces, terminals, _runtimes, _browser_panes) = restore(
             &snapshot,
             None,
             24,
@@ -1506,6 +1764,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            browser: None,
                         },
                     )]),
                     zoomed: false,
@@ -1522,7 +1781,7 @@ mod tests {
         };
         let (events, _event_rx) = mpsc::channel(4);
 
-        let (_workspaces, terminals, runtimes) = restore(
+        let (_workspaces, terminals, runtimes, _browser_panes) = restore(
             &snapshot,
             None,
             24,
@@ -1553,17 +1812,18 @@ mod tests {
             "native agent restore should not spawn a fallback-size runtime during snapshot restore"
         );
         let mut imports = HashMap::new();
-        let (_handoff_workspaces, handoff_terminals, handoff_runtimes) = restore_handoff(
-            &snapshot,
-            0,
-            test_restore_shell(),
-            crate::config::ShellModeConfig::NonLogin,
-            &mut imports,
-            mpsc::channel(4).0,
-            Arc::new(Notify::new()),
-            Arc::new(RenderSignal::new()),
-        )
-        .expect("handoff restore should preserve pending native agent resume");
+        let (_handoff_workspaces, handoff_terminals, handoff_runtimes, _handoff_browser_panes) =
+            restore_handoff(
+                &snapshot,
+                0,
+                test_restore_shell(),
+                crate::config::ShellModeConfig::NonLogin,
+                &mut imports,
+                mpsc::channel(4).0,
+                Arc::new(Notify::new()),
+                Arc::new(RenderSignal::new()),
+            )
+            .expect("handoff restore should preserve pending native agent resume");
         let handoff_terminal = handoff_terminals
             .values()
             .next()
@@ -1585,7 +1845,7 @@ mod tests {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(RenderSignal::new());
 
-        let (_workspaces, _terminals, runtimes) = restore(
+        let (_workspaces, _terminals, runtimes, _browser_panes) = restore(
             &snapshot,
             Some(&history),
             5,
@@ -1623,7 +1883,7 @@ mod tests {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(RenderSignal::new());
 
-        let (_workspaces, _terminals, runtimes) = restore(
+        let (_workspaces, _terminals, runtimes, _browser_panes) = restore(
             &snapshot,
             None,
             5,
@@ -1667,6 +1927,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                browser: None,
             },
         );
         let history = SessionHistorySnapshot {

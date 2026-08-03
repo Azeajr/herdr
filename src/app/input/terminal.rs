@@ -1462,6 +1462,7 @@ mod tests {
             &app.state.workspaces,
             &app.state.terminals,
             &app.terminal_runtimes,
+            &app.state.browser_pane_urls,
             app.state.active,
             app.state.selected,
             app.state.sidebar_width,

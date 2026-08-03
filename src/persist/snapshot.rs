@@ -107,6 +107,23 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<PaneBrowserSnapshot>,
+}
+
+/// Marks a saved pane as a Browser pane and records where to put it back.
+///
+/// Presence is the marker: a pane carrying this restores as
+/// `PaneKind::Browser` with an `agent-browser` session instead of a shell.
+/// The field is optional and skipped when absent, so a session file written
+/// by this build still loads in a build that predates Browser panes --
+/// which is why `SNAPSHOT_VERSION` does not move for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneBrowserSnapshot {
+    /// Last url the pane was on, replayed on restore. `None` for a pane that
+    /// never navigated anywhere (it comes back on `about:blank`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +273,7 @@ pub fn capture(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    browser_pane_urls: &HashMap<crate::layout::PaneId, String>,
     active: Option<usize>,
     selected: usize,
     sidebar_width: u16,
@@ -266,7 +284,9 @@ pub fn capture(
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
             .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+            .map(|workspace| {
+                capture_workspace(workspace, terminals, terminal_runtimes, browser_pane_urls)
+            })
             .collect(),
         active,
         selected,
@@ -283,6 +303,7 @@ fn capture_workspace(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    browser_pane_urls: &HashMap<crate::layout::PaneId, String>,
 ) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
@@ -302,7 +323,7 @@ fn capture_workspace(
         tabs: ws
             .tabs
             .iter()
-            .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
+            .map(|tab| capture_tab(tab, terminals, terminal_runtimes, browser_pane_urls))
             .collect(),
         active_tab: ws.active_tab,
     }
@@ -315,6 +336,7 @@ fn capture_tab(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    browser_pane_urls: &HashMap<crate::layout::PaneId, String>,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
     for id in tab.panes.keys() {
@@ -325,6 +347,16 @@ fn capture_tab(
             .panes
             .get(id)
             .and_then(|pane| terminals.get(&pane.attached_terminal_id));
+        // The pane's own kind is the source of truth for this, not the
+        // presence of a url or an actor: a Browser pane whose session died is
+        // still a Browser pane and must come back as one.
+        let browser =
+            tab.panes
+                .get(id)
+                .filter(|pane| pane.is_browser())
+                .map(|_| PaneBrowserSnapshot {
+                    url: browser_pane_urls.get(id).cloned(),
+                });
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
         let (agent_name, managed_agent_kind) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
@@ -368,6 +400,7 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                browser,
             },
         );
     }
@@ -536,6 +569,7 @@ mod tests {
             &state.workspaces,
             &state.terminals,
             terminal_runtimes,
+            &state.browser_pane_urls,
             state.active,
             state.selected,
             state.sidebar_width,
@@ -648,6 +682,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                browser: None,
             },
         );
         panes.insert(
@@ -659,6 +694,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                browser: None,
             },
         );
 
@@ -1000,6 +1036,58 @@ mod tests {
     }
 
     #[test]
+    fn capture_contract_tracks_browser_panes_and_their_last_url() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let browser_pane = state.workspaces[0]
+            .split_pane_browser(root, Direction::Horizontal, Some(0.5), None, true)
+            .expect("split browser pane")
+            .1
+            .pane_id;
+        state.ensure_test_terminals();
+        state
+            .browser_pane_urls
+            .insert(browser_pane, "https://example.com/x".into());
+
+        let snapshot = capture_from_state(&state);
+        let tab = &snapshot.workspaces[0].tabs[0];
+
+        let browser = tab.panes[&browser_pane.raw()]
+            .browser
+            .as_ref()
+            .expect("browser pane should be marked");
+        assert_eq!(browser.url.as_deref(), Some("https://example.com/x"));
+        // A shell pane stays unmarked, and its json does not grow a key --
+        // which is what lets a build without Browser panes read this file.
+        assert!(tab.panes[&root.raw()].browser.is_none());
+        let encoded = serde_json::to_string(&tab.panes[&root.raw()]).unwrap();
+        assert!(!encoded.contains("browser"), "{encoded}");
+    }
+
+    #[test]
+    fn capture_contract_marks_a_browser_pane_that_never_navigated() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let browser_pane = state.workspaces[0]
+            .split_pane_browser(root, Direction::Horizontal, Some(0.5), None, true)
+            .expect("split browser pane")
+            .1
+            .pane_id;
+        state.ensure_test_terminals();
+
+        let snapshot = capture_from_state(&state);
+
+        // The pane's kind is the marker, not the url: a pane opened on
+        // about:blank, or one whose session died before it reported a page,
+        // must still come back as a Browser pane.
+        let browser = snapshot.workspaces[0].tabs[0].panes[&browser_pane.raw()]
+            .browser
+            .as_ref()
+            .expect("browser pane should be marked without a url");
+        assert_eq!(browser.url, None);
+    }
+
+    #[test]
     fn capture_contract_tracks_workspace_identity_and_pane_cwds() {
         let mut state = state_with_workspaces(&["one"]);
         let root = state.workspaces[0].tabs[0].root_pane;
@@ -1207,6 +1295,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                browser: None,
             },
         );
         panes.insert(
@@ -1220,6 +1309,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                browser: None,
             },
         );
 

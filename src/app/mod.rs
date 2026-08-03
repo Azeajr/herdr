@@ -400,6 +400,7 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut restored_browser_panes = crate::persist::RestoredBrowserPanes::new();
         let (
             workspaces,
             active,
@@ -424,7 +425,7 @@ impl App {
                 .pane_history
                 .then(crate::persist::load_history)
                 .flatten();
-            let (ws, terminals, terminal_runtimes) = crate::persist::restore(
+            let (ws, terminals, terminal_runtimes, browser_panes) = crate::persist::restore(
                 &snap,
                 history.as_ref(),
                 24,
@@ -439,6 +440,7 @@ impl App {
             );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
+            restored_browser_panes = browser_panes;
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (
@@ -745,7 +747,7 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
-        Self {
+        let mut app = Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
@@ -805,7 +807,9 @@ impl App {
             local_input_source_switch: true,
             config_reloaded_from_disk: false,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
-        }
+        };
+        app.restore_browser_panes(restored_browser_panes);
+        app
     }
 
     #[cfg(unix)]
@@ -821,7 +825,7 @@ impl App {
         >,
     ) -> io::Result<Self> {
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
-        let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
+        let (workspaces, terminals, runtimes, browser_panes) = crate::persist::restore_handoff(
             snapshot,
             config.advanced.scrollback_limit_bytes,
             &config.terminal.default_shell,
@@ -851,6 +855,10 @@ impl App {
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
         app.terminal_runtimes = runtimes.into();
+        // After the workspaces are in place: launching a session needs the
+        // pane to be findable, and the old server stops its own browsers as
+        // it exits, so these are always fresh launches rather than handovers.
+        app.restore_browser_panes(browser_panes);
         app.state.active = snapshot
             .active
             .filter(|&idx| idx < app.state.workspaces.len());
