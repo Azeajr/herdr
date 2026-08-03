@@ -1724,6 +1724,18 @@
           },
           "type": "object"
         },
+        "BrowserPaneTarget": {
+          "description": "Identifies a Browser pane for an action that needs no other input\n(`browser.reload`, `browser.back`, `browser.forward`, `browser.close`,\n`browser.info`).",
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleSetParams": {
           "properties": {
             "title": {
@@ -5412,6 +5424,86 @@
         {
           "properties": {
             "method": {
+              "const": "browser.reload",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserPaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "browser.back",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserPaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "browser.forward",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserPaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "browser.info",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserPaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "browser.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/BrowserPaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.send_text",
               "type": "string"
             },
@@ -6342,6 +6434,37 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "BrowserPageInfo": {
+          "description": "What a Browser pane is currently showing. `url` and `title` are whatever\nthe last successful page-info poll observed, so they lag a navigation by\nup to one poll interval and are absent until the first one lands.",
+          "properties": {
+            "error": {
+              "description": "Set when the pane's `agent-browser` session has failed and the pane is\nwaiting for a retry.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "url": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -9013,6 +9136,22 @@
               "required": [
                 "type",
                 "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "page": {
+                  "$ref": "#/schemas/success_response/$defs/BrowserPageInfo"
+                },
+                "type": {
+                  "const": "browser_page_info",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "page"
               ],
               "type": "object"
             },

@@ -169,6 +169,16 @@ pub enum Method {
     BrowserOpen(BrowserOpenParams),
     #[serde(rename = "browser.navigate")]
     BrowserNavigate(BrowserNavigateParams),
+    #[serde(rename = "browser.reload")]
+    BrowserReload(BrowserPaneTarget),
+    #[serde(rename = "browser.back")]
+    BrowserBack(BrowserPaneTarget),
+    #[serde(rename = "browser.forward")]
+    BrowserForward(BrowserPaneTarget),
+    #[serde(rename = "browser.info")]
+    BrowserInfo(BrowserPaneTarget),
+    #[serde(rename = "browser.close")]
+    BrowserClose(BrowserPaneTarget),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]

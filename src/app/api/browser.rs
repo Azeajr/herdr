@@ -17,6 +17,22 @@ pub(crate) const BROWSER_STREAM_OWNER: &str = "herdr-browser";
 /// to take the machine down rather than a useful workflow.
 pub(crate) const MAX_BROWSER_PANES: usize = 4;
 
+/// Short pane label for a page: its host, with `www.` dropped. Falls back to
+/// `None` for urls with no host (`about:blank`, `file://`), letting the
+/// caller keep the generic label.
+fn browser_pane_label(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest)?;
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Strip userinfo and port, which are noise in a pane border.
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 impl App {
     /// Handles `AppEvent::BrowserFrame`: pushes a newly polled PNG
     /// screenshot into the pane's graphics overlay via the same mechanism
@@ -48,6 +64,77 @@ impl App {
         self.state.pane_graphics_layers.remove(&pane_id);
         self.state.pane_graphics_revision = self.state.pane_graphics_revision.wrapping_add(1);
         self.state.browser_pane_errors.insert(pane_id, reason);
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
+    }
+
+    /// Handles `AppEvent::BrowserPageInfo`: reflects the page's identity onto
+    /// the pane.
+    ///
+    /// The host goes in the manual label (a pane border has room for
+    /// `example.com`, not a headline) and the full title goes in the terminal
+    /// title, which is what the sidebar and `pane.list` already surface. Both
+    /// are runtime facts about the pane, so they live in server state rather
+    /// than only in the TUI.
+    pub(crate) fn handle_browser_page_info(
+        &mut self,
+        pane_id: PaneId,
+        url: Option<String>,
+        title: Option<String>,
+    ) {
+        if !self.state.is_browser_pane(pane_id) {
+            return;
+        }
+        match &url {
+            Some(url) => {
+                self.state.browser_pane_urls.insert(pane_id, url.clone());
+            }
+            None => {
+                self.state.browser_pane_urls.remove(&pane_id);
+            }
+        }
+        let label = url
+            .as_deref()
+            .and_then(browser_pane_label)
+            .unwrap_or_else(|| "browser".to_string());
+        let Some((ws_idx, _)) = self.find_pane(pane_id) else {
+            return;
+        };
+        let Some(terminal_id) = self.state.terminal_id_for_pane(ws_idx, pane_id) else {
+            return;
+        };
+        let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        terminal.set_manual_label(label);
+        terminal.set_terminal_title(title);
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
+    }
+
+    /// Handles `AppEvent::BrowserCommandFailed`: a command the API already
+    /// answered `ok` to turned out to fail. Surfaced as a toast because the
+    /// request is long gone by the time the actor runs it.
+    pub(crate) fn handle_browser_command_failed(
+        &mut self,
+        pane_id: PaneId,
+        action: &str,
+        reason: &str,
+    ) {
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: format!("browser {action} failed"),
+            context: reason.to_string(),
+            position: None,
+            target: self
+                .find_pane(pane_id)
+                .map(|(ws_idx, _)| crate::app::state::ToastTarget {
+                    workspace_id: self.state.workspaces[ws_idx].id.clone(),
+                    pane_id,
+                }),
+        });
+        self.sync_toast_deadline(previous_toast);
         self.render_dirty.request_generic();
         self.render_notify.notify_one();
     }
@@ -130,6 +217,18 @@ impl App {
         self.state.clear_browser_frame(pane_id);
     }
 
+    /// Stops a pane's `agent-browser` session.
+    ///
+    /// Skipped under `cfg(test)` for the same reason
+    /// [`App::spawn_browser_actor`] starts no thread there: this shells out to
+    /// the real CLI, and a unit-test suite has no business spawning it.
+    fn stop_browser_session(&mut self, pane_id: PaneId) {
+        #[cfg(not(test))]
+        crate::browser::daemon::stop(&crate::browser::daemon::session_name(pane_id));
+        #[cfg(test)]
+        self.test_stopped_browser_sessions.push(pane_id);
+    }
+
     /// Pushes each Browser pane's current pixel size to its session, so the
     /// page is laid out at the pane's aspect ratio instead of being stretched
     /// into it by the Kitty placement.
@@ -177,7 +276,7 @@ impl App {
         let pane_ids = self.state.browser_pane_ids();
         for pane_id in pane_ids {
             self.retire_browser_pane(pane_id);
-            crate::browser::daemon::stop(&crate::browser::daemon::session_name(pane_id));
+            self.stop_browser_session(pane_id);
         }
     }
 
@@ -212,6 +311,13 @@ impl App {
                 format!("at most {MAX_BROWSER_PANES} browser panes can be open at once"),
             );
         }
+        // Validated before the pane is allocated, so a bad url is an error
+        // instead of a blank pane that quietly failed to navigate.
+        let url = match params.url.as_deref().map(crate::browser::url::normalize) {
+            Some(Ok(url)) => Some(url),
+            Some(Err(err)) => return encode_error(id, "invalid_url", err),
+            None => None,
+        };
         let target_pane_id = match params.pane_id {
             Some(pane_id) => pane_id,
             None => match self.current_public_browser_target_pane_id() {
@@ -251,7 +357,7 @@ impl App {
         self.state.remove_alias_shadowed_by_new_pane(pane_id);
         self.state.terminals.insert(terminal_id, terminal);
 
-        if let Err(err) = self.spawn_browser_actor(pane_id, params.url) {
+        if let Err(err) = self.spawn_browser_actor(pane_id, url) {
             self.rollback_browser_pane(ws_idx, pane_id);
             return encode_error(
                 id,
@@ -305,30 +411,171 @@ impl App {
         id: String,
         params: crate::api::schema::BrowserNavigateParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+        let url = match crate::browser::url::normalize(&params.url) {
+            Ok(url) => url,
+            Err(err) => return encode_error(id, "invalid_url", err),
+        };
+        let pane_id = match self.browser_pane_for_request(&params.pane_id) {
+            Ok(pane_id) => pane_id,
+            Err(response) => return encode_error(id, response.0, response.1),
+        };
+        if let Err(response) = self.send_browser_command(
+            pane_id,
+            crate::browser::BrowserCommand::Navigate(url.clone()),
+        ) {
+            return encode_error(id, response.0, response.1);
+        }
+        // Remembered so a later relaunch lands back on this page rather than
+        // on `about:blank` (see `App::retry_browser_pane`).
+        self.state.browser_pane_urls.insert(pane_id, url);
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_browser_reload(
+        &mut self,
+        id: String,
+        params: crate::api::schema::BrowserPaneTarget,
+    ) -> String {
+        self.handle_browser_page_action(id, &params.pane_id, crate::browser::BrowserCommand::Reload)
+    }
+
+    pub(super) fn handle_browser_back(
+        &mut self,
+        id: String,
+        params: crate::api::schema::BrowserPaneTarget,
+    ) -> String {
+        self.handle_browser_page_action(id, &params.pane_id, crate::browser::BrowserCommand::Back)
+    }
+
+    pub(super) fn handle_browser_forward(
+        &mut self,
+        id: String,
+        params: crate::api::schema::BrowserPaneTarget,
+    ) -> String {
+        self.handle_browser_page_action(
+            id,
+            &params.pane_id,
+            crate::browser::BrowserCommand::Forward,
+        )
+    }
+
+    fn handle_browser_page_action(
+        &mut self,
+        id: String,
+        public_pane_id: &str,
+        command: crate::browser::BrowserCommand,
+    ) -> String {
+        let pane_id = match self.browser_pane_for_request(public_pane_id) {
+            Ok(pane_id) => pane_id,
+            Err(response) => return encode_error(id, response.0, response.1),
+        };
+        match self.send_browser_command(pane_id, command) {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(response) => encode_error(id, response.0, response.1),
+        }
+    }
+
+    /// Reports what a Browser pane is showing. Answers from state the actor
+    /// last reported rather than querying the session, so it stays a cheap
+    /// non-blocking read; the values lag a navigation by up to one poll.
+    pub(super) fn handle_browser_info(
+        &mut self,
+        id: String,
+        params: crate::api::schema::BrowserPaneTarget,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return encode_error(
                 id,
                 "pane_not_found",
                 format!("pane {} not found", params.pane_id),
             );
         };
-        let Some(commands) = self.browser_actors.get(&pane_id) else {
+        if !self.state.is_browser_pane(pane_id) {
             return encode_error(id, "not_browser_pane", "pane is not a Browser pane");
-        };
-        if commands
-            .send(crate::browser::BrowserCommand::Navigate(params.url.clone()))
-            .is_err()
-        {
-            return encode_error(
-                id,
-                "browser_pane_gone",
-                "browser pane actor is no longer running",
-            );
         }
-        // Remembered so a later relaunch lands back on this page rather than
-        // on `about:blank` (see `App::retry_browser_pane`).
-        self.state.browser_pane_urls.insert(pane_id, params.url);
-        encode_success(id, ResponseResult::Ok {})
+        let title = self
+            .state
+            .terminal_id_for_pane(ws_idx, pane_id)
+            .and_then(|terminal_id| self.state.terminals.get(&terminal_id))
+            .and_then(|terminal| terminal.terminal_title.clone());
+        encode_success(
+            id,
+            ResponseResult::BrowserPageInfo {
+                page: crate::api::schema::BrowserPageInfo {
+                    pane_id: params.pane_id,
+                    url: self.state.browser_pane_urls.get(&pane_id).cloned(),
+                    title,
+                    error: self.state.browser_pane_errors.get(&pane_id).cloned(),
+                },
+            },
+        )
+    }
+
+    /// Closes a Browser pane: stops its session and removes the pane, the
+    /// same outcome as `pane.close` on an ordinary pane.
+    pub(super) fn handle_browser_close(
+        &mut self,
+        id: String,
+        params: crate::api::schema::BrowserPaneTarget,
+    ) -> String {
+        let pane_id = match self.browser_pane_for_request(&params.pane_id) {
+            Ok(pane_id) => pane_id,
+            Err(response) => return encode_error(id, response.0, response.1),
+        };
+        // Stop the browser first: once the pane leaves the layout its kind is
+        // no longer readable, and `pane.close` has no idea a detached
+        // agent-browser daemon is attached to it.
+        self.retire_browser_pane(pane_id);
+        self.stop_browser_session(pane_id);
+        // Reuse the ordinary pane teardown so workspace collapse, events and
+        // session save behave exactly as they do for any other pane.
+        let target = crate::api::schema::PaneTarget {
+            pane_id: params.pane_id,
+        };
+        match self.close_pane(id.clone(), &target) {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(response) => response,
+        }
+    }
+
+    /// Resolves a public pane id to a live Browser pane, or the error code and
+    /// message to answer with.
+    fn browser_pane_for_request(
+        &self,
+        public_pane_id: &str,
+    ) -> Result<PaneId, (&'static str, String)> {
+        let Some((_ws_idx, pane_id)) = self.parse_pane_id(public_pane_id) else {
+            return Err(("pane_not_found", format!("pane {public_pane_id} not found")));
+        };
+        if !self.state.is_browser_pane(pane_id) {
+            return Err(("not_browser_pane", "pane is not a Browser pane".to_string()));
+        }
+        Ok(pane_id)
+    }
+
+    fn send_browser_command(
+        &self,
+        pane_id: PaneId,
+        command: crate::browser::BrowserCommand,
+    ) -> Result<(), (&'static str, String)> {
+        let Some(commands) = self.browser_actors.get(&pane_id) else {
+            // The pane is still a Browser pane, so this is the failed state
+            // rather than a wrong pane id.
+            return Err((
+                "browser_pane_gone",
+                self.state
+                    .browser_pane_errors
+                    .get(&pane_id)
+                    .cloned()
+                    .unwrap_or_else(|| "browser pane actor is no longer running".to_string()),
+            ));
+        };
+        commands.send(command).map_err(|_| {
+            (
+                "browser_pane_gone",
+                "browser pane actor is no longer running".to_string(),
+            )
+        })
     }
 }
 
@@ -401,6 +648,250 @@ mod tests {
             ),
         );
         (app, pane_id, command_rx)
+    }
+
+    fn public_pane_id_of(app: &App, pane_id: PaneId) -> String {
+        app.public_pane_id(0, pane_id).expect("public pane id")
+    }
+
+    fn error_code(response: &str) -> String {
+        let error: crate::api::schema::ErrorResponse =
+            serde_json::from_str(response).expect("error response");
+        error.error.code
+    }
+
+    #[test]
+    fn page_labels_use_the_host_and_the_title() {
+        assert_eq!(
+            browser_pane_label("https://www.example.com/a/b?c=d#e").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            browser_pane_label("http://user:pw@example.org:8443/x").as_deref(),
+            Some("example.org")
+        );
+        // No host to show; the caller keeps the generic label.
+        assert_eq!(browser_pane_label("about:blank"), None);
+        assert_eq!(browser_pane_label("file:///tmp/x.html"), None);
+    }
+
+    #[test]
+    fn page_info_replaces_the_placeholder_label_and_title() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+
+        app.handle_browser_page_info(
+            pane_id,
+            Some("https://www.rust-lang.org/learn".to_string()),
+            Some("Learn Rust".to_string()),
+        );
+
+        let terminal_id = app
+            .state
+            .terminal_id_for_pane(0, pane_id)
+            .expect("browser pane terminal");
+        let terminal = app.state.terminals.get(&terminal_id).expect("terminal");
+        // Was the literal "browser" forever before this.
+        assert_eq!(terminal.manual_label.as_deref(), Some("rust-lang.org"));
+        assert_eq!(terminal.terminal_title.as_deref(), Some("Learn Rust"));
+        assert_eq!(
+            app.state
+                .browser_pane_urls
+                .get(&pane_id)
+                .map(String::as_str),
+            Some("https://www.rust-lang.org/learn")
+        );
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn page_info_is_ignored_for_panes_that_are_not_browser_panes() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        app.retire_browser_pane(pane_id);
+
+        app.handle_browser_page_info(pane_id, Some("https://example.com".to_string()), None);
+
+        assert!(!app.state.browser_pane_urls.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn a_failed_command_becomes_a_toast() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        assert!(app.state.toast.is_none());
+
+        app.handle_browser_command_failed(pane_id, "navigate", "net::ERR_NAME_NOT_RESOLVED");
+
+        // The API answered `ok` long before the actor ran this, so a silent
+        // failure is indistinguishable from success.
+        let toast = app.state.toast.as_ref().expect("toast");
+        assert_eq!(toast.title, "browser navigate failed");
+        assert_eq!(toast.context, "net::ERR_NAME_NOT_RESOLVED");
+        assert_eq!(toast.target.as_ref().map(|t| t.pane_id), Some(pane_id));
+    }
+
+    #[test]
+    fn page_actions_reach_the_actor() {
+        let (mut app, pane_id, command_rx) = app_with_browser_pane();
+        let public = public_pane_id_of(&app, pane_id);
+        let target = crate::api::schema::BrowserPaneTarget {
+            pane_id: public.clone(),
+        };
+
+        app.handle_browser_reload("1".into(), target.clone());
+        app.handle_browser_back("2".into(), target.clone());
+        app.handle_browser_forward("3".into(), target);
+
+        assert_eq!(command_rx.try_recv().unwrap(), BrowserCommand::Reload);
+        assert_eq!(command_rx.try_recv().unwrap(), BrowserCommand::Back);
+        assert_eq!(command_rx.try_recv().unwrap(), BrowserCommand::Forward);
+    }
+
+    #[test]
+    fn page_actions_reject_panes_that_are_not_browser_panes() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        let shell_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let public = public_pane_id_of(&app, shell_pane);
+        assert_ne!(shell_pane, pane_id);
+
+        let response = app.handle_browser_reload(
+            "1".into(),
+            crate::api::schema::BrowserPaneTarget { pane_id: public },
+        );
+
+        assert_eq!(error_code(&response), "not_browser_pane");
+    }
+
+    #[test]
+    fn navigate_normalizes_and_rejects_urls() {
+        let (mut app, pane_id, command_rx) = app_with_browser_pane();
+        let public = public_pane_id_of(&app, pane_id);
+
+        let response = app.handle_browser_navigate(
+            "1".into(),
+            crate::api::schema::BrowserNavigateParams {
+                pane_id: public.clone(),
+                url: "example.com".to_string(),
+            },
+        );
+        assert!(!response.contains("\"error\""), "{response}");
+        assert_eq!(
+            command_rx.try_recv().unwrap(),
+            BrowserCommand::Navigate("https://example.com".to_string())
+        );
+        assert_eq!(
+            app.state
+                .browser_pane_urls
+                .get(&pane_id)
+                .map(String::as_str),
+            Some("https://example.com")
+        );
+
+        // Would otherwise be handed to the CLI as a flag.
+        let response = app.handle_browser_navigate(
+            "2".into(),
+            crate::api::schema::BrowserNavigateParams {
+                pane_id: public,
+                url: "--version".to_string(),
+            },
+        );
+        assert_eq!(error_code(&response), "invalid_url");
+        assert!(command_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn open_rejects_a_bad_url_before_allocating_a_pane() {
+        let mut app = test_app();
+        app.state.kitty_graphics_enabled = true;
+        app.state.workspaces.push(Workspace::test_new("test"));
+        app.state.active = Some(0);
+        let panes_before = app.state.workspaces[0].tabs[0].panes.len();
+
+        let response = app.handle_browser_open(
+            "1".to_string(),
+            BrowserOpenParams {
+                pane_id: None,
+                url: Some("javascript:alert(1)".to_string()),
+            },
+        );
+
+        assert_eq!(error_code(&response), "invalid_url");
+        // A pane that failed to navigate would just be a blank rectangle.
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), panes_before);
+        assert!(app.state.browser_pane_ids().is_empty());
+    }
+
+    #[test]
+    fn info_reports_url_title_and_failure() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        let public = public_pane_id_of(&app, pane_id);
+        app.handle_browser_page_info(
+            pane_id,
+            Some("https://example.com/x".to_string()),
+            Some("Example".to_string()),
+        );
+
+        let response = app.handle_browser_info(
+            "1".into(),
+            crate::api::schema::BrowserPaneTarget {
+                pane_id: public.clone(),
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).expect("response");
+        let page = &value["result"]["page"];
+        assert_eq!(page["url"], "https://example.com/x");
+        assert_eq!(page["title"], "Example");
+        assert!(page.get("error").is_none(), "{page}");
+
+        app.handle_browser_daemon_exited(pane_id, "session died".to_string());
+        let response = app.handle_browser_info(
+            "2".into(),
+            crate::api::schema::BrowserPaneTarget { pane_id: public },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).expect("response");
+        assert_eq!(value["result"]["page"]["error"], "session died");
+    }
+
+    #[test]
+    fn close_stops_the_session_and_removes_the_pane() {
+        let (mut app, pane_id, command_rx) = app_with_browser_pane();
+        let public = public_pane_id_of(&app, pane_id);
+        let terminal_id = app
+            .state
+            .terminal_id_for_pane(0, pane_id)
+            .expect("browser pane terminal");
+
+        let response = app.handle_browser_close(
+            "1".into(),
+            crate::api::schema::BrowserPaneTarget { pane_id: public },
+        );
+
+        assert!(!response.contains("\"error\""), "{response}");
+        // The daemon is detached, so closing the pane alone would leak it.
+        assert_eq!(app.test_stopped_browser_sessions, vec![pane_id]);
+        assert!(app.find_pane(pane_id).is_none());
+        assert!(!app.state.terminals.contains_key(&terminal_id));
+        assert!(!app.state.is_browser_pane(pane_id));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        app.state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn commands_for_a_failed_pane_report_why() {
+        let (mut app, pane_id, _command_rx) = app_with_browser_pane();
+        let public = public_pane_id_of(&app, pane_id);
+        app.handle_browser_daemon_exited(pane_id, "chrome crashed".to_string());
+
+        let response = app.handle_browser_reload(
+            "1".into(),
+            crate::api::schema::BrowserPaneTarget { pane_id: public },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&response).expect("response");
+        assert_eq!(value["error"]["code"], "browser_pane_gone");
+        // The recorded failure is more use than "actor is no longer running".
+        assert_eq!(value["error"]["message"], "chrome crashed");
     }
 
     #[test]

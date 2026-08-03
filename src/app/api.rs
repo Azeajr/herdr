@@ -145,6 +145,26 @@ impl App {
             return;
         }
 
+        if let AppEvent::BrowserPageInfo {
+            pane_id,
+            url,
+            title,
+        } = ev
+        {
+            self.handle_browser_page_info(pane_id, url, title);
+            return;
+        }
+
+        if let AppEvent::BrowserCommandFailed {
+            pane_id,
+            action,
+            reason,
+        } = ev
+        {
+            self.handle_browser_command_failed(pane_id, &action, &reason);
+            return;
+        }
+
         if let AppEvent::PluginCommandFinished {
             log_id,
             finished_unix_ms,
@@ -1126,6 +1146,13 @@ impl App {
             Method::BrowserNavigate(params) => {
                 return self.handle_browser_navigate(request.id, params)
             }
+            Method::BrowserReload(params) => return self.handle_browser_reload(request.id, params),
+            Method::BrowserBack(params) => return self.handle_browser_back(request.id, params),
+            Method::BrowserForward(params) => {
+                return self.handle_browser_forward(request.id, params)
+            }
+            Method::BrowserInfo(params) => return self.handle_browser_info(request.id, params),
+            Method::BrowserClose(params) => return self.handle_browser_close(request.id, params),
             Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
             Method::PaneSendInput(params) => {
                 return self.handle_pane_send_input(request.id, params)

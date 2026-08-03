@@ -466,6 +466,31 @@ fn browser_command() -> Command {
                 .arg(required("pane_id", "pane_id"))
                 .arg(required("url", "url")),
         )
+        .subcommand(
+            Command::new("reload")
+                .about("Reload a Browser pane")
+                .arg(required("pane_id", "pane_id")),
+        )
+        .subcommand(
+            Command::new("back")
+                .about("Go back in a Browser pane")
+                .arg(required("pane_id", "pane_id")),
+        )
+        .subcommand(
+            Command::new("forward")
+                .about("Go forward in a Browser pane")
+                .arg(required("pane_id", "pane_id")),
+        )
+        .subcommand(
+            Command::new("info")
+                .about("Show what a Browser pane is displaying")
+                .arg(required("pane_id", "pane_id")),
+        )
+        .subcommand(
+            Command::new("close")
+                .about("Close a Browser pane")
+                .arg(required("pane_id", "pane_id")),
+        )
 }
 
 fn pane_command() -> Command {

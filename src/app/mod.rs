@@ -115,6 +115,10 @@ pub struct App {
         crate::layout::PaneId,
         std::sync::mpsc::Receiver<crate::browser::BrowserCommand>,
     >,
+    /// Panes whose `agent-browser` session `App::stop_browser_session` would
+    /// have stopped, recorded instead of shelling out to the real CLI.
+    #[cfg(test)]
+    pub(crate) test_stopped_browser_sessions: Vec<crate::layout::PaneId>,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -752,6 +756,8 @@ impl App {
             browser_viewports: std::collections::HashMap::new(),
             #[cfg(test)]
             test_browser_command_rx: std::collections::HashMap::new(),
+            #[cfg(test)]
+            test_stopped_browser_sessions: Vec::new(),
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,

@@ -27,9 +27,7 @@ const POLL_STEP: Duration = Duration::from_millis(5);
 #[derive(Debug, Deserialize)]
 pub(crate) struct Response {
     pub success: bool,
-    // Unread for now (MVP only checks success/error); kept to mirror the
-    // daemon's actual response shape rather than dropped and re-added later.
-    #[allow(dead_code)]
+    /// Action-specific payload; read by `super::daemon::page_info`.
     pub data: Option<Value>,
     pub error: Option<String>,
 }

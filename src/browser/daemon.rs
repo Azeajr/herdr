@@ -88,6 +88,60 @@ pub(crate) fn navigate(session: &str, url: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
+pub(crate) fn reload(session: &str) -> Result<(), String> {
+    ok_or_err(
+        "reload",
+        client::call(session, &[], &["reload"], NAVIGATE_TIMEOUT),
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn back(session: &str) -> Result<(), String> {
+    ok_or_err(
+        "back",
+        client::call(session, &[], &["back"], NAVIGATE_TIMEOUT),
+    )
+    .map(|_| ())
+}
+
+pub(crate) fn forward(session: &str) -> Result<(), String> {
+    ok_or_err(
+        "forward",
+        client::call(session, &[], &["forward"], NAVIGATE_TIMEOUT),
+    )
+    .map(|_| ())
+}
+
+/// Reads the page's URL and title in one call.
+///
+/// `eval` rather than `get url` + `get title` because each action is its own
+/// subprocess: polling two of them per visual change would roughly double the
+/// cost of an active page.
+pub(crate) fn page_info(session: &str) -> Result<(Option<String>, Option<String>), String> {
+    let response = ok_or_err(
+        "page info",
+        client::call(
+            session,
+            &[],
+            &["eval", "JSON.stringify([location.href, document.title])"],
+            ACTION_TIMEOUT,
+        ),
+    )?;
+    let raw = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("result"))
+        .and_then(|result| result.as_str())
+        .ok_or_else(|| "page info response had no result".to_string())?;
+    let parsed: (String, String) =
+        serde_json::from_str(raw).map_err(|err| format!("decode page info: {err}"))?;
+    Ok((non_empty(parsed.0), non_empty(parsed.1)))
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
 /// Resizes the page itself so its aspect ratio matches the pane's.
 ///
 /// Kitty-graphics placement stretches the frame to fill the pane's inner rect

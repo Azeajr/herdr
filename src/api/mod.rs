@@ -69,6 +69,11 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneClearAgentAuthority(_)
             | Method::PaneReleaseAgent(_)
             | Method::PaneClose(_)
+            // Browser panes are split, focused and closed like any other pane;
+            // omitting these left an opened pane unrendered until something
+            // else happened to mark the UI dirty.
+            | Method::BrowserOpen(_)
+            | Method::BrowserClose(_)
             | Method::PopupClose(_)
             | Method::PluginUnlink(_)
             | Method::PluginDisable(_)

@@ -117,6 +117,9 @@ pub enum ResponseResult {
     PaneInfo {
         pane: PaneInfo,
     },
+    BrowserPageInfo {
+        page: crate::api::schema::BrowserPageInfo,
+    },
     PaneList {
         panes: Vec<PaneInfo>,
     },

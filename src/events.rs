@@ -61,6 +61,18 @@ pub enum AppEvent {
     BrowserFrame { pane_id: PaneId, data: Vec<u8> },
     /// A Browser pane's `agent-browser` session failed to start or exited.
     BrowserDaemonExited { pane_id: PaneId, reason: String },
+    /// A Browser pane's page changed its url or title.
+    BrowserPageInfo {
+        pane_id: PaneId,
+        url: Option<String>,
+        title: Option<String>,
+    },
+    /// A command the API already acknowledged failed once it actually ran.
+    BrowserCommandFailed {
+        pane_id: PaneId,
+        action: String,
+        reason: String,
+    },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,

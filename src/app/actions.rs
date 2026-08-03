@@ -2766,6 +2766,8 @@ impl AppState {
             // handle AppState can't reach. Kept for AppEvent exhaustiveness.
             AppEvent::BrowserFrame { .. } => Vec::new(),
             AppEvent::BrowserDaemonExited { .. } => Vec::new(),
+            AppEvent::BrowserPageInfo { .. } => Vec::new(),
+            AppEvent::BrowserCommandFailed { .. } => Vec::new(),
             AppEvent::UpdateReady {
                 version,
                 install_command,

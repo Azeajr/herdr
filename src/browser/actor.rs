@@ -132,6 +132,8 @@ pub(crate) fn run(
     // recovery budget bounded -- see `MAX_RECOVERY_ATTEMPTS`.
     let mut relaunches_since_frame: u32 = 0;
     let mut state = SessionState::default();
+    let mut last_page_info: Option<std::time::Instant> = None;
+    let mut last_page: Option<(Option<String>, Option<String>)> = None;
 
     loop {
         let command = commands.recv_timeout(interval);
@@ -147,7 +149,16 @@ pub(crate) fn run(
                 // Fast typing otherwise costs one `keyboard type` per key.
                 for command in coalesce(first, &commands) {
                     state.record(&command);
-                    apply(pane_id, &session, command);
+                    if let Some((action, reason)) = apply(pane_id, &session, command) {
+                        // Reported rather than only logged: the API accepted
+                        // this command before it ran, so a failure that never
+                        // reaches the user looks exactly like success.
+                        let _ = events.blocking_send(AppEvent::BrowserCommandFailed {
+                            pane_id,
+                            action,
+                            reason,
+                        });
+                    }
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -171,6 +182,17 @@ pub(crate) fn run(
                 {
                     // Main loop is gone; nothing left to render into.
                     break;
+                }
+                // The picture changed, so the page may have too. Rate-limited
+                // because it is another subprocess and an animating page
+                // changes far more often than its url or title.
+                if page_info_due(last_page_info) {
+                    last_page_info = Some(std::time::Instant::now());
+                    if let Some(event) = poll_page_info(pane_id, &session, &mut last_page) {
+                        if events.blocking_send(event).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -315,9 +337,14 @@ fn coalesce(first: BrowserCommand, commands: &Receiver<BrowserCommand>) -> Vec<B
     batch
 }
 
-fn apply(pane_id: PaneId, session: &str, command: BrowserCommand) {
+/// Runs one command, returning `Some((action, reason))` when it failed so the
+/// caller can report it.
+fn apply(pane_id: PaneId, session: &str, command: BrowserCommand) -> Option<(String, String)> {
     let (action, result) = match command {
         BrowserCommand::Navigate(url) => ("navigate", daemon::navigate(session, &url)),
+        BrowserCommand::Reload => ("reload", daemon::reload(session)),
+        BrowserCommand::Back => ("back", daemon::back(session)),
+        BrowserCommand::Forward => ("forward", daemon::forward(session)),
         BrowserCommand::SetViewport { width, height } => {
             ("set viewport", daemon::set_viewport(session, width, height))
         }
@@ -330,9 +357,60 @@ fn apply(pane_id: PaneId, session: &str, command: BrowserCommand) {
         BrowserCommand::TypeText(text) => ("type", daemon::type_text(session, &text)),
         BrowserCommand::PressKey(key) => ("press", daemon::press_key(session, &key)),
     };
-    if let Err(err) = result {
-        tracing::warn!(pane_id = pane_id.raw(), action, %err, "browser pane: command failed");
+    match result {
+        Ok(()) => None,
+        Err(err) => {
+            tracing::warn!(pane_id = pane_id.raw(), action, %err, "browser pane: command failed");
+            // Pointer and viewport traffic is continuous and self-correcting;
+            // reporting every transient miss would bury the failures a user
+            // can act on.
+            reportable(action).then(|| (action.to_string(), err))
+        }
     }
+}
+
+/// Whether a failed action is worth telling the user about, as opposed to one
+/// the next poll or gesture supersedes anyway.
+fn reportable(action: &str) -> bool {
+    matches!(
+        action,
+        "navigate" | "reload" | "back" | "forward" | "type" | "press"
+    )
+}
+
+/// Minimum gap between page-info reads, independent of frame rate.
+const PAGE_INFO_INTERVAL: Duration = Duration::from_millis(750);
+
+fn page_info_due(last: Option<std::time::Instant>) -> bool {
+    last.is_none_or(|last| last.elapsed() >= PAGE_INFO_INTERVAL)
+}
+
+/// Reads the page's url and title, returning an event only when either
+/// actually changed so an idle page costs no main-loop work.
+fn poll_page_info(
+    pane_id: PaneId,
+    session: &str,
+    last: &mut Option<(Option<String>, Option<String>)>,
+) -> Option<AppEvent> {
+    let page = match daemon::page_info(session) {
+        Ok(page) => page,
+        Err(err) => {
+            // Not fatal and not worth reporting: the screenshot poll is the
+            // authority on whether the session is alive.
+            tracing::debug!(pane_id = pane_id.raw(), %err, "browser pane: page info failed");
+            return None;
+        }
+    };
+    if last.as_ref() == Some(&page) {
+        return None;
+    }
+    *last = Some(page.clone());
+    let (url, title) = page;
+    Some(AppEvent::BrowserPageInfo {
+        pane_id,
+        url,
+        title,
+    })
 }
 
 fn mouse_down(session: &str, x: i32, y: i32) -> Result<(), String> {

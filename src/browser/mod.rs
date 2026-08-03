@@ -31,6 +31,7 @@ pub(crate) mod client;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) mod daemon;
 pub(crate) mod keys;
+pub(crate) mod url;
 
 /// Commands accepted by a Browser pane's actor thread.
 #[derive(Debug, PartialEq, Eq)]
@@ -61,6 +62,9 @@ pub(crate) enum BrowserCommand {
         x: i32,
         y: i32,
     },
+    Reload,
+    Back,
+    Forward,
     Scroll {
         delta_x: i32,
         delta_y: i32,
