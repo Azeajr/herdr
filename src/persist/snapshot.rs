@@ -1087,6 +1087,63 @@ mod tests {
         assert_eq!(browser.url, None);
     }
 
+    /// The marker is keyed by raw pane id, so it must survive a workspace
+    /// whose raw ids, public pane numbers, tab indices and public tab numbers
+    /// have all drifted apart. If capture ever keyed it off a position or a
+    /// public number instead, the marker would land on a shell pane and that
+    /// pane would come back as a browser.
+    #[test]
+    fn capture_contract_marks_the_right_pane_under_adversarial_identity() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        let workspace = &mut state.workspaces[0];
+        // Not tab 0: the adversarial workspace moved its tabs, so an index
+        // and a public tab number disagree from here on.
+        let host_tab = 1;
+        let host_pane = workspace.tabs[host_tab].root_pane;
+        let browser_pane = workspace
+            .split_pane_browser(host_pane, Direction::Horizontal, Some(0.5), None, true)
+            .expect("split browser pane")
+            .1
+            .pane_id;
+        let browser_public = workspace
+            .public_pane_number(browser_pane)
+            .expect("browser pane public number");
+        assert_ne!(
+            browser_pane.raw() as usize,
+            browser_public,
+            "the skew this test relies on is gone"
+        );
+        state.ensure_test_terminals();
+        state
+            .browser_pane_urls
+            .insert(browser_pane, "https://example.com/x".into());
+
+        let snapshot = capture_from_state(&state);
+
+        let marked: Vec<u32> = snapshot.workspaces[0]
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|(_, pane)| pane.browser.is_some())
+            .map(|(raw, _)| *raw)
+            .collect();
+        assert_eq!(marked, vec![browser_pane.raw()]);
+        let saved_tab = &snapshot.workspaces[0].tabs[host_tab];
+        assert_eq!(
+            saved_tab.panes[&browser_pane.raw()]
+                .browser
+                .as_ref()
+                .and_then(|browser| browser.url.as_deref()),
+            Some("https://example.com/x")
+        );
+        // The pane stayed in the tab it was split into, not the one its
+        // public number would suggest.
+        assert_eq!(
+            snapshot.workspaces[0].public_pane_numbers[&browser_pane.raw()],
+            browser_public
+        );
+    }
+
     #[test]
     fn capture_contract_tracks_workspace_identity_and_pane_cwds() {
         let mut state = state_with_workspaces(&["one"]);

@@ -1498,6 +1498,111 @@ mod tests {
         }
     }
 
+    /// Round-trips a Browser pane through a workspace whose raw pane ids,
+    /// public pane numbers, tab indices and public tab numbers have all
+    /// drifted apart, and whose ids are guaranteed to be remapped on the way
+    /// back in. The marker has to follow the pane's identity across that
+    /// remap; anything positional would resurrect the wrong pane as a browser.
+    #[tokio::test]
+    async fn restore_reattaches_the_browser_marker_to_the_same_pane_under_adversarial_identity() {
+        let mut state = crate::app::AppState::test_with_adversarial_identity_state();
+        let workspace = &mut state.workspaces[0];
+        let host_tab = 1;
+        let host_pane = workspace.tabs[host_tab].root_pane;
+        let saved_browser_pane = workspace
+            .split_pane_browser(host_pane, Direction::Horizontal, Some(0.5), None, true)
+            .expect("split browser pane")
+            .1
+            .pane_id;
+        let saved_public = workspace
+            .public_pane_number(saved_browser_pane)
+            .expect("browser pane public number");
+        let saved_tab_number = workspace.tabs[host_tab].number;
+        state.ensure_test_terminals();
+        state
+            .browser_pane_urls
+            .insert(saved_browser_pane, "https://example.com/x".into());
+        let snapshot = crate::persist::capture(
+            &state.workspaces,
+            &state.terminals,
+            &crate::terminal::TerminalRuntimeRegistry::new(),
+            &state.browser_pane_urls,
+            state.active,
+            state.selected,
+            state.sidebar_width,
+            state.sidebar_section_split,
+            state.collapsed_space_keys.clone(),
+        );
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, terminals, runtimes, browser_panes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let restored = &workspaces[0];
+        let browser_panes_found: Vec<PaneId> = restored
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .filter(|(_, pane)| pane.is_browser())
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(browser_panes_found.len(), 1);
+        let restored_browser_pane = browser_panes_found[0];
+        // Ids really were remapped, or this test proves nothing.
+        assert_ne!(restored_browser_pane, saved_browser_pane);
+        // Same pane, by the identity the rest of herdr addresses it with.
+        assert_eq!(
+            restored.public_pane_number(restored_browser_pane),
+            Some(saved_public)
+        );
+        assert_eq!(
+            restored
+                .find_tab_index_for_pane(restored_browser_pane)
+                .map(|idx| restored.tabs[idx].number),
+            Some(saved_tab_number)
+        );
+        assert_eq!(
+            browser_panes,
+            HashMap::from([(
+                restored_browser_pane,
+                Some("https://example.com/x".to_string())
+            )])
+        );
+        // The browser pane owns a terminal record but no PTY; every other
+        // pane in this adversarial workspace still gets both.
+        let browser_terminal = restored
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.iter())
+            .find(|(id, _)| **id == restored_browser_pane)
+            .map(|(_, pane)| pane.attached_terminal_id.clone())
+            .expect("browser pane");
+        assert!(terminals.contains_key(&browser_terminal));
+        assert!(!runtimes.contains_key(&browser_terminal));
+        let pane_count: usize = restored.tabs.iter().map(|tab| tab.panes.len()).sum();
+        assert_eq!(runtimes.len(), pane_count - 1);
+        restored.assert_invariants_for_test();
+
+        for runtime in runtimes.values() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while runtime.cwd().is_none() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
+        }
+    }
+
     #[tokio::test]
     async fn restore_preserves_public_id_mapping_after_pane_id_remap() {
         let cwd = std::env::current_dir().unwrap();

@@ -329,10 +329,16 @@ impl App {
     /// `crate::browser::daemon`, which documents the `setsid()` detach).
     /// Stopping by derived session name means no extra runtime state is
     /// needed, and it stays correct for panes whose actor already exited.
+    ///
+    /// Only the session dies here; the panes must survive intact. The server
+    /// saves the session *after* this runs, and `crate::persist::snapshot`
+    /// reads the pane's kind and its last url to write the marker that brings
+    /// it back -- so retiring the panes here would silently persist them as
+    /// ordinary shell panes.
     pub(crate) fn stop_all_browser_sessions(&mut self) {
         let pane_ids = self.state.browser_pane_ids();
         for pane_id in pane_ids {
-            self.retire_browser_pane(pane_id);
+            self.detach_browser_actor(pane_id);
             self.stop_browser_session(pane_id);
         }
     }
@@ -946,6 +952,47 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&response).expect("response");
         assert_eq!(value["result"]["page"]["error"], "session died");
+    }
+
+    /// Regression: shutdown used to retire the panes as well as their
+    /// sessions, and the server saves the session *after* that runs -- so
+    /// every Browser pane persisted as an ordinary shell pane and Phase 4's
+    /// marker never reached disk on a clean `herdr server stop`.
+    #[test]
+    fn shutdown_stops_the_sessions_but_still_persists_the_panes() {
+        let (mut app, pane_id, command_rx) = app_with_browser_pane();
+        app.state
+            .browser_pane_urls
+            .insert(pane_id, "https://example.com/x".to_string());
+
+        app.stop_all_browser_sessions();
+
+        // The daemon is detached, so process exit alone would leak it.
+        assert_eq!(app.test_stopped_browser_sessions, vec![pane_id]);
+        assert!(app.browser_actors.is_empty());
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        // What the save that follows this must still be able to see.
+        assert!(app.state.is_browser_pane(pane_id));
+        let snapshot = crate::persist::capture(
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            &app.state.browser_pane_urls,
+            app.state.active,
+            app.state.selected,
+            app.state.sidebar_width,
+            app.state.sidebar_section_split,
+            app.state.collapsed_space_keys.clone(),
+        );
+        let saved = snapshot.workspaces[0].tabs[0].panes[&pane_id.raw()]
+            .browser
+            .as_ref()
+            .expect("a stopped Browser pane still saves as one");
+        assert_eq!(saved.url.as_deref(), Some("https://example.com/x"));
+        app.state.assert_invariants_for_test();
     }
 
     #[test]
