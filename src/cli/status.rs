@@ -75,6 +75,7 @@ enum ServerRuntimeStatus {
         version: Option<String>,
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
+        instance_id: Option<String>,
     },
     NotRunning,
 }
@@ -137,12 +138,16 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     match server {
         ServerRuntimeStatus::Running {
-            version, protocol, ..
+            version,
+            protocol,
+            instance_id,
+            ..
         } => {
             println!("{indent}status: running");
             println!("{indent}version: {}", option_label(version.as_deref()));
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
+            println!("{indent}instance: {}", option_label(instance_id.as_deref()));
             println!("{indent}socket: {}", api::socket_path().display());
         }
         ServerRuntimeStatus::NotRunning => {
@@ -158,6 +163,7 @@ fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatus> {
             version: status.version,
             protocol: status.protocol,
             capabilities: status.capabilities,
+            instance_id: status.instance_id,
         }),
         Err(ApiClientError::Io(err)) if super::server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -224,6 +230,7 @@ struct ServerStatusJson {
     running: bool,
     version: Option<String>,
     protocol: Option<u32>,
+    instance_id: Option<String>,
     capabilities: Option<ServerCapabilitiesJson>,
     compatible: Option<bool>,
     socket: String,
@@ -258,11 +265,13 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             version,
             protocol,
             capabilities,
+            instance_id,
         } => ServerStatusJson {
             status: "running",
             running: true,
             version: version.clone(),
             protocol: *protocol,
+            instance_id: instance_id.clone(),
             capabilities: capabilities
                 .as_ref()
                 .map(|capabilities| ServerCapabilitiesJson {
@@ -279,6 +288,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             running: false,
             version: None,
             protocol: None,
+            instance_id: None,
             capabilities: None,
             compatible: None,
             socket: api::socket_path().display().to_string(),

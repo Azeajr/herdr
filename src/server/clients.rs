@@ -69,10 +69,22 @@ pub(crate) struct ClientConnection {
     pub(crate) host_sgr_pixels_active: Option<bool>,
     /// Last Kitty report-all mode sent to this client's host terminal.
     pub(crate) host_keyboard_report_all_active: Option<bool>,
+    /// Last `(bracketed_paste, mouse_reporting)` pair sent to this
+    /// terminal-stream client.
+    ///
+    /// Only terminal-stream clients are told, so this stays `None` for app
+    /// clients, which read the modes from the terminal state they already hold.
+    pub(crate) terminal_input_modes_active: Option<(bool, bool)>,
     /// Temporary files staged from this client's local clipboard image pastes.
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
     pub(crate) writer: Option<ClientWriter>,
+    /// Instance id of the herdr server on the other end, when the client is one.
+    ///
+    /// Set from the handshake rather than passed to the constructor, which is
+    /// already wide. A terminal this server created for another instance counts
+    /// as attended only while that instance holds a connection here.
+    pub(crate) instance_id: Option<String>,
 }
 
 impl ClientConnection {
@@ -135,8 +147,10 @@ impl ClientConnection {
             host_mouse_capture_active: None,
             host_sgr_pixels_active: None,
             host_keyboard_report_all_active: None,
+            terminal_input_modes_active: None,
             staged_clipboard_files: Vec::new(),
             writer,
+            instance_id: None,
         }
     }
 

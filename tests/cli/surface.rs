@@ -1,5 +1,45 @@
 use super::harness::*;
 
+/// `pane list --json` exited 2 with `unknown option` while `peer list` required
+/// that same flag to answer with JSON at all. Any script that passed it to both
+/// broke on one of them, and the symptom — a missing `result` key — pointed
+/// nowhere near the cause. The flag now parses and the request goes out unchanged.
+#[test]
+fn always_json_list_commands_accept_the_json_flag() {
+    for (args, method) in [
+        (&["pane", "list", "--json"][..], "pane.list"),
+        (&["workspace", "list", "--json"][..], "workspace.list"),
+        (&["tab", "list", "--json"][..], "tab.list"),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket_path = base.join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, line) = accept_fake_cli_operation(&listener);
+            stream
+                .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            line
+        });
+
+        let run = run_cli(&socket_path, args);
+        assert!(
+            run.status.success(),
+            "{args:?} stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+
+        let request: serde_json::Value = serde_json::from_str(&server.join().unwrap()).unwrap();
+        assert_eq!(request["method"], method, "{args:?}");
+
+        cleanup_test_base(&base);
+    }
+}
+
 #[test]
 fn pane_run_sends_one_send_input_request_with_enter_key() {
     let base = unique_test_dir();

@@ -654,6 +654,18 @@ pub struct WorkspaceCardArea {
     pub indented: bool,
 }
 
+/// A peer group header row in the workspace list.
+///
+/// Headers are kept in their own list rather than folded into
+/// [`WorkspaceCardArea`], because every consumer of that type treats `ws_idx`
+/// as a real workspace index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerHeaderArea {
+    /// Handle of the peer this header names.
+    pub peer: String,
+    pub rect: Rect,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeCreateState {
     pub source_workspace_id: String,
@@ -666,6 +678,15 @@ pub struct WorktreeCreateState {
     pub checkout_path: std::path::PathBuf,
     pub error: Option<String>,
     pub creating: bool,
+    /// The peer the checkout will be made on, when the source workspace is a
+    /// view onto one.
+    ///
+    /// It decides two things nothing else can: `checkout_path` is left unset,
+    /// because this server's worktree directory names a path on the wrong
+    /// machine and only the peer can choose one; and the completion arrives as a
+    /// peer answer rather than as a local `git worktree add` finishing, so this
+    /// is what tells the dialog which of the two to wait for.
+    pub peer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,6 +697,9 @@ pub struct WorktreeRemoveState {
     pub error: Option<String>,
     pub removing: bool,
     pub force_confirmation: bool,
+    /// The peer holding the checkout, when this workspace is a view onto one.
+    /// The removal runs there, so nothing local is stat'd before confirming.
+    pub peer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,6 +752,224 @@ impl WorktreeOpenEntry {
     }
 }
 
+/// One workspace a peer reported, offered as something this server can open a
+/// view onto.
+///
+/// Built from the peer's last enumeration, which is already held in
+/// [`crate::app::peers::PeerState::workspaces`]; nothing here is fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerWorkspaceOpenEntry {
+    /// Namespaced id, exactly what `peer.workspace.open` takes as its target.
+    pub target: String,
+    pub label: String,
+    pub number: usize,
+    pub pane_count: usize,
+    pub tab_count: usize,
+    /// The local workspace already viewing this target, if there is one.
+    ///
+    /// Opening it again is idempotent — it focuses the existing view — so an
+    /// open entry stays in the list and becomes a "take me there" instead of
+    /// being filtered out.
+    pub already_open_ws_idx: Option<usize>,
+}
+
+impl PeerWorkspaceOpenEntry {
+    pub(crate) fn status_label(&self) -> &'static str {
+        if self.already_open_ws_idx.is_some() {
+            "open"
+        } else {
+            ""
+        }
+    }
+
+    pub(crate) fn detail(&self) -> String {
+        let panes = if self.pane_count == 1 {
+            "pane"
+        } else {
+            "panes"
+        };
+        let tabs = if self.tab_count == 1 { "tab" } else { "tabs" };
+        // The peer-local id, which is what someone looking at the peer's own
+        // session sees. The instance prefix names the peer the modal header
+        // already names, so repeating it on every line is noise.
+        let local_id = crate::app::peers::split_peer_id(&self.target)
+            .map_or(self.target.as_str(), |(_, local)| local);
+        format!(
+            "{local_id} · {} {panes} · {} {tabs}",
+            self.pane_count, self.tab_count
+        )
+    }
+
+    fn search_text(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.label,
+            self.number,
+            self.target,
+            self.status_label()
+        )
+        .to_lowercase()
+    }
+
+    fn matches_query(&self, query: &str) -> bool {
+        text_matches_query(query, &self.search_text())
+    }
+}
+
+/// Which field of the add-peer dialog is being typed into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddPeerField {
+    /// The dialog opens here: a destination is the one thing it cannot default.
+    #[default]
+    Destination,
+    Name,
+    /// The recent-peers list, offered when `[peer_history]` is non-empty.
+    Recent,
+}
+
+/// The add-peer dialog.
+///
+/// Holds only what is being typed. Adding the peer is not done here: the ssh
+/// setup it may need is interactive, and this dialog runs in the server, which
+/// has no terminal. Submitting opens a pane running `herdr peer connect`, which
+/// does, so the fields exist to build that command line and nothing else.
+///
+/// Two fields means its own buffers rather than the shared `name_input` every
+/// single-field dialog borrows.
+#[derive(Debug, Clone, Default)]
+pub struct AddPeerState {
+    pub destination: String,
+    pub name: String,
+    pub field: AddPeerField,
+    /// Selected row in the recent-peers list when `field` is
+    /// [`AddPeerField::Recent`].
+    pub recent_selected: usize,
+    pub error: Option<String>,
+}
+
+impl AddPeerState {
+    /// The buffer the next keystroke belongs in.
+    pub(crate) fn active_input_mut(&mut self) -> &mut String {
+        match self.field {
+            AddPeerField::Destination => &mut self.destination,
+            AddPeerField::Name | AddPeerField::Recent => &mut self.name,
+        }
+    }
+
+    /// Tab order: the recent list (when offered) sits above the two inputs.
+    pub(crate) fn toggle_field(&mut self, has_recents: bool) {
+        self.field = match (self.field, has_recents) {
+            (AddPeerField::Destination, true) => AddPeerField::Name,
+            (AddPeerField::Destination, false) => AddPeerField::Name,
+            (AddPeerField::Name, true) => AddPeerField::Recent,
+            (AddPeerField::Name, false) => AddPeerField::Destination,
+            (AddPeerField::Recent, _) => AddPeerField::Destination,
+        };
+    }
+
+    /// Prefills the inputs from a history entry, clicked or picked, and hands
+    /// the destination field back to the user for review before connect.
+    pub(crate) fn fill_from_history(&mut self, entry: &crate::config::PeerHistoryEntry) {
+        self.destination = peer_history_destination(&entry.target);
+        self.name = entry.name.clone();
+        self.field = AddPeerField::Destination;
+        self.error = None;
+    }
+}
+
+/// The ssh destination a history entry points at, without the scheme or the
+/// optional `#session` suffix.
+pub(crate) fn peer_history_destination(target: &str) -> String {
+    target
+        .strip_prefix("ssh://")
+        .unwrap_or(target)
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One hidden peer in the unhide picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenPeerEntry {
+    pub peer: String,
+    /// Config-sourced hides survive restarts and take a config write to undo;
+    /// session hides only last until the server restarts.
+    pub permanent: bool,
+}
+
+/// The unhide picker: the hidden peers, session and permanent together, so a
+/// hidden peer can always be brought back from the UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HiddenPeersState {
+    pub entries: Vec<HiddenPeerEntry>,
+    pub selected: usize,
+    pub error: Option<String>,
+}
+
+/// Picker over one peer's enumerated workspaces.
+///
+/// Deliberately shaped like [`WorktreeOpenState`]: same filter, selection, and
+/// status-marker semantics, so the two modals behave identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerWorkspaceOpenState {
+    /// Handle of the peer whose workspaces these are, and what the title names it
+    /// by: a socket peer's label is its full socket path, which identifies nothing
+    /// once truncated.
+    pub peer: String,
+    pub entries: Vec<PeerWorkspaceOpenEntry>,
+    pub selected: usize,
+    pub query: String,
+    pub search_focused: bool,
+    pub error: Option<String>,
+}
+
+impl PeerWorkspaceOpenState {
+    pub(crate) fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.query.trim();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| {
+                (query.is_empty() || entry.matches_query(query)).then_some(idx)
+            })
+            .collect()
+    }
+
+    pub(crate) fn selected_entry_index(&self) -> Option<usize> {
+        let indices = self.filtered_indices();
+        if indices.contains(&self.selected) {
+            Some(self.selected)
+        } else {
+            indices.first().copied()
+        }
+    }
+
+    pub(crate) fn normalize_selection(&mut self) {
+        if let Some(selected) = self.selected_entry_index() {
+            self.selected = selected;
+        }
+    }
+
+    pub(crate) fn select_previous_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[pos.saturating_sub(1)];
+    }
+
+    pub(crate) fn select_next_filtered(&mut self) {
+        let indices = self.filtered_indices();
+        let Some(current) = self.selected_entry_index() else {
+            return;
+        };
+        let pos = indices.iter().position(|idx| *idx == current).unwrap_or(0);
+        self.selected = indices[(pos + 1).min(indices.len().saturating_sub(1))];
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeOpenState {
     pub source_workspace_id: String,
@@ -741,6 +983,16 @@ pub struct WorktreeOpenState {
     pub query: String,
     pub search_focused: bool,
     pub error: Option<String>,
+    /// The peer whose worktrees these are, when the source workspace is a view
+    /// onto one.
+    pub peer: Option<String>,
+    /// Whether the list is still being fetched.
+    ///
+    /// Only a peer list is ever loading: a local `git worktree list` is a
+    /// process this server runs and waits for, while a peer's list is a round
+    /// trip that must not block the event loop — so the dialog opens empty and
+    /// fills in when the peer answers.
+    pub loading: bool,
 }
 
 impl WorktreeOpenState {
@@ -809,6 +1061,8 @@ pub struct ViewState {
     pub layout: ViewLayout,
     pub sidebar_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
+    /// Peer group header rows in the workspace list.
+    pub peer_header_areas: Vec<PeerHeaderArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
     pub tab_scroll_left_hit_area: Rect,
@@ -836,6 +1090,9 @@ pub enum Mode {
     RenamePane,
     NewLinkedWorktree,
     OpenExistingWorktree,
+    OpenPeerWorkspace,
+    AddPeer,
+    UnhidePeers,
     ConfirmRemoveWorktree,
     Resize,
     ConfirmClose,
@@ -1215,6 +1472,15 @@ pub enum ContextMenuKind {
         has_manual_label: bool,
         right_click_passthrough: bool,
     },
+    /// A peer group header. Names a peer, not a workspace, so it carries the
+    /// peer's handle rather than an index into `workspaces`.
+    Peer {
+        peer: String,
+        collapsed: bool,
+        /// Whether any peer is currently hidden; gates the "Unhide peer..."
+        /// entry.
+        has_hidden: bool,
+    },
 }
 
 /// Right-click context menu state.
@@ -1249,6 +1515,29 @@ impl ContextMenuState {
                 "New worktree",
                 "Open worktree...",
                 if collapsed { "Expand" } else { "Collapse" },
+            ],
+            ContextMenuKind::Peer {
+                collapsed,
+                has_hidden: false,
+                ..
+            } => vec![
+                "Open workspace...",
+                "Add peer...",
+                if collapsed { "Expand" } else { "Collapse" },
+                "Hide for session",
+                "Hide permanently",
+            ],
+            ContextMenuKind::Peer {
+                collapsed,
+                has_hidden: true,
+                ..
+            } => vec![
+                "Open workspace...",
+                "Add peer...",
+                if collapsed { "Expand" } else { "Collapse" },
+                "Hide for session",
+                "Hide permanently",
+                "Unhide peer...",
             ],
             ContextMenuKind::Tab { .. } => vec!["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
@@ -1371,6 +1660,38 @@ pub enum TabBarStatusSegment {
     Text(Option<String>),
 }
 
+/// A copy waiting on the server that owns the screen.
+///
+/// The rows are absolute buffer rows. They are already in the owning server's
+/// coordinates: they were derived from the scroll position that server stamped
+/// on the frame being looked at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerSelectionCopy {
+    pub pane_id: PaneId,
+    pub start: (u32, u16),
+    pub end: (u32, u16),
+}
+
+/// One copy-mode query waiting to be sent to a peer-owned terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCopyModeQuery {
+    pub generation: u64,
+    pub pane_id: PaneId,
+    pub query: crate::api::schema::PaneTextQuery,
+    pub action: PeerCopyModeQueryAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerCopyModeQueryAction {
+    Search {
+        direction: CopyModeSearchDirection,
+        repeat: bool,
+        cursor: crate::pane::TerminalTextPoint,
+        previous: Option<crate::pane::TerminalTextMatch>,
+    },
+    Motion,
+}
+
 pub struct AppState {
     pub terminals:
         std::collections::HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
@@ -1379,6 +1700,9 @@ pub struct AppState {
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
+    /// Federated peer servers and what they last reported. Empty unless remote
+    /// workspaces are configured.
+    pub peers: crate::app::peers::PeerRegistryState,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub selected: usize,
@@ -1398,6 +1722,15 @@ pub struct AppState {
     pub request_submit_worktree_create: bool,
     pub request_submit_worktree_open: bool,
     pub request_submit_worktree_remove: bool,
+    /// Handle of the peer whose workspace picker should be opened.
+    pub request_open_peer_workspace: Option<String>,
+    pub request_submit_peer_workspace_open: bool,
+    pub request_open_add_peer: bool,
+    pub request_submit_add_peer: bool,
+    /// Handle of the peer whose hidden-peer picker should be opened.
+    pub request_open_hidden_peers: bool,
+    /// A hidden-peer row was clicked; unhide the picker's selected entry.
+    pub request_unhide_peer: bool,
     pub request_reload_config: bool,
     /// Set when the headless server should ask attached clients to reload
     /// their client-local sound config from disk.
@@ -1405,6 +1738,21 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
+    /// Set when a copy covered a pane whose screen lives on a peer.
+    ///
+    /// The text cannot be produced here: matching how the terminal joins
+    /// soft-wrapped lines and where it trims means running its own formatter,
+    /// which only the server holding the screen can do. So the span is recorded
+    /// and the outer App asks that server, exactly as
+    /// [`Self::request_clipboard_write`] hands off a write it must not perform.
+    pub request_peer_selection_copy: Option<PeerSelectionCopy>,
+    /// Newest generation of a copy-mode query sent to a peer.
+    ///
+    /// Every new query or intervening copy-mode action advances it. A reply
+    /// carrying an older value is ignored, so a slow machine cannot move a
+    /// cursor for a search the user has already replaced or abandoned.
+    pub peer_copy_mode_query_generation: u64,
+    pub request_peer_copy_mode_query: Option<PeerCopyModeQuery>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub pending_workspace_create_cwd: Option<std::path::PathBuf>,
@@ -1412,8 +1760,20 @@ pub struct AppState {
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
+    pub peer_workspace_open: Option<PeerWorkspaceOpenState>,
+    pub add_peer: Option<AddPeerState>,
+    pub hidden_peers_picker: Option<HiddenPeersState>,
     pub worktree_directory: std::path::PathBuf,
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Peers hidden from the sidebar for this session only. Session-persisted
+    /// like [`Self::collapsed_space_keys`]; never written to config.
+    pub hidden_peers: std::collections::HashSet<String>,
+    /// Peers hidden permanently via `[peer_hidden]` in the config file.
+    /// Reloaded from disk with the rest of the config.
+    pub hidden_peers_config: std::collections::HashSet<String>,
+    /// Recently added peers, mirrored from `[peer_history]` in the config file
+    /// so the add-peer dialog can offer one-click re-adds.
+    pub peer_history: Vec<crate::config::PeerHistoryEntry>,
     pub request_complete_onboarding: bool,
     pub name_input: String,
     pub name_input_replace_on_type: bool,
@@ -1560,11 +1920,30 @@ pub struct AppState {
     /// Terminal runtimes that should be shut down by the app/runtime layer
     /// after state has detached their terminal metadata.
     pub(crate) terminal_runtime_shutdowns: Vec<crate::terminal::TerminalId>,
+    /// Which federating server instances currently hold a connection to each
+    /// terminal.
+    ///
+    /// A projection of the server's client connections, republished whenever
+    /// they change, so pane reporting can say whether a terminal's owner is
+    /// still around without reaching into transport state. Empty on a server
+    /// nobody federates with.
+    pub(crate) terminal_attached_instances:
+        std::collections::HashMap<crate::terminal::TerminalId, Vec<String>>,
 }
 
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    /// Whether any locally open workspace is a view onto this peer. A peer in
+    /// that state cannot be hidden: hiding it would drop the user's open
+    /// workspaces from the sidebar, the same reason a collapsed group keeps
+    /// the workspace in view visible.
+    pub(crate) fn peer_has_open_workspaces(&self, peer: &str) -> bool {
+        self.workspaces
+            .iter()
+            .any(|ws| ws.peer.as_deref() == Some(peer))
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1658,16 +2037,57 @@ impl AppState {
         crate::config::terminal_key_matches_combo(key, (self.prefix_code, self.prefix_mods))
     }
 
-    pub fn estimate_pane_size(&self) -> (u16, u16) {
+    /// The size to give a pane that has not been laid out yet.
+    ///
+    /// `inner_rect`, not `rect`: the render sizes a pty to the inner rect
+    /// (`compute_pane_infos`), so the outer rect over-estimates by whatever
+    /// borders and the scrollbar gutter take — one column with the defaults.
+    /// A local pane is corrected by the next render and nobody notices, but a
+    /// peer-backed pane is attached at this size on the machine that owns it,
+    /// and a headless server only resizes panes while it has none laid out
+    /// (`render_and_stream`, `resize_panes`). So the second peer view opened
+    /// from a headless server kept the over-estimate until a client attached:
+    /// measured 23x54 against the 23x53 the first view got.
+    pub fn estimate_pane_size(&self) -> crate::terminal::TerminalSize {
         if let Some(info) = self.view.pane_infos.first() {
-            (info.rect.height, info.rect.width)
+            crate::terminal::TerminalSize::new(info.inner_rect.height, info.inner_rect.width)
         } else {
-            (self.headless_size.1, self.headless_size.0)
+            crate::terminal::TerminalSize::new(self.headless_size.1, self.headless_size.0)
         }
     }
 
     /// Returns true when the given (workspace, tab, pane) refers to the
     /// currently focused pane in the active workspace's active tab.
+    /// The focused pane of `ws_idx`, with its terminal id and runtime, resolved in
+    /// one walk of that workspace's tabs.
+    ///
+    /// Asking for the id and then the runtime walks them twice, because
+    /// [`Self::runtime_for_pane_in_workspace`] has to resolve the id again to reach
+    /// the registry. That is on the per-keystroke input path, where a typed burst
+    /// pays for it once per character.
+    pub(crate) fn focused_pane_runtime_in_workspace<'a>(
+        &'a self,
+        terminal_runtimes: &'a crate::terminal::TerminalRuntimeRegistry,
+        ws_idx: usize,
+    ) -> Option<(
+        crate::layout::PaneId,
+        &'a crate::terminal::TerminalId,
+        &'a crate::terminal::TerminalRuntime,
+    )> {
+        let ws = self.workspaces.get(ws_idx)?;
+        let pane_id = ws.focused_pane_id()?;
+        let terminal_id = ws.terminal_id(pane_id)?;
+        #[cfg(test)]
+        if let Some(runtime) = ws.test_runtimes.get(&pane_id) {
+            return Some((pane_id, terminal_id, runtime));
+        }
+        #[cfg(test)]
+        if let Some(runtime) = ws.tabs.iter().find_map(|tab| tab.runtimes.get(&pane_id)) {
+            return Some((pane_id, terminal_id, runtime));
+        }
+        Some((pane_id, terminal_id, terminal_runtimes.get(terminal_id)?))
+    }
+
     pub(crate) fn runtime_for_pane_in_workspace<'a>(
         &'a self,
         terminal_runtimes: &'a crate::terminal::TerminalRuntimeRegistry,
@@ -1770,6 +2190,7 @@ impl AppState {
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
+            peers: crate::app::peers::PeerRegistryState::default(),
             active: None,
             previous_pane_focus: None,
             selected: 0,
@@ -1786,9 +2207,18 @@ impl AppState {
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
+            request_open_peer_workspace: None,
+            request_submit_peer_workspace_open: false,
+            request_open_add_peer: false,
+            request_submit_add_peer: false,
+            request_open_hidden_peers: false,
+            request_unhide_peer: false,
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_peer_selection_copy: None,
+            peer_copy_mode_query_generation: 0,
+            request_peer_copy_mode_query: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
@@ -1796,8 +2226,14 @@ impl AppState {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
+            peer_workspace_open: None,
+            add_peer: None,
+            hidden_peers_picker: None,
             worktree_directory: std::path::PathBuf::from("/tmp/herdr-worktrees"),
             collapsed_space_keys: std::collections::HashSet::new(),
+            hidden_peers: std::collections::HashSet::new(),
+            hidden_peers_config: std::collections::HashSet::new(),
+            peer_history: Vec::new(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -1815,6 +2251,7 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                peer_header_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
@@ -1936,6 +2373,7 @@ impl AppState {
             host_mouse_pixels: None,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            terminal_attached_instances: std::collections::HashMap::new(),
         }
     }
 
@@ -2266,6 +2704,11 @@ impl AppState {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
                 }
+                // A peer menu names a peer handle, not an index into any local
+                // collection, so there is no identity invariant to check. A
+                // peer removed while the menu is open makes its actions no-ops
+                // rather than corrupting state.
+                ContextMenuKind::Peer { .. } => {}
             }
         }
     }
@@ -2295,7 +2738,10 @@ mod tests {
         let mut state = AppState::test_new();
         state.headless_size = (132, 41);
 
-        assert_eq!(state.estimate_pane_size(), (41, 132));
+        assert_eq!(
+            state.estimate_pane_size(),
+            crate::terminal::TerminalSize::new(41, 132)
+        );
     }
 
     #[test]
@@ -2318,6 +2764,36 @@ mod tests {
         state.workspaces = vec![ws];
 
         assert!(state.pane_exposes_host_cursor(0, pane_id));
+    }
+
+    /// The estimate is the size a pane is *created* at, and for a peer-backed
+    /// pane that size is applied on the machine that owns it. Comparing it to
+    /// the render's own answer rather than to a literal is the point: the two
+    /// disagreed by the scrollbar gutter's column, and only the render's is
+    /// real.
+    #[tokio::test]
+    async fn the_pane_size_estimate_is_the_size_the_render_gives_a_pane() {
+        let mut state = AppState::test_new();
+        let mut ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        crate::ui::compute_view_with_runtime_registry(
+            &mut state,
+            &terminal_runtimes,
+            ratatui::layout::Rect::new(0, 0, 120, 40),
+        );
+
+        assert_eq!(
+            state.estimate_pane_size(),
+            state.workspaces[0].tabs[0].runtimes[&pane_id].current_size()
+        );
     }
 
     #[test]
@@ -2620,5 +3096,107 @@ mod tests {
                 "Collapse"
             ]
         );
+    }
+
+    #[test]
+    fn peer_context_menu_offers_the_picker_and_the_matching_collapse_action() {
+        let expanded = ContextMenuState {
+            kind: ContextMenuKind::Peer {
+                peer: "beta".into(),
+                collapsed: false,
+                has_hidden: false,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            expanded.items(),
+            &[
+                "Open workspace...",
+                "Add peer...",
+                "Collapse",
+                "Hide for session",
+                "Hide permanently"
+            ]
+        );
+
+        let collapsed = ContextMenuState {
+            kind: ContextMenuKind::Peer {
+                peer: "beta".into(),
+                collapsed: true,
+                has_hidden: true,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert_eq!(
+            collapsed.items(),
+            &[
+                "Open workspace...",
+                "Add peer...",
+                "Expand",
+                "Hide for session",
+                "Hide permanently",
+                "Unhide peer..."
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_workspace_picker_filters_and_marks_open_entries() {
+        let mut open = PeerWorkspaceOpenState {
+            peer: "beta".into(),
+            entries: vec![
+                PeerWorkspaceOpenEntry {
+                    target: "0123456789abcdef0123456789abcdef:w1".into(),
+                    label: "api".into(),
+                    number: 1,
+                    pane_count: 2,
+                    tab_count: 1,
+                    already_open_ws_idx: Some(0),
+                },
+                PeerWorkspaceOpenEntry {
+                    target: "0123456789abcdef0123456789abcdef:w2".into(),
+                    label: "web".into(),
+                    number: 2,
+                    pane_count: 1,
+                    tab_count: 1,
+                    already_open_ws_idx: None,
+                },
+            ],
+            selected: 0,
+            query: String::new(),
+            search_focused: false,
+            error: None,
+        };
+
+        assert_eq!(open.entries[0].status_label(), "open");
+        assert_eq!(open.entries[1].status_label(), "");
+        // Pluralisation is per count, and the detail line carries the id the
+        // open request will use.
+        assert!(open.entries[0].detail().ends_with("2 panes · 1 tab"));
+        // The detail line carries the peer-local id, not the namespaced one.
+        assert!(open.entries[0].detail().starts_with("w1 ·"));
+
+        // The status marker is searchable, so "open" narrows to open entries.
+        open.query = "open".into();
+        assert_eq!(open.filtered_indices(), vec![0]);
+
+        open.query = "web".into();
+        open.normalize_selection();
+        assert_eq!(open.selected_entry_index(), Some(1));
+
+        // Selection stays inside the filtered set at both ends.
+        open.query.clear();
+        open.select_next_filtered();
+        assert_eq!(open.selected_entry_index(), Some(1));
+        open.select_next_filtered();
+        assert_eq!(open.selected_entry_index(), Some(1));
+        open.select_previous_filtered();
+        assert_eq!(open.selected_entry_index(), Some(0));
+        open.select_previous_filtered();
+        assert_eq!(open.selected_entry_index(), Some(0));
     }
 }

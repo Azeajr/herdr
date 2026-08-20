@@ -159,7 +159,10 @@ impl App {
         {
             self.state.view.terminal_area
         } else {
-            let (estimated_rows, estimated_cols) = self.state.estimate_pane_size();
+            let crate::terminal::TerminalSize {
+                rows: estimated_rows,
+                cols: estimated_cols,
+            } = self.state.estimate_pane_size();
             ratatui::layout::Rect::new(0, 0, estimated_cols, estimated_rows)
         };
         let Some(resolved_geometry) =

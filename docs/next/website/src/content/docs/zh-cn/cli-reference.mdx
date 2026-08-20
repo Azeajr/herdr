@@ -128,6 +128,30 @@ herdr workspace create --cwd ~/project --label api --no-focus
 
 工作区是顶层项目或工作上下文。创建工作区也会创建第一个标签页和根窗格。JSON 响应中的 `.result.workspace.workspace_id`、`.result.tab.tab_id` 和 `.result.root_pane.pane_id` 是对应 ID。
 
+## 对等
+
+```bash
+herdr peer list [--json]
+herdr peer add <name> (--socket PATH | --ssh DESTINATION) [--peer-session NAME] [--json]
+herdr peer remove <name> [--json]
+herdr peer open <target> [--peer NAME] [--label TEXT] [--focus] [--no-focus] [--takeover]
+```
+
+对等是另一台 Herdr 服务器，本服务器会把它的工作区显示在自己的工作区旁边。用本机上的 API 套接字路径，或用 SSH 目标来指定它：
+
+```bash
+herdr peer add beta --socket ~/.config/herdr/sessions/beta/herdr.sock
+herdr peer add workbox --ssh workbox --peer-session agents
+```
+
+指定对等会话的参数是 `--peer-session`，因为 `--session` 已经用来选择每个 `herdr` 命令发往你自己的哪台服务器。
+
+`add`、`remove`、`list` 都会返回完整的对等列表并以表格打印；`--json` 给出原始响应，其中还包含每个对等的版本、协议和已报告的工作区。
+
+`peer open` 接受来自 `peer list` 的工作区 id、窗格 id 或终端 id，并打开一个查看它的本地工作区。`peer list` 返回的 id 已用对等的实例 id 加了命名空间，足以标识对等；只有对等本地的裸 id 才需要传 `--peer`。
+
+由对等支撑的窗格能做什么、不能做什么，见[持久化与远程访问](/zh-cn/docs/persistence-remote/)。
+
 ## Worktree
 
 ```bash
@@ -295,7 +319,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 `agent send-keys` 发送 `enter`、`up`、`esc`、`ctrl+c` 等逻辑按键。Herdr 会在写入任何字节前验证所有按键。`agent read` 读取解析出的终端流,`agent rename` 为已检测到的智能体命名。
 
-`agent explain` 请求运行中的服务器对屏幕检测所用的同一份底部缓冲区检测快照进行分类,因此实时输出反映服务器生效的清单缓存。因为它使用 `agent.explain` socket 方法,升级 Herdr 后,请先重启或交接到更新后的服务器,再使用实时 explain。用 `--file PATH --agent LABEL` 可以改为在本地解释一份保存的样本。默认输出显示智能体、最终状态、清单来源和版本、匹配的规则及其区域证据,以及任何回退、跳过或警告原因。加 `--verbose` 可以看到可见证据标志、缓存的远程版本、本地覆盖的遮蔽情况、远程更新状态,以及带匹配器和区域证据的完整已评估规则列表。提交问题报告或写测试时加 `--json`。
+`agent explain` 请求运行中的服务器对屏幕检测所用的同一份底部缓冲区检测快照进行分类,因此实时输出反映服务器生效的清单缓存。因为它使用 `agent.explain` socket 方法,升级 Herdr 后,请先重启或交接到更新后的服务器,再使用实时 explain。用 `--file PATH --agent LABEL` 可以改为在本地解释一份保存的样本。默认输出显示智能体、最终状态、清单来源和版本、匹配的规则及其区域证据,以及任何回退、跳过或警告原因。对由对等支撑的面板,解释来自真正跑过这些规则的对等,清单行上方的 `peer:` 一行会说明这一点——它下面的内容描述的都是对等那一侧的安装。加 `--verbose` 可以看到可见证据标志、缓存的远程版本、本地覆盖的遮蔽情况、远程更新状态,以及带匹配器和区域证据的完整已评估规则列表。提交问题报告或写测试时加 `--json`。
 
 普通终端、服务器、测试、shell 或底层终端控制,请使用 `pane send-text`、`pane send-keys`、`pane run` 和 `terminal attach`。想带回车提交命令时用 `pane run`。
 

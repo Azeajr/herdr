@@ -153,6 +153,16 @@ pub struct ResolvedBinding {
 }
 
 impl ResolvedBinding {
+    /// A direct binding on an unmodified character, which `validate_binding`
+    /// refuses to build from config. Tests that need one construct it here.
+    #[cfg(test)]
+    pub fn direct_for_test(character: char) -> Self {
+        Self {
+            trigger: BindingTrigger::Direct((KeyCode::Char(character), KeyModifiers::empty())),
+            label: character.to_string(),
+        }
+    }
+
     #[cfg(test)]
     fn matches_key_event(&self, key: &KeyEvent) -> bool {
         key_event_matches_combo(key, self.trigger.combo())
@@ -217,6 +227,12 @@ impl ActionKeybinds {
         self.bindings
             .iter()
             .any(|binding| binding.trigger.is_direct() && binding.matches_terminal_key(key))
+    }
+
+    fn has_direct_bare_printable(&self) -> bool {
+        self.bindings.iter().any(|binding| {
+            binding.trigger.is_direct() && is_unmodified_printable(binding.trigger.combo())
+        })
     }
 
     pub fn labels(&self) -> Vec<String> {
@@ -358,6 +374,167 @@ pub struct Keybinds {
     pub resize_pane_right: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
+    /// Set once by [`Config::validated_keybinds`]; read through
+    /// [`Keybinds::has_direct_bare_printable_binding`].
+    direct_bare_printable: bool,
+}
+
+impl Keybinds {
+    /// Whether any *direct* binding could fire on an ordinary typed character.
+    ///
+    /// Precomputed because the question is asked once per keystroke while the
+    /// answer changes only when the config does: one 800 KB burst of typed input
+    /// asks it 819,200 times, and answering it by scanning the binding tables was
+    /// a third of the per-key cost.
+    ///
+    /// Almost always false — the defaults bind through the prefix or a modifier —
+    /// which is what makes skipping the scans worth the bookkeeping.
+    pub fn has_direct_bare_printable_binding(&self) -> bool {
+        self.direct_bare_printable
+    }
+
+    /// Recomputes [`Self::has_direct_bare_printable_binding`] after the binding
+    /// lists have been changed in place.
+    ///
+    /// Nothing outside this module needs it today — every consumer replaces the
+    /// whole `Keybinds` — but the fields are public, so anything that starts
+    /// mutating them has to have a way to keep the cached answer true.
+    pub fn refresh_direct_bare_printable(&mut self) {
+        self.direct_bare_printable = any_direct_binding_matches_bare_printable(self);
+    }
+}
+
+fn any_direct_binding_matches_bare_printable(keybinds: &Keybinds) -> bool {
+    // Destructured without `..` on purpose. A keybind field added later must not
+    // quietly fall outside this check, because the cost of missing one is a
+    // binding that stops firing; a compile error is the only guarantee that holds
+    // without anyone remembering this function exists.
+    //
+    // `navigate` is deliberately excluded rather than folded in as a harmless
+    // superset. Its bindings apply in navigate mode, which the terminal-mode scans
+    // in `non_indexed_action_for_key` never consult — and `navigate_pane_left`
+    // defaults to a bare `h`, so counting it would report true for the default
+    // config and the fast path would never run at all.
+    let Keybinds {
+        navigate: _,
+        help,
+        settings,
+        new_workspace,
+        new_worktree,
+        open_worktree,
+        remove_worktree,
+        rename_workspace,
+        close_workspace,
+        workspace_picker,
+        goto,
+        detach,
+        reload_config,
+        open_notification_target,
+        previous_workspace,
+        next_workspace,
+        previous_agent,
+        next_agent,
+        focus_agent,
+        new_tab,
+        rename_tab,
+        previous_tab,
+        next_tab,
+        move_tab_previous,
+        move_tab_next,
+        switch_tab,
+        switch_workspace,
+        close_tab,
+        rename_pane,
+        edit_scrollback,
+        copy_mode,
+        focus_pane_left,
+        focus_pane_down,
+        focus_pane_up,
+        focus_pane_right,
+        swap_pane_left,
+        swap_pane_down,
+        swap_pane_up,
+        swap_pane_right,
+        cycle_pane_next,
+        cycle_pane_previous,
+        last_pane,
+        split_vertical,
+        split_horizontal,
+        close_pane,
+        zoom,
+        resize_mode,
+        resize_pane_left,
+        resize_pane_down,
+        resize_pane_up,
+        resize_pane_right,
+        toggle_sidebar,
+        custom_commands,
+        direct_bare_printable: _,
+    } = keybinds;
+
+    let actions = [
+        help,
+        settings,
+        new_workspace,
+        new_worktree,
+        open_worktree,
+        remove_worktree,
+        rename_workspace,
+        close_workspace,
+        workspace_picker,
+        goto,
+        detach,
+        reload_config,
+        open_notification_target,
+        previous_workspace,
+        next_workspace,
+        previous_agent,
+        next_agent,
+        new_tab,
+        rename_tab,
+        previous_tab,
+        next_tab,
+        move_tab_previous,
+        move_tab_next,
+        close_tab,
+        rename_pane,
+        edit_scrollback,
+        copy_mode,
+        focus_pane_left,
+        focus_pane_down,
+        focus_pane_up,
+        focus_pane_right,
+        swap_pane_left,
+        swap_pane_down,
+        swap_pane_up,
+        swap_pane_right,
+        cycle_pane_next,
+        cycle_pane_previous,
+        last_pane,
+        split_vertical,
+        split_horizontal,
+        close_pane,
+        zoom,
+        resize_mode,
+        resize_pane_left,
+        resize_pane_down,
+        resize_pane_up,
+        resize_pane_right,
+        toggle_sidebar,
+    ];
+
+    actions
+        .into_iter()
+        .any(ActionKeybinds::has_direct_bare_printable)
+        || [focus_agent, switch_tab, switch_workspace]
+            .into_iter()
+            .flatten()
+            .any(|binding| {
+                binding.trigger.is_direct() && is_unmodified_printable(binding.trigger.combo())
+            })
+        || custom_commands
+            .iter()
+            .any(|command| command.bindings.has_direct_bare_printable())
 }
 
 impl Default for Keybinds {
@@ -526,6 +703,7 @@ impl Config {
             resize_pane_right: empty_action!(),
             toggle_sidebar: empty_action!(),
             custom_commands: Vec::new(),
+            direct_bare_printable: false,
         };
 
         macro_rules! field_source {
@@ -709,6 +887,10 @@ impl Config {
                 );
             }
         }
+
+        // After every source has been applied, including custom commands: this
+        // summarises the finished tables, so it cannot be computed earlier.
+        keybinds.refresh_direct_bare_printable();
 
         (prefix_diag, prefix, diagnostics, keybinds)
     }
@@ -1325,6 +1507,37 @@ pub fn terminal_key_matches_combo(key: &TerminalKey, combo: KeyCombo) -> bool {
     key_parts_match_combo(key.code, key.modifiers, key.shifted_codepoint, combo)
 }
 
+/// A printable character carrying no modifier beyond shift — one keystroke of
+/// ordinary typing.
+///
+/// It is the key-side mirror of [`is_unmodified_printable`], which is the combo
+/// side, and the two must keep agreeing: a key this accepts may only ever match a
+/// combo that one accepts.
+///
+/// That direction is exact, not conservative, and it is what licenses skipping
+/// binding lookups entirely for typed text. Take a key whose code is a
+/// non-control `Char` and whose modifiers are within `SHIFT`. Every branch of
+/// [`key_parts_match_combo`] then forces the same shape on the expected combo:
+///
+/// * the direct branch requires `actual_modifiers == expected_modifiers`, so the
+///   expected set is within `SHIFT`, and `key_codes_match` compares `Char` to
+///   `Char` — any non-`Char` expected code falls to `actual == expected` and fails;
+/// * the shifted branch requires `actual_modifiers - SHIFT == expected_modifiers`,
+///   so the expected set is empty, and `shifted_char_matches_expected` returns
+///   early unless the expected code is `Char`;
+/// * the legacy uppercase branch requires `actual_modifiers | SHIFT ==
+///   expected_modifiers` with both codes `Char`, so the expected set is exactly
+///   `SHIFT`.
+///
+/// `IndexedKeybind::matched_index`'s shifted-number path is covered too: it needs
+/// `key.modifiers == expected_modifiers - SHIFT`, which for an actual set within
+/// `SHIFT` again leaves the expected set within `SHIFT`.
+pub fn terminal_key_is_bare_printable(key: &TerminalKey) -> bool {
+    // No `normalize_key_combo` here: it only rewrites Tab/BackTab, which are not
+    // `Char`, so it is the identity on everything this can return true for.
+    is_unmodified_printable((key.code, key.modifiers))
+}
+
 fn key_parts_match_combo(
     actual_code: KeyCode,
     actual_modifiers: KeyModifiers,
@@ -1485,6 +1698,184 @@ mod tests {
             .iter()
             .map(|binding| binding.trigger)
             .collect()
+    }
+
+    /// The predicate pair has to be exact in one direction: whenever
+    /// `is_unmodified_printable` is false, no key that
+    /// `terminal_key_is_bare_printable` accepts may match that combo. That is the
+    /// entire licence for skipping the binding scans, so it is checked
+    /// exhaustively over printable ASCII rather than argued for on samples.
+    #[test]
+    fn no_bare_printable_key_matches_a_combo_the_predicate_excludes() {
+        let modifier_sets = [
+            KeyModifiers::empty(),
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ];
+        let codes = ('!'..='~')
+            .map(KeyCode::Char)
+            .chain([
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Enter,
+                KeyCode::Esc,
+                KeyCode::F(1),
+                KeyCode::Up,
+            ])
+            .collect::<Vec<_>>();
+
+        for &combo_code in &codes {
+            for &combo_mods in &modifier_sets {
+                let combo = (combo_code, combo_mods);
+                if is_unmodified_printable(combo) {
+                    continue;
+                }
+                for actual in ('!'..='~').map(KeyCode::Char) {
+                    for actual_mods in [KeyModifiers::empty(), KeyModifiers::SHIFT] {
+                        // Both with and without a shifted codepoint, because that is
+                        // the input the enhanced-keyboard branch reads.
+                        for shifted in [None, Some('?' as u32), Some('A' as u32)] {
+                            let mut key = TerminalKey::new(actual, actual_mods);
+                            if let Some(shifted) = shifted {
+                                key = key.with_shifted_codepoint(shifted);
+                            }
+                            assert!(
+                                terminal_key_is_bare_printable(&key),
+                                "{key:?} should count as bare printable"
+                            );
+                            assert!(
+                                !terminal_key_matches_combo(&key, combo),
+                                "{key:?} matched {combo:?}, which the predicate excluded"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_keybinds_have_no_direct_bare_printable_binding() {
+        // Not merely a property of the defaults: if this ever becomes true, the
+        // terminal input fast path stops running for every default install.
+        assert!(!Config::default()
+            .keybinds()
+            .has_direct_bare_printable_binding());
+    }
+
+    #[test]
+    fn navigate_mode_bindings_do_not_set_the_direct_bare_printable_flag() {
+        // `navigate_pane_left` defaults to a bare `h`, and navigate-mode bindings are
+        // never consulted by the terminal-mode direct scans. Counting them would
+        // disable the fast path for every default config.
+        let keybinds = Config::default().keybinds();
+        assert!(keybinds
+            .navigate
+            .pane_left
+            .matches_direct_key(&TerminalKey::new(KeyCode::Char('h'), KeyModifiers::empty())));
+        assert!(!keybinds.has_direct_bare_printable_binding());
+    }
+
+    #[test]
+    fn configuring_a_direct_bare_printable_binding_leaves_the_flag_false() {
+        // Because it never becomes a binding: `validate_binding` disables any direct
+        // combo that `is_unmodified_printable` accepts, for actions, indexed
+        // triggers and custom commands alike. The flag is therefore expected to be
+        // false in practice — it exists so the fast path stays correct if that rule
+        // is ever relaxed, not because it is currently reachable.
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+zoom = "z"
+switch_tab = "1"
+
+[[keys.command]]
+key = "g"
+command = "echo no"
+"#,
+        )
+        .unwrap();
+        let keybinds = config.keybinds();
+        assert!(keybinds.zoom.bindings.is_empty());
+        assert!(keybinds.switch_tab.is_empty());
+        assert!(keybinds.custom_commands.is_empty());
+        assert!(!keybinds.has_direct_bare_printable_binding());
+    }
+
+    #[test]
+    fn traversal_finds_a_bare_printable_binding_in_every_source() {
+        // Injected past `validate_binding`, which is the only reason the sources
+        // above come back empty. This is what the flag would have to catch if that
+        // validation stopped rejecting them.
+        let bare = ResolvedBinding {
+            trigger: BindingTrigger::Direct((KeyCode::Char('z'), KeyModifiers::empty())),
+            label: "z".to_string(),
+        };
+        // Shift-only counts too: a bare `Z` reaches a `shift+z` binding through the
+        // legacy uppercase branch of `key_parts_match_combo`.
+        let shifted = ResolvedBinding {
+            trigger: BindingTrigger::Direct((KeyCode::Char('z'), KeyModifiers::SHIFT)),
+            label: "shift+z".to_string(),
+        };
+        let modified = ResolvedBinding {
+            trigger: BindingTrigger::Direct((KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            label: "ctrl+z".to_string(),
+        };
+
+        for binding in [&bare, &shifted] {
+            let mut keybinds = Config::default().keybinds();
+            keybinds.zoom.bindings.push(binding.clone());
+            assert!(
+                any_direct_binding_matches_bare_printable(&keybinds),
+                "action binding {:?} should count",
+                binding.trigger
+            );
+        }
+
+        let mut keybinds = Config::default().keybinds();
+        keybinds.zoom.bindings.push(modified);
+        assert!(!any_direct_binding_matches_bare_printable(&keybinds));
+
+        let mut keybinds = Config::default().keybinds();
+        keybinds.switch_tab.push(IndexedKeybind {
+            trigger: BindingTrigger::Direct((KeyCode::Char('1'), KeyModifiers::empty())),
+            label: "1".to_string(),
+        });
+        assert!(any_direct_binding_matches_bare_printable(&keybinds));
+
+        let mut keybinds = Config::default().keybinds();
+        keybinds.custom_commands.push(CustomCommandKeybind {
+            bindings: ActionKeybinds {
+                bindings: vec![bare],
+            },
+            label: "z".to_string(),
+            command: "echo hi".to_string(),
+            action: CustomCommandAction::Shell,
+            description: None,
+            width: None,
+            height: None,
+        });
+        assert!(any_direct_binding_matches_bare_printable(&keybinds));
+    }
+
+    #[test]
+    fn prefix_bindings_do_not_set_the_flag() {
+        // The flag is about the direct scans only. A prefix binding on a bare
+        // printable is normal and must not disable the fast path.
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+zoom = "prefix+z"
+"#,
+        )
+        .unwrap();
+        let keybinds = config.keybinds();
+        assert!(!keybinds.zoom.bindings.is_empty());
+        assert!(!keybinds.has_direct_bare_printable_binding());
     }
 
     #[test]

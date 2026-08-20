@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 20,
+  "protocol": 22,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -757,9 +757,61 @@
           ],
           "type": "string"
         },
+        "KeyboardProtocolInfo": {
+          "description": "How a pane's program wants keypresses encoded.",
+          "oneOf": [
+            {
+              "description": "Classic terminal encodings.",
+              "properties": {
+                "type": {
+                  "const": "legacy",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The Kitty keyboard protocol, with the progressive-enhancement flags the\nprogram asked for.",
+              "properties": {
+                "flags": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "kitty",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "flags"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "PaneInfo": {
           "properties": {
             "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_osc_progress": {
+              "description": "Agent progress reported through the terminal's OSC channel.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_osc_title": {
+              "description": "Agent status title reported through the terminal's OSC channel.",
               "type": [
                 "string",
                 "null"
@@ -799,7 +851,32 @@
                 "null"
               ]
             },
+            "keyboard_protocol": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/KeyboardProtocolInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Keyboard protocol the program in this pane has enabled.\n\nWhich encoding a keypress should take is VT state, so only the server\nholding the terminal can read it. A federating server reports it here so\na view onto this pane encodes the way the program asked rather than\nalways falling back to the legacy encoding — which is what makes\nShift+Enter, Ctrl+Enter and key-release events reach a remote agent at\nall.\n\n`None` from a server too old to report it; treat that as legacy."
+            },
             "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner_attached": {
+              "description": "Whether that owner currently holds a connection to this pane's terminal.\n\n`None` when the pane has no other owner. `false` means the instance that\nasked for this pane is gone while the pane is still running here, which\nis what makes it a candidate for cleanup.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "owner_instance_id": {
+              "description": "Instance id of another herdr server that had this pane created, when one\ndid.",
               "type": [
                 "string",
                 "null"
@@ -807,6 +884,24 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "peer": {
+              "description": "Name of the peer whose terminal this pane is a view onto, when it is one.\n\nA peer-backed pane holds no local terminal state: the peer renders the\nscreen and streams cells. Reads are forwarded to it, but anything that\nneeds the grid itself — selection, search, scroll position — has no\nanswer here. Clients should present this as a view onto another server\nrather than discovering each limit by calling into it.\n\nThis is the local side of [`Self::owner_instance_id`], which is what the\npeer reports about the same pane.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "peer_view": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/event/$defs/PeerViewInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Liveness of the connection carrying this view, when the pane is one.\n\nA peer-backed pane keeps its identity, title, and cwd after the\nconnection behind it drops, because they are the last thing the peer\nreported rather than something read live. Without this a stale view and\na healthy one are indistinguishable to a client, which is how a pane the\npeer already closed goes on being listed as if it were running.\n\n`None` for a local pane. Always present for a peer-backed one, including\nwhile it is connected, so a client can tell \"not a view\" from \"a view\nthat is fine\"."
             },
             "revision": {
               "format": "uint64",
@@ -1021,6 +1116,44 @@
             "viewport_rows"
           ],
           "type": "object"
+        },
+        "PeerViewInfo": {
+          "description": "What the connection behind a peer-backed pane is currently doing.",
+          "properties": {
+            "reason": {
+              "description": "Why the view is not connected, when the reason is known.\n\nCarried for both non-connected states because the same failure reads\ndifferently depending on which one it produced: as the last thing that\nwent wrong while retrying, or as the thing retrying could not get past.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/event/$defs/PeerViewState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "PeerViewState": {
+          "oneOf": [
+            {
+              "const": "connected",
+              "description": "The peer is streaming this pane.",
+              "type": "string"
+            },
+            {
+              "const": "reconnecting",
+              "description": "The connection dropped and is being reopened. The pane still shows the\npeer's last frame.",
+              "type": "string"
+            },
+            {
+              "const": "disconnected",
+              "description": "Reopening was given up on. Nothing will change without the pane being\nclosed and the view opened again, so anything this pane reports is a\nsnapshot of when the connection was last alive.",
+              "type": "string"
+            }
+          ]
         },
         "SplitDirection": {
           "enum": [
@@ -2755,6 +2888,48 @@
           ],
           "type": "object"
         },
+        "PaneReadRangeParams": {
+          "description": "Read a rectangle-free span of a pane's screen, by buffer coordinates.\n\n`pane.read` answers in whole lines from the bottom, which cannot name the\nspan a drag covers. The rows here are absolute rows in the terminal's own\nbuffer — the same coordinates a scroll position is expressed in — so a\ncaller holding a scroll offset can name a row on any server that owns the\nscreen, including one reached through a peer.",
+          "properties": {
+            "end_col": {
+              "description": "Last column of the span, inclusive.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "end_row": {
+              "description": "Last row of the span, inclusive.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "start_col": {
+              "description": "First column of the span.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "start_row": {
+              "description": "First row of the span, as an absolute buffer row.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane_id",
+            "start_row",
+            "start_col",
+            "end_row",
+            "end_col"
+          ],
+          "type": "object"
+        },
         "PaneReleaseAgentParams": {
           "properties": {
             "agent": {
@@ -3085,6 +3260,13 @@
               "default": false,
               "type": "boolean"
             },
+            "owner_instance_id": {
+              "description": "Instance id of the server requesting the split, when it is not this one.\n\nSet by a federating server splitting a pane here to back a view of its\nown, so this server can report the pane as unattended once that instance\nstops attaching to it. Self-asserted, like every other field on this\nsocket.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "ratio": {
               "format": "float",
               "type": [
@@ -3158,6 +3340,84 @@
           ],
           "type": "object"
         },
+        "PaneTextMotion": {
+          "enum": [
+            "next_word_start",
+            "previous_word_start",
+            "next_word_end",
+            "next_big_word_start",
+            "previous_big_word_start",
+            "next_big_word_end",
+            "line_end",
+            "first_non_blank",
+            "previous_paragraph",
+            "next_paragraph"
+          ],
+          "type": "string"
+        },
+        "PaneTextQueryParams": {
+          "description": "A terminal text operation that must run beside the terminal buffer.\n\nThe streamed pane frame intentionally carries only visible cells. Search\nand text motion need scrollback, soft-wrap boundaries, and the terminal's\nword rules, so a federating server asks the server that owns the buffer.",
+          "oneOf": [
+            {
+              "properties": {
+                "case_sensitive": {
+                  "default": false,
+                  "type": "boolean"
+                },
+                "query": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "search",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "query"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "col": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "motion": {
+                  "$ref": "#/schemas/request/$defs/PaneTextMotion"
+                },
+                "row": {
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "motion",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "row",
+                "col",
+                "motion"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneWaitForOutputParams": {
           "properties": {
             "lines": {
@@ -3218,6 +3478,182 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "PeerAddParams": {
+          "properties": {
+            "name": {
+              "description": "Local name for the peer. Must be unique.",
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/schemas/request/$defs/PeerTargetSpec"
+            }
+          },
+          "required": [
+            "name",
+            "target"
+          ],
+          "type": "object"
+        },
+        "PeerRef": {
+          "properties": {
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "PeerTargetSpec": {
+          "description": "How to reach a peer server.",
+          "oneOf": [
+            {
+              "description": "A herdr API socket path on this machine.",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "socket_path",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "path"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "An SSH destination; the socket path resolves on the remote host.",
+              "properties": {
+                "destination": {
+                  "type": "string"
+                },
+                "session": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "ssh",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "destination"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PeerTerminalOpenParams": {
+          "properties": {
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "description": "Local name of the peer. Optional when `target` carries a peer namespace,\nwhich already identifies the peer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "takeover": {
+              "default": false,
+              "description": "Replace an existing writable controller for that terminal on the peer.",
+              "type": "boolean"
+            },
+            "target": {
+              "description": "Terminal id, pane id, or agent name to control on the peer.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
+        "PeerWorkspaceCreateParams": {
+          "description": "Create a workspace on a peer and open a local view onto it.\n\nDistinct from `workspace.create` with a namespaced id: this names a *peer*,\nnot a peer workspace, so there is no existing id to route on. The reply is\nthe **local** workspace, the same as `peer.workspace.open`, because the\ncaller can only act on the view it now holds.",
+          "properties": {
+            "cwd": {
+              "description": "Working directory for the new workspace, resolved on the peer.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "description": "Label for the local view. Defaults to the peer name and target.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "Local name of the peer to create the workspace on.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "PeerWorkspaceOpenParams": {
+          "properties": {
+            "focus": {
+              "default": false,
+              "type": "boolean"
+            },
+            "label": {
+              "description": "Label for the local workspace. Defaults to the peer name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "Local name of the peer. Optional when `target` carries a peer namespace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "takeover": {
+              "default": false,
+              "description": "Replace an existing writable controller for that terminal on the peer.",
+              "type": "boolean"
+            },
+            "target": {
+              "description": "Namespaced or peer-local id of the pane or terminal to view.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
           "type": "object"
         },
         "PingParams": {
@@ -4136,6 +4572,18 @@
           ],
           "type": "object"
         },
+        "TerminalTarget": {
+          "description": "Release a peer-backed terminal opened without a workspace around it.\n\nThe counterpart to `peer.terminal.open`. A terminal a pane is attached to is\nreleased by closing that pane; this is for the ones nothing holds.",
+          "properties": {
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id"
+          ],
+          "type": "object"
+        },
         "ToastHerdrPosition": {
           "enum": [
             "top-left",
@@ -4426,6 +4874,7 @@
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Wire envelope for an API request.\n\n`if_instance_id` rejects the request if a different server now owns the\nsocket. Ordinary clients omit it.",
       "oneOf": [
         {
           "properties": {
@@ -5470,6 +5919,38 @@
         {
           "properties": {
             "method": {
+              "const": "pane.read_range",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReadRangeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "pane.text_query",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTextQueryParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.graphics.set",
               "type": "string"
             },
@@ -5619,6 +6100,118 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.add",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PeerAddParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.remove",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PeerRef"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.terminal.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PeerTerminalOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.terminal.close",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TerminalTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.workspace.open",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PeerWorkspaceOpenParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "peer.workspace.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PeerWorkspaceCreateParams"
             }
           },
           "required": [
@@ -5887,12 +6480,18 @@
       "properties": {
         "id": {
           "type": "string"
+        },
+        "if_instance_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
         "id"
       ],
-      "title": "Request",
+      "title": "RequestEnvelope",
       "type": "object"
     },
     "subscription_event": {
@@ -6080,16 +6679,50 @@
             },
             {
               "$ref": "#/schemas/subscription_event/$defs/PaneScrollChangedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_event/$defs/SubscriptionOverflowEvent"
             }
           ]
         },
         "SubscriptionEventKind": {
-          "enum": [
-            "pane.output_matched",
-            "pane.agent_status_changed",
-            "pane.scroll_changed"
+          "oneOf": [
+            {
+              "enum": [
+                "pane.output_matched",
+                "pane.agent_status_changed",
+                "pane.scroll_changed"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "subscription.overflow",
+              "description": "Events matching this subscription were dropped before it read them.\n\nSent instead of quietly delivering a shorter history, which a client\ncannot tell apart from a quiet period. A client that is building a\nrecord of what happened should treat this as a break in it and resync\nfrom current state rather than assume continuity.",
+              "type": "string"
+            }
+          ]
+        },
+        "SubscriptionOverflowEvent": {
+          "description": "Reports that the server could not deliver everything this subscription\nmatched.",
+          "properties": {
+            "oldest_retained_sequence": {
+              "description": "The oldest event sequence the server still holds. Everything between\nthe subscription's position and this was dropped.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "resumed_at_sequence": {
+              "description": "The sequence the subscription resumed from. Delivery continues normally\nafter this point.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "oldest_retained_sequence",
+            "resumed_at_sequence"
           ],
-          "type": "string"
+          "type": "object"
         }
       },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -7195,6 +7828,44 @@
           ],
           "type": "object"
         },
+        "KeyboardProtocolInfo": {
+          "description": "How a pane's program wants keypresses encoded.",
+          "oneOf": [
+            {
+              "description": "Classic terminal encodings.",
+              "properties": {
+                "type": {
+                  "const": "legacy",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The Kitty keyboard protocol, with the progressive-enhancement flags the\nprogram asked for.",
+              "properties": {
+                "flags": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "kitty",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "flags"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "LayoutDescription": {
           "properties": {
             "focused_pane_id": {
@@ -7399,6 +8070,20 @@
                 "null"
               ]
             },
+            "agent_osc_progress": {
+              "description": "Agent progress reported through the terminal's OSC channel.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_osc_title": {
+              "description": "Agent status title reported through the terminal's OSC channel.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "agent_session": {
               "anyOf": [
                 {
@@ -7433,7 +8118,32 @@
                 "null"
               ]
             },
+            "keyboard_protocol": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/KeyboardProtocolInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Keyboard protocol the program in this pane has enabled.\n\nWhich encoding a keypress should take is VT state, so only the server\nholding the terminal can read it. A federating server reports it here so\na view onto this pane encodes the way the program asked rather than\nalways falling back to the legacy encoding — which is what makes\nShift+Enter, Ctrl+Enter and key-release events reach a remote agent at\nall.\n\n`None` from a server too old to report it; treat that as legacy."
+            },
             "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "owner_attached": {
+              "description": "Whether that owner currently holds a connection to this pane's terminal.\n\n`None` when the pane has no other owner. `false` means the instance that\nasked for this pane is gone while the pane is still running here, which\nis what makes it a candidate for cleanup.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "owner_instance_id": {
+              "description": "Instance id of another herdr server that had this pane created, when one\ndid.",
               "type": [
                 "string",
                 "null"
@@ -7441,6 +8151,24 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "peer": {
+              "description": "Name of the peer whose terminal this pane is a view onto, when it is one.\n\nA peer-backed pane holds no local terminal state: the peer renders the\nscreen and streams cells. Reads are forwarded to it, but anything that\nneeds the grid itself — selection, search, scroll position — has no\nanswer here. Clients should present this as a view onto another server\nrather than discovering each limit by calling into it.\n\nThis is the local side of [`Self::owner_instance_id`], which is what the\npeer reports about the same pane.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "peer_view": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/PeerViewInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Liveness of the connection carrying this view, when the pane is one.\n\nA peer-backed pane keeps its identity, title, and cwd after the\nconnection behind it drops, because they are the last thing the peer\nreported rather than something read live. Without this a stale view and\na healthy one are indistinguishable to a client, which is how a pane the\npeer already closed goes on being listed as if it were running.\n\n`None` for a local pane. Always present for a peer-backed one, including\nwhile it is connected, so a client can tell \"not a view\" from \"a view\nthat is fine\"."
             },
             "revision": {
               "format": "uint64",
@@ -7833,6 +8561,22 @@
           ],
           "type": "object"
         },
+        "PaneReadRangeResult": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "text": {
+              "description": "The span's text, joined the way the terminal itself joins it: soft\nwraps do not become newlines, and trailing blanks are dropped.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "text"
+          ],
+          "type": "object"
+        },
         "PaneReadResult": {
           "properties": {
             "format": {
@@ -7986,6 +8730,95 @@
           ],
           "type": "object"
         },
+        "PaneTextMatch": {
+          "properties": {
+            "end": {
+              "$ref": "#/schemas/success_response/$defs/PaneTextPoint"
+            },
+            "start": {
+              "$ref": "#/schemas/success_response/$defs/PaneTextPoint"
+            }
+          },
+          "required": [
+            "start",
+            "end"
+          ],
+          "type": "object"
+        },
+        "PaneTextPoint": {
+          "properties": {
+            "col": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "row": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "row",
+            "col"
+          ],
+          "type": "object"
+        },
+        "PaneTextQueryResult": {
+          "oneOf": [
+            {
+              "properties": {
+                "matches": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/PaneTextMatch"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "search",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "matches"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "target": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/PaneTextPoint"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": {
+                  "const": "motion",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            }
+          ],
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneZoomReason": {
           "enum": [
             "single_pane",
@@ -8038,6 +8871,234 @@
             "layout"
           ],
           "type": "object"
+        },
+        "PeerConnectionKind": {
+          "description": "Where a peer's control connection currently stands.\n\nA generated enum rather than a free-form string, matching `PeerViewState`:\nthe two describe the same kind of fact at different scopes, and a client\nshould not get a typed answer for one and an unconstrained string for the\nother.",
+          "oneOf": [
+            {
+              "const": "connecting",
+              "description": "The first attempt has not finished yet.",
+              "type": "string"
+            },
+            {
+              "const": "connected",
+              "description": "The peer is answering.",
+              "type": "string"
+            },
+            {
+              "const": "reconnecting",
+              "description": "The connection dropped and is being retried with backoff.",
+              "type": "string"
+            },
+            {
+              "const": "error",
+              "description": "The peer cannot be federated with as configured. Retrying would only\nhide the misconfiguration, so nothing is retrying.",
+              "type": "string"
+            }
+          ]
+        },
+        "PeerInfo": {
+          "description": "A peer and what it last reported.",
+          "properties": {
+            "attempt": {
+              "description": "Set while the connection is retrying.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "connection": {
+              "$ref": "#/schemas/success_response/$defs/PeerConnectionKind"
+            },
+            "error": {
+              "description": "Set when the last attempt failed.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failed_pane_cleanups": {
+              "description": "Panes this server spawned on the peer and could not close there.\n\nClosing a local view cannot fail or be rolled back, so a cleanup that\ndoes not reach the peer is counted here instead of reported as an error.\nThe peer may still be running those panes; it tracks them itself as\nowned by an instance that is no longer attached.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "instance_id": {
+              "description": "The peer's server instance id, once it has identified itself.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "label": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "protocol": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stale": {
+              "description": "Whether this peer's content is currently out of date.",
+              "type": "boolean"
+            },
+            "target": {
+              "$ref": "#/schemas/success_response/$defs/PeerTargetSpec"
+            },
+            "version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "workspaces": {
+              "description": "The peer's workspaces as of its last enumeration.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/WorkspaceInfo"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "label",
+            "target",
+            "connection",
+            "stale",
+            "workspaces"
+          ],
+          "type": "object"
+        },
+        "PeerTargetSpec": {
+          "description": "How to reach a peer server.",
+          "oneOf": [
+            {
+              "description": "A herdr API socket path on this machine.",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "socket_path",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "path"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "An SSH destination; the socket path resolves on the remote host.",
+              "properties": {
+                "destination": {
+                  "type": "string"
+                },
+                "session": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "ssh",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "destination"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "PeerTerminalInfo": {
+          "properties": {
+            "cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "local_target": {
+              "description": "The peer-local id actually sent over the wire.",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "target": {
+              "description": "Target as requested, which may be namespaced with the peer instance id.",
+              "type": "string"
+            },
+            "terminal_id": {
+              "description": "Local terminal id for the peer-backed terminal.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "name",
+            "target",
+            "local_target",
+            "cols",
+            "rows"
+          ],
+          "type": "object"
+        },
+        "PeerViewInfo": {
+          "description": "What the connection behind a peer-backed pane is currently doing.",
+          "properties": {
+            "reason": {
+              "description": "Why the view is not connected, when the reason is known.\n\nCarried for both non-connected states because the same failure reads\ndifferently depending on which one it produced: as the last thing that\nwent wrong while retrying, or as the thing retrying could not get past.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/PeerViewState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "PeerViewState": {
+          "oneOf": [
+            {
+              "const": "connected",
+              "description": "The peer is streaming this pane.",
+              "type": "string"
+            },
+            {
+              "const": "reconnecting",
+              "description": "The connection dropped and is being reopened. The pane still shows the\npeer's last frame.",
+              "type": "string"
+            },
+            {
+              "const": "disconnected",
+              "description": "Reopening was given up on. Nothing will change without the pane being\nclosed and the view opened again, so anything this pane reports is a\nsnapshot of when the connection was last alive.",
+              "type": "string"
+            }
+          ]
         },
         "PluginActionContext": {
           "enum": [
@@ -8636,6 +9697,14 @@
                   ],
                   "default": null
                 },
+                "instance_id": {
+                  "default": null,
+                  "description": "Stable identity of this server instance, used to namespace ids when\nfederating with another server. Absent on servers predating it.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "protocol": {
                   "format": "uint32",
                   "minimum": 0,
@@ -8728,6 +9797,57 @@
               "required": [
                 "type",
                 "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "peers": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/PeerInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "peer_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "peers"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "terminal": {
+                  "$ref": "#/schemas/success_response/$defs/PeerTerminalInfo"
+                },
+                "type": {
+                  "const": "peer_terminal",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "terminal"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "terminal_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "terminal_closed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "terminal_id"
               ],
               "type": "object"
             },
@@ -9251,6 +10371,38 @@
               "required": [
                 "type",
                 "read"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "read": {
+                  "$ref": "#/schemas/success_response/$defs/PaneReadRangeResult"
+                },
+                "type": {
+                  "const": "pane_read_range",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "read"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "query": {
+                  "$ref": "#/schemas/success_response/$defs/PaneTextQueryResult"
+                },
+                "type": {
+                  "const": "pane_text_query",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "query"
               ],
               "type": "object"
             },

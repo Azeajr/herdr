@@ -296,6 +296,21 @@ impl ActiveSubscription {
         }
     }
 
+    /// Takes everything this subscription has to deliver right now.
+    ///
+    /// Only event-stream subscriptions can have a backlog; the others compare
+    /// against current state, where there is only ever one answer.
+    pub(super) fn poll_batch(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        event_hub: &EventHub,
+    ) -> Vec<serde_json::Value> {
+        match self {
+            Self::Event(subscription) => subscription.poll_batch(event_hub),
+            _ => self.poll(api_tx, event_hub).into_iter().collect(),
+        }
+    }
+
     pub(super) fn poll(
         &mut self,
         api_tx: &ApiRequestSender,
@@ -331,13 +346,58 @@ impl ActiveSubscription {
 
 impl ActiveEventSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
-            self.last_sequence = sequence;
-            if event.event == self.event_kind {
-                return serde_json::to_value(event).ok();
+        self.poll_batch(event_hub).into_iter().next()
+    }
+
+    /// Takes everything matched since the last poll, up to the hub's batch
+    /// limit.
+    ///
+    /// One event per poll was a throughput ceiling rather than a pacing choice:
+    /// the connection sleeps between polls, so anything matching faster than
+    /// that could never be delivered in full, and the excess aged out of the
+    /// replay buffer unannounced.
+    fn poll_batch(&mut self, event_hub: &EventHub) -> Vec<serde_json::Value> {
+        match event_hub.matching_after(self.last_sequence, self.event_kind) {
+            None => Vec::new(),
+            Some(crate::api::event_hub::EventBatch::Delivered {
+                events,
+                last_sequence,
+            }) => {
+                self.last_sequence = last_sequence;
+                events
+                    .into_iter()
+                    .filter_map(|event| serde_json::to_value(event).ok())
+                    .collect()
+            }
+            Some(crate::api::event_hub::EventBatch::Gap {
+                oldest_retained,
+                resume_at,
+            }) => {
+                // Said out loud rather than absorbed: the client is building a
+                // history, and a silently shorter one is worse than a reported
+                // break in it.
+                tracing::warn!(
+                    kind = ?self.event_kind,
+                    subscription_at = self.last_sequence,
+                    oldest_retained,
+                    resume_at,
+                    "an event subscription fell behind the replay buffer"
+                );
+                self.last_sequence = resume_at;
+                serde_json::to_value(SubscriptionEventEnvelope {
+                    event: SubscriptionEventKind::SubscriptionOverflow,
+                    data: SubscriptionEventData::SubscriptionOverflow(
+                        crate::api::schema::SubscriptionOverflowEvent {
+                            oldest_retained_sequence: oldest_retained,
+                            resumed_at_sequence: resume_at,
+                        },
+                    ),
+                })
+                .ok()
+                .into_iter()
+                .collect()
             }
         }
-        None
     }
 }
 
@@ -667,11 +727,18 @@ mod tests {
             terminal_title: None,
             terminal_title_stripped: None,
             display_agent: None,
+            agent_osc_title: None,
+            agent_osc_progress: None,
             agent_status: AgentStatus::Unknown,
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
             scroll,
+            keyboard_protocol: None,
+            peer: None,
+            peer_view: None,
+            owner_instance_id: None,
+            owner_attached: None,
             revision: 0,
         }
     }
@@ -849,5 +916,95 @@ mod tests {
         };
         assert_eq!(data.title.as_deref(), Some("short lived"));
         assert!(subscription.initial_event.is_none());
+    }
+
+    fn workspace_closed_event() -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::WorkspaceClosed,
+            data: EventData::WorkspaceClosed {
+                workspace_id: "w1".into(),
+                workspace: None,
+            },
+        }
+    }
+
+    fn event_subscription(kind: EventKind) -> ActiveEventSubscription {
+        ActiveEventSubscription {
+            event_kind: kind,
+            last_sequence: 0,
+        }
+    }
+
+    /// B2's throughput half: a subscription emitted one event per poll while
+    /// its connection slept between polls, so anything matching faster than
+    /// that could never be delivered whole.
+    #[test]
+    fn a_burst_is_delivered_in_one_poll_rather_than_one_at_a_time() {
+        let hub = EventHub::default();
+        for _ in 0..25 {
+            hub.push(workspace_closed_event());
+        }
+        let mut subscription = event_subscription(EventKind::WorkspaceClosed);
+
+        let delivered = subscription.poll_batch(&hub);
+
+        assert_eq!(delivered.len(), 25);
+        assert!(
+            subscription.poll_batch(&hub).is_empty(),
+            "the burst is fully consumed"
+        );
+    }
+
+    /// B2's correctness half: falling behind the replay buffer used to be
+    /// indistinguishable from nothing having happened.
+    #[test]
+    fn falling_behind_produces_an_overflow_notice_not_silence() {
+        let hub = EventHub::default();
+        let mut subscription = event_subscription(EventKind::WorkspaceClosed);
+        for _ in 0..(EventHub::MAX_EVENTS + 50) {
+            hub.push(workspace_closed_event());
+        }
+
+        let delivered = subscription.poll_batch(&hub);
+
+        assert_eq!(delivered.len(), 1, "one notice, not a truncated history");
+        let kind = delivered[0]
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .expect("the notice names its kind");
+        assert_eq!(kind, "subscription.overflow");
+    }
+
+    #[test]
+    fn a_subscription_resumes_normally_after_an_overflow() {
+        let hub = EventHub::default();
+        let mut subscription = event_subscription(EventKind::WorkspaceClosed);
+        for _ in 0..(EventHub::MAX_EVENTS + 50) {
+            hub.push(workspace_closed_event());
+        }
+        assert_eq!(subscription.poll_batch(&hub).len(), 1);
+
+        assert!(
+            subscription.poll_batch(&hub).is_empty(),
+            "the gap is reported once, not on every poll"
+        );
+
+        hub.push(workspace_closed_event());
+        let resumed = subscription.poll_batch(&hub);
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(
+            resumed[0].get("event").and_then(serde_json::Value::as_str),
+            Some("workspace_closed"),
+            "delivery continues normally after the break"
+        );
+    }
+
+    #[test]
+    fn events_of_other_kinds_do_not_reach_a_filtered_subscription() {
+        let hub = EventHub::default();
+        let mut subscription = event_subscription(EventKind::WorkspaceCreated);
+        hub.push(workspace_closed_event());
+
+        assert!(subscription.poll_batch(&hub).is_empty());
     }
 }

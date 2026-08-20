@@ -482,6 +482,8 @@ mod tests {
             workspaces: Vec::new(),
             active: None,
             selected: 0,
+            hidden_peers: Default::default(),
+            peers: Vec::new(),
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),

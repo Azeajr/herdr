@@ -5,6 +5,7 @@ pub mod common;
 pub mod events;
 pub mod integrations;
 pub mod panes;
+pub mod peers;
 pub mod plugins;
 pub mod response;
 pub mod server;
@@ -18,6 +19,7 @@ pub use common::*;
 pub use events::*;
 pub use integrations::*;
 pub use panes::*;
+pub use peers::*;
 pub use plugins::*;
 pub use response::*;
 pub use server::*;
@@ -35,6 +37,27 @@ pub struct Request {
     pub id: String,
     #[serde(flatten)]
     pub method: Method,
+}
+
+/// Wire envelope for an API request.
+///
+/// `if_instance_id` rejects the request if a different server now owns the
+/// socket. Ordinary clients omit it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RequestEnvelope {
+    #[serde(flatten)]
+    pub request: Request,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_instance_id: Option<String>,
+}
+
+impl From<Request> for RequestEnvelope {
+    fn from(request: Request) -> Self {
+        Self {
+            request,
+            if_instance_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -173,6 +196,10 @@ pub enum Method {
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
+    #[serde(rename = "pane.read_range")]
+    PaneReadRange(PaneReadRangeParams),
+    #[serde(rename = "pane.text_query")]
+    PaneTextQuery(PaneTextQueryParams),
     #[serde(rename = "pane.graphics.set")]
     PaneGraphicsSet(PaneGraphicsSetParams),
     #[serde(rename = "pane.graphics.clear")]
@@ -208,6 +235,20 @@ pub enum Method {
     PaneClose(PaneTarget),
     #[serde(rename = "popup.close")]
     PopupClose(EmptyParams),
+    #[serde(rename = "peer.add")]
+    PeerAdd(PeerAddParams),
+    #[serde(rename = "peer.remove")]
+    PeerRemove(PeerRef),
+    #[serde(rename = "peer.list")]
+    PeerList(EmptyParams),
+    #[serde(rename = "peer.terminal.open")]
+    PeerTerminalOpen(PeerTerminalOpenParams),
+    #[serde(rename = "peer.terminal.close")]
+    PeerTerminalClose(TerminalTarget),
+    #[serde(rename = "peer.workspace.open")]
+    PeerWorkspaceOpen(PeerWorkspaceOpenParams),
+    #[serde(rename = "peer.workspace.create")]
+    PeerWorkspaceCreate(PeerWorkspaceCreateParams),
     #[serde(rename = "events.subscribe")]
     EventsSubscribe(EventsSubscribeParams),
     #[serde(rename = "events.wait")]

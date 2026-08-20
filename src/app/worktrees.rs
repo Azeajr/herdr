@@ -77,7 +77,40 @@ impl App {
         ))
     }
 
+    /// The peer and local view id a worktree dialog opened from.
+    ///
+    /// Nothing about the repo is decided here, and that is deliberate. Whether
+    /// the peer's workspace is inside a work tree, and which repo, is a question
+    /// only the peer can answer: a peer no client is attached to never refreshes
+    /// its cached git space, so its enumeration says nothing about a workspace
+    /// no worktree action has touched yet. So the dialog opens, asks, and shows
+    /// the peer's own refusal if there is one — rather than withholding itself
+    /// on a local guess that is wrong exactly when the peer is headless.
+    fn peer_worktree_view(&self, ws_idx: usize) -> Result<(String, String), String> {
+        let Some(workspace) = self.state.workspaces.get(ws_idx) else {
+            return Err("Workspace not found.".into());
+        };
+        let Some(peer) = workspace.peer.clone() else {
+            return Err("Workspace not found.".into());
+        };
+        if workspace.peer_workspace.is_none() {
+            return Err(format!(
+                "This view does not name a workspace on '{peer}', so there is no repo to act in."
+            ));
+        }
+        Ok((peer, workspace.id.clone()))
+    }
+
     pub(crate) fn open_new_linked_worktree_dialog(&mut self, ws_idx: usize) {
+        if self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .is_some_and(|ws| ws.peer.is_some())
+        {
+            self.open_new_peer_worktree_dialog(ws_idx);
+            return;
+        }
         let (existing_membership, space, source_checkout_path, source_workspace_id) =
             match self.worktree_source_metadata(ws_idx) {
                 Ok(metadata) => metadata,
@@ -120,11 +153,70 @@ impl App {
             checkout_path,
             error: None,
             creating: false,
+            peer: None,
         });
         self.state.mode = Mode::NewLinkedWorktree;
     }
 
+    /// The new-worktree dialog for a view onto a peer.
+    ///
+    /// Same dialog, one field short and one field late. The checkout path is
+    /// left unset because this server's worktree directory names a path on the
+    /// wrong machine — the peer picks it, and the answer reports where it
+    /// landed. The repo name arrives from the peer, which is also what turns
+    /// "this workspace is not in a work tree" into a message in the dialog
+    /// rather than a menu that quietly refused to open.
+    fn open_new_peer_worktree_dialog(&mut self, ws_idx: usize) {
+        let (peer, source_workspace_id) = match self.peer_worktree_view(ws_idx) {
+            Ok(view) => view,
+            Err(err) => {
+                self.state.config_diagnostic = Some(err);
+                return;
+            }
+        };
+
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let branch = crate::worktree::generated_branch_slug(seed);
+
+        tracing::info!(
+            ws_idx,
+            peer,
+            branch,
+            "opening worktree dialog for a peer view"
+        );
+        self.state.selected = ws_idx;
+        self.state.name_input = branch.clone();
+        self.state.name_input_replace_on_type = true;
+        self.state.worktree_create = Some(WorktreeCreateState {
+            source_workspace_id: source_workspace_id.clone(),
+            source_checkout_path: std::path::PathBuf::new(),
+            source_existing_membership: None,
+            source_repo_root: std::path::PathBuf::new(),
+            repo_key: String::new(),
+            repo_name: String::new(),
+            branch,
+            checkout_path: std::path::PathBuf::new(),
+            error: None,
+            creating: false,
+            peer: Some(peer),
+        });
+        self.state.mode = Mode::NewLinkedWorktree;
+        self.ask_peer_for_worktrees(source_workspace_id);
+    }
+
     pub(crate) fn open_remove_linked_worktree_confirmation(&mut self, ws_idx: usize) {
+        if self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .is_some_and(|ws| ws.peer.is_some())
+        {
+            self.open_remove_peer_worktree_confirmation(ws_idx);
+            return;
+        }
         let Some(ws) = self.state.workspaces.get(ws_idx) else {
             return;
         };
@@ -147,11 +239,62 @@ impl App {
             error: None,
             removing: false,
             force_confirmation: false,
+            peer: None,
+        });
+        self.state.mode = Mode::ConfirmRemoveWorktree;
+    }
+
+    /// The delete-checkout confirmation for a view onto a peer's worktree.
+    ///
+    /// The one peer dialog that does read the enumeration, because it is the one
+    /// that can: a checkout only reaches this dialog through the menu's "Delete
+    /// worktree checkout...", which is offered only when the peer has already
+    /// reported the workspace as a linked checkout of its own. A confirmation
+    /// has to name the folder it is about to delete, and this is where that
+    /// name comes from.
+    fn open_remove_peer_worktree_confirmation(&mut self, ws_idx: usize) {
+        let (peer, workspace_id) = match self.peer_worktree_view(ws_idx) {
+            Ok(view) => view,
+            Err(err) => {
+                self.state.config_diagnostic = Some(err);
+                return;
+            }
+        };
+        let Some(space) = self.state.peer_view_worktree_space(ws_idx).cloned() else {
+            self.state.config_diagnostic = Some(format!(
+                "'{peer}' has not reported this workspace as a worktree checkout."
+            ));
+            return;
+        };
+        if !space.is_linked_worktree {
+            self.state.config_diagnostic = Some(format!(
+                "This workspace is not a Herdr-managed worktree checkout on '{peer}'."
+            ));
+            return;
+        }
+        self.state.selected = ws_idx;
+        self.state.worktree_remove = Some(WorktreeRemoveState {
+            workspace_id,
+            repo_root: std::path::PathBuf::from(&space.repo_root),
+            path: std::path::PathBuf::from(&space.checkout_path),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+            peer: Some(peer),
         });
         self.state.mode = Mode::ConfirmRemoveWorktree;
     }
 
     pub(crate) fn open_existing_worktree_dialog(&mut self, ws_idx: usize) {
+        if self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .is_some_and(|ws| ws.peer.is_some())
+        {
+            self.open_existing_peer_worktree_dialog(ws_idx);
+            return;
+        }
         let (existing_membership, space, source_checkout_path, source_workspace_id) =
             match self.worktree_source_metadata(ws_idx) {
                 Ok(metadata) => metadata,
@@ -229,8 +372,191 @@ impl App {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
         self.state.mode = Mode::OpenExistingWorktree;
+    }
+
+    /// The open-worktree dialog for a view onto a peer.
+    ///
+    /// `git worktree list` runs where the repo is, and that is another machine.
+    /// So the dialog opens empty and loading, and the peer's answer fills it in
+    /// — the alternative, blocking the event loop on a round trip, is the one
+    /// thing the peer paths never do.
+    fn open_existing_peer_worktree_dialog(&mut self, ws_idx: usize) {
+        let (peer, source_workspace_id) = match self.peer_worktree_view(ws_idx) {
+            Ok(view) => view,
+            Err(err) => {
+                self.state.config_diagnostic = Some(err);
+                return;
+            }
+        };
+
+        self.state.selected = ws_idx;
+        self.state.worktree_open = Some(WorktreeOpenState {
+            source_workspace_id: source_workspace_id.clone(),
+            source_existing_membership: None,
+            source_checkout_path: std::path::PathBuf::new(),
+            source_repo_root: std::path::PathBuf::new(),
+            repo_key: String::new(),
+            repo_name: String::new(),
+            entries: Vec::new(),
+            selected: 0,
+            query: String::new(),
+            search_focused: false,
+            error: None,
+            peer: Some(peer),
+            loading: true,
+        });
+        self.state.mode = Mode::OpenExistingWorktree;
+        self.ask_peer_for_worktrees(source_workspace_id);
+    }
+
+    /// Asks the peer behind a view for its worktrees, off the event loop.
+    ///
+    /// Shared by both peer dialogs: they need different halves of the same
+    /// answer — the list, and the source that says which repo it is — and asking
+    /// once for both keeps them from disagreeing about the repo they are in.
+    fn ask_peer_for_worktrees(&mut self, source_workspace_id: String) {
+        let respond_to = self.peer_worktree_list_reporter(source_workspace_id.clone());
+        let request = crate::api::schema::Request {
+            id: "tui.worktree.list".to_string(),
+            method: crate::api::schema::Method::WorktreeList(
+                crate::api::schema::WorktreeListParams {
+                    workspace_id: Some(source_workspace_id),
+                    cwd: None,
+                },
+            ),
+        };
+        self.handle_deferred_peer_workspace_api_request(request, respond_to);
+    }
+
+    /// A response channel that turns a peer's worktree list into an app event.
+    ///
+    /// The dialog waiting for it lives on the event loop, and the loop must not
+    /// wait on the peer — so a thread parks on the receiver and the answer comes
+    /// back the way every other peer completion does. The same shape
+    /// `peer_forward_reporter` uses, carrying a payload rather than only a
+    /// failure.
+    fn peer_worktree_list_reporter(&self, workspace_id: String) -> std::sync::mpsc::Sender<String> {
+        let (respond_to, response_rx) = std::sync::mpsc::channel::<String>();
+        let event_tx = self.event_tx.clone();
+        std::thread::Builder::new()
+            .name("herdr-peer-worktree-list".to_string())
+            .spawn(move || {
+                // Ends when the sender is dropped, which every path does: the
+                // deferred handler either answers directly or hands it to the
+                // worker that will.
+                let Ok(response) = response_rx.recv() else {
+                    return;
+                };
+                let _ = event_tx.blocking_send(crate::events::AppEvent::PeerWorktreeListFinished {
+                    workspace_id,
+                    result: parse_worktree_list_response(&response),
+                });
+            })
+            .ok();
+        respond_to
+    }
+
+    /// Fills whichever peer worktree dialog asked, once its peer has answered.
+    pub(crate) fn handle_peer_worktree_list_finished(
+        &mut self,
+        workspace_id: String,
+        result: Result<Box<crate::events::PeerWorktreeListing>, String>,
+    ) {
+        // A dialog can be closed or replaced while the peer answers, so the one
+        // that asked is re-identified rather than assumed.
+        let fills_create = self.state.worktree_create.as_ref().is_some_and(|create| {
+            create.peer.is_some() && create.source_workspace_id == workspace_id
+        });
+        if fills_create {
+            self.fill_peer_worktree_create_dialog(result);
+            return;
+        }
+        if self.state.worktree_open.as_ref().is_none_or(|open| {
+            open.peer.is_none() || open.source_workspace_id != workspace_id || !open.loading
+        }) {
+            return;
+        }
+
+        let entries = match result {
+            Ok(listing) => listing
+                .worktrees
+                .into_iter()
+                .filter(|worktree| !worktree.is_bare && !worktree.is_prunable)
+                .map(|worktree| WorktreeOpenEntry {
+                    // The peer's list already names any local view onto one of
+                    // its checkouts: the forwarded response restates
+                    // `open_workspace_id` in this server's ids precisely so this
+                    // does not have to guess from a path on another machine.
+                    already_open_ws_idx: worktree
+                        .open_workspace_id
+                        .as_ref()
+                        .and_then(|id| self.state.workspaces.iter().position(|ws| &ws.id == id)),
+                    path: std::path::PathBuf::from(worktree.path),
+                    branch: worktree.branch,
+                    is_linked_worktree: worktree.is_linked_worktree,
+                })
+                .collect::<Vec<_>>(),
+            Err(message) => {
+                if let Some(open) = &mut self.state.worktree_open {
+                    open.loading = false;
+                    open.error = Some(message);
+                }
+                self.render_dirty.request_generic();
+                self.render_notify.notify_one();
+                return;
+            }
+        };
+
+        let peer_label = self
+            .state
+            .worktree_open
+            .as_ref()
+            .and_then(|open| open.peer.clone())
+            .unwrap_or_default();
+        if let Some(open) = &mut self.state.worktree_open {
+            open.loading = false;
+            if entries.is_empty() {
+                open.error = Some(format!(
+                    "No Git worktrees found for this repo on '{peer_label}'."
+                ));
+            } else {
+                open.entries = entries;
+                open.normalize_selection();
+            }
+        }
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
+    }
+
+    /// Names the repo in the new-worktree dialog, or says why there is none.
+    ///
+    /// The refusal half is the important one. The menu offers "New worktree" on
+    /// any peer view, because nothing local can tell whether the peer's
+    /// workspace is inside a work tree; this is where the peer's own answer to
+    /// that arrives, and a `not_git_worktree` or a linked-checkout source shows
+    /// up as an error in the dialog rather than as a create that fails on Enter.
+    fn fill_peer_worktree_create_dialog(
+        &mut self,
+        result: Result<Box<crate::events::PeerWorktreeListing>, String>,
+    ) {
+        if let Some(create) = &mut self.state.worktree_create {
+            match result {
+                Ok(listing) => {
+                    create.repo_key = listing.source.repo_key;
+                    create.repo_name = listing.source.repo_name;
+                    create.source_repo_root = std::path::PathBuf::from(listing.source.repo_root);
+                    create.source_checkout_path =
+                        std::path::PathBuf::from(listing.source.source_checkout_path);
+                }
+                Err(message) => create.error = Some(message),
+            }
+        }
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
     }
 
     pub(crate) fn handle_worktree_create_key(&mut self, key: KeyEvent) {
@@ -425,6 +751,8 @@ impl App {
                     query: String::new(),
                     search_focused: false,
                     error: Some(format!("failed to open worktree: {err}")),
+                    peer: None,
+                    loading: false,
                 });
                 self.state.mode = Mode::OpenExistingWorktree;
             }
@@ -492,12 +820,94 @@ impl App {
             return;
         };
         create.branch = self.state.name_input.clone();
-        create.checkout_path = crate::worktree::default_checkout_path(
-            &self.state.worktree_directory,
-            &create.repo_name,
-            &create.branch,
-        );
+        // A peer's checkout path is the peer's to choose. Deriving one from this
+        // server's worktree directory would show the user a path on the wrong
+        // machine, and sending it would create the checkout somewhere the peer
+        // never puts them.
+        if create.peer.is_none() {
+            create.checkout_path = crate::worktree::default_checkout_path(
+                &self.state.worktree_directory,
+                &create.repo_name,
+                &create.branch,
+            );
+        }
         create.error = None;
+    }
+
+    /// Clears the new-worktree dialog once its peer has made the checkout.
+    ///
+    /// Only a peer create is cleared here. A local one is matched on its
+    /// checkout path when `git worktree add` finishes, which a peer create never
+    /// has: the path is chosen on the other machine and is not known until the
+    /// answer arrives.
+    pub(crate) fn clear_worktree_create_dialog(&mut self) {
+        if self
+            .state
+            .worktree_create
+            .as_ref()
+            .is_none_or(|create| create.peer.is_none())
+        {
+            return;
+        }
+        self.close_worktree_create_dialog();
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
+    }
+
+    /// Reports a peer's refusal of a create in the dialog that asked for it.
+    pub(crate) fn report_peer_worktree_create_failed(&mut self, message: &str) {
+        let Some(create) = &mut self.state.worktree_create else {
+            return;
+        };
+        if create.peer.is_none() || !create.creating {
+            return;
+        }
+        create.creating = false;
+        create.error = Some(message.to_string());
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
+    }
+
+    /// Clears the delete-checkout confirmation once its peer has removed it.
+    pub(crate) fn clear_worktree_remove_dialog(&mut self) {
+        if self
+            .state
+            .worktree_remove
+            .as_ref()
+            .is_none_or(|remove| remove.peer.is_none())
+        {
+            return;
+        }
+        self.state.worktree_remove = None;
+        self.state.mode = if self.state.active.is_some() {
+            Mode::Terminal
+        } else {
+            Mode::Navigate
+        };
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
+    }
+
+    /// Reports a peer's refusal of a removal in the dialog that asked for it.
+    ///
+    /// A dirty checkout takes the same second-press-to-force path a local one
+    /// does; the peer is what decided it is dirty, since the files are there.
+    pub(crate) fn report_peer_worktree_remove_failed(&mut self, message: &str) {
+        let Some(remove) = &mut self.state.worktree_remove else {
+            return;
+        };
+        if remove.peer.is_none() || !remove.removing {
+            return;
+        }
+        remove.removing = false;
+        if !remove.force_confirmation && crate::worktree::is_dirty_worktree_remove_error(message) {
+            remove.force_confirmation = true;
+            remove.error = None;
+        } else {
+            remove.error = Some(message.to_string());
+        }
+        self.render_dirty.request_generic();
+        self.render_notify.notify_one();
     }
 
     #[cfg(test)]
@@ -579,15 +989,20 @@ impl App {
 
         create.branch = branch.clone();
         self.state.name_input = branch.clone();
-        create.checkout_path = crate::worktree::default_checkout_path(
-            &self.state.worktree_directory,
-            &create.repo_name,
-            &branch,
-        );
+        let on_peer = create.peer.is_some();
+        if !on_peer {
+            create.checkout_path = crate::worktree::default_checkout_path(
+                &self.state.worktree_directory,
+                &create.repo_name,
+                &branch,
+            );
+        }
         create.creating = true;
         create.error = None;
         let workspace_id = create.source_workspace_id.clone();
-        let checkout_path = create.checkout_path.display().to_string();
+        // No path for a peer: it names its own worktree directory, and this
+        // server's would be a path on the wrong machine.
+        let path = (!on_peer).then(|| create.checkout_path.display().to_string());
 
         let immediate_response = self.runtime_worktree_create_deferred(
             "tui.worktree.create",
@@ -595,7 +1010,7 @@ impl App {
                 workspace_id: Some(workspace_id),
                 cwd: None,
                 branch: Some(branch),
-                path: Some(checkout_path),
+                path,
                 base: Some("HEAD".into()),
                 focus: true,
                 label: None,
@@ -719,7 +1134,7 @@ impl App {
         };
         let source_workspace_id = open.source_workspace_id.clone();
 
-        let response = self.runtime_worktree_open(
+        let outcome = self.runtime_worktree_open(
             "tui.worktree.open",
             crate::api::schema::WorktreeOpenParams {
                 workspace_id: Some(source_workspace_id),
@@ -730,11 +1145,20 @@ impl App {
                 label: None,
             },
         );
-        if serde_json::from_str::<crate::api::schema::SuccessResponse>(&response).is_ok() {
+        // A peer open is accepted, not answered: the view lands seconds later,
+        // so there is nothing to read here. The dialog closes on the request
+        // being accepted, and a refusal reaches the user as the peer-forward
+        // toast every other deferred UI action uses.
+        let Some(response) = outcome.answered() else {
+            self.state.worktree_open = None;
+            self.state.mode = Mode::Terminal;
+            return;
+        };
+        if serde_json::from_str::<crate::api::schema::SuccessResponse>(response).is_ok() {
             self.state.worktree_open = None;
             self.state.mode = Mode::Terminal;
         } else if let Ok(error) =
-            serde_json::from_str::<crate::api::schema::ErrorResponse>(&response)
+            serde_json::from_str::<crate::api::schema::ErrorResponse>(response)
         {
             if let Some(open) = &mut self.state.worktree_open {
                 open.error = Some(error.error.message);
@@ -749,8 +1173,12 @@ impl App {
         if remove.removing {
             return;
         }
+        // A peer's checkout cannot be stat'd from here, so the dirty check is
+        // the peer's: it refuses, and the refusal turns into the same
+        // press-again-to-force confirmation.
         #[cfg(windows)]
-        if !remove.force_confirmation
+        if remove.peer.is_none()
+            && !remove.force_confirmation
             && crate::worktree::checkout_has_dirty_files(&remove.path).unwrap_or(false)
         {
             remove.force_confirmation = true;
@@ -1007,6 +1435,30 @@ impl App {
     }
 }
 
+/// Reads a forwarded `worktree.list` answer, or why there is no list.
+///
+/// The forward already restated the ids in this server's terms, so nothing here
+/// has to know a peer was involved.
+fn parse_worktree_list_response(
+    response: &str,
+) -> Result<Box<crate::events::PeerWorktreeListing>, String> {
+    if let Ok(success) = serde_json::from_str::<crate::api::schema::SuccessResponse>(response) {
+        return match success.result {
+            crate::api::schema::ResponseResult::WorktreeList { source, worktrees } => {
+                Ok(Box::new(crate::events::PeerWorktreeListing {
+                    source,
+                    worktrees,
+                }))
+            }
+            _ => Err("the peer answered with an unexpected result".to_string()),
+        };
+    }
+    if let Ok(error) = serde_json::from_str::<crate::api::schema::ErrorResponse>(response) {
+        return Err(error.error.message);
+    }
+    Err("the peer did not answer the worktree list".to_string())
+}
+
 fn immediate_api_error_message(response: Option<&str>) -> Option<String> {
     response
         .and_then(|response| {
@@ -1148,6 +1600,7 @@ mod tests {
             checkout_path: "/repo/herdr-generated-branch".into(),
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.insert_worktree_create_text("feature/linear-302");
@@ -1191,6 +1644,8 @@ mod tests {
             query: String::new(),
             search_focused: true,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.insert_worktree_open_search_text("linear-302");
@@ -1215,6 +1670,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.insert_worktree_open_search_text("linear-302");
@@ -1255,6 +1712,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.open_selected_existing_worktree();
@@ -1305,6 +1764,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.open_selected_existing_worktree();
@@ -1351,6 +1812,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.open_selected_existing_worktree();
@@ -1416,6 +1879,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.handle_worktree_open_key(crossterm::event::KeyEvent::new(
@@ -1536,6 +2001,7 @@ mod tests {
             checkout_path: std::path::PathBuf::from("/old"),
             error: Some("old error".into()),
             creating: false,
+            peer: None,
         });
 
         app.sync_worktree_branch_from_input();
@@ -1581,6 +2047,7 @@ mod tests {
             checkout_path,
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.handle_worktree_create_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
@@ -1640,6 +2107,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         });
 
         app.handle_worktree_open_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
@@ -1732,6 +2201,7 @@ mod tests {
             checkout_path: checkout.clone(),
             error: None,
             creating: true,
+            peer: None,
         });
         let plugin_root = unique_temp_path("app-worktree-create-plugin");
         std::fs::create_dir_all(&plugin_root).unwrap();
@@ -1857,6 +2327,7 @@ mod tests {
             checkout_path: checkout.clone(),
             error: None,
             creating: true,
+            peer: None,
         });
 
         app.handle_worktree_add_finished(WorktreeAddResult {
@@ -1905,6 +2376,7 @@ mod tests {
             checkout_path: checkout.clone(),
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.start_worktree_add();
@@ -1952,6 +2424,7 @@ mod tests {
             checkout_path: checkout.clone(),
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.start_worktree_add();
@@ -2077,6 +2550,7 @@ mod tests {
             checkout_path: checkout.clone(),
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.start_worktree_add();
@@ -2112,6 +2586,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            peer: None,
         });
 
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
@@ -2144,6 +2619,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            peer: None,
         });
 
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
@@ -2206,6 +2682,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: false,
+            peer: None,
         });
 
         app.handle_worktree_remove_finished(WorktreeRemoveResult {
@@ -2258,6 +2735,7 @@ mod tests {
             error: None,
             removing: true,
             force_confirmation: true,
+            peer: None,
         });
         app.state.workspaces.clear();
 

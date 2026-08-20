@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde_json::Value;
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid, scrub_inherited_herdr_env,
     unregister_spawned_herdr_pid,
 };
 
@@ -106,6 +106,11 @@ fn spawn_server(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -150,6 +155,11 @@ fn spawn_herdr_auto(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     // No subcommand, no --no-session → auto-detect launch
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -193,6 +203,11 @@ fn spawn_herdr_no_session(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("--no-session");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -619,6 +634,11 @@ fn auto_detect_default_socket_path_from_config_dir() {
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);

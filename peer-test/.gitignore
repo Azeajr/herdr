@@ -1,0 +1,8 @@
+# uv's environment for the scenario suite; rebuilt from pyproject.toml + uv.lock.
+.venv/
+.pytest_cache/
+
+# A failing scenario freezes an evidence bundle here, so a normal red run would
+# otherwise fill `git status` with debugging artifacts. Bundles already committed stay
+# tracked; `git add -f` a new one that is worth keeping.
+evidence/

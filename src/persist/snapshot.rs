@@ -26,6 +26,36 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Peers hidden from the sidebar for the session. Session-scoped, so it
+    /// rides the snapshot rather than the config file.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub hidden_peers: std::collections::HashSet<String>,
+    /// Configured peer servers. Only how to reach a peer is stored; connection
+    /// state and enumerated workspaces are rebuilt by reconnecting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerSnapshot>,
+}
+
+/// A configured peer, as persisted.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PeerSnapshot {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub target: PeerTargetSnapshot,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PeerTargetSnapshot {
+    SocketPath {
+        path: PathBuf,
+    },
+    Ssh {
+        destination: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,6 +137,13 @@ pub struct PaneSnapshot {
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// Instance id of the server that had this pane created here.
+    ///
+    /// Persisted so a restart does not turn every pane another server asked for
+    /// into an anonymous one; without it this server loses the ability to say
+    /// which panes are running for a machine that never came back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +221,10 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    hidden_peers: std::collections::HashSet<String>,
+    #[serde(default)]
+    peers: Vec<PeerSnapshot>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -199,6 +240,8 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        hidden_peers: raw.hidden_peers,
+        peers: raw.peers,
     })
 }
 
@@ -261,18 +304,35 @@ pub fn capture(
     sidebar_width: u16,
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
+    hidden_peers: std::collections::HashSet<String>,
+    peers: Vec<PeerSnapshot>,
 ) -> SessionSnapshot {
+    // Peer-backed workspaces are views onto another server's terminals. They
+    // cannot be restored without that peer, and restoring one as a local
+    // workspace would silently spawn a local shell in its place, so they are
+    // left out entirely.
+    //
+    // Dropping entries renumbers what is left, so `active` and `selected` are
+    // remapped onto the retained workspaces rather than carried across as raw
+    // indexes into a list that no longer exists.
+    let retained = retained_workspace_indices(workspaces);
+    let remap = |index: usize| retained.iter().position(|kept| *kept == index);
+
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
-        workspaces: workspaces
+        workspaces: retained
             .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+            .map(|index| capture_workspace(&workspaces[*index], terminals, terminal_runtimes))
             .collect(),
-        active,
-        selected,
+        active: active.and_then(remap),
+        // A selection landing on a dropped workspace falls back to the first
+        // retained one rather than pointing past the end of the list.
+        selected: remap(selected).unwrap_or(0),
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
         collapsed_space_keys,
+        hidden_peers,
+        peers,
     }
 }
 
@@ -368,6 +428,7 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 launch_argv,
+                owner_instance_id: terminal.and_then(|terminal| terminal.owner_instance_id.clone()),
             },
         );
     }
@@ -381,23 +442,78 @@ fn capture_tab(
     }
 }
 
+/// Which workspaces a snapshot describes, in snapshot order.
+///
+/// The single retention rule, shared by [`capture`] and [`capture_history`].
+/// The two snapshots are zipped *positionally* on restore — `restore` reads
+/// `history.workspaces[idx]` where `idx` indexes the session snapshot — so a
+/// rule applied to one and not the other shifts every workspace after the first
+/// dropped one and silently restores it with somebody else's scrollback, or
+/// none.
+fn retained_workspace_indices(workspaces: &[Workspace]) -> Vec<usize> {
+    workspaces
+        .iter()
+        .enumerate()
+        .filter_map(|(index, workspace)| workspace.peer.is_none().then_some(index))
+        .collect()
+}
+
 /// Capture pane screen history separately from the structural session snapshot.
+///
+/// Describes exactly the workspaces [`capture`] kept, in the same order.
+/// A session's history, named but not yet read.
+///
+/// Which panes to record, and where each sits, is decided on the server loop
+/// alongside the structural snapshot, so the two describe the same moment. The
+/// bytes are fetched afterwards, on the save thread, because materializing
+/// every retained line takes milliseconds per populated pane and the loop is
+/// also drawing frames and handling input.
+pub struct SessionHistoryCapture {
+    workspaces: Vec<Vec<Vec<(u32, crate::pane::PaneHistorySource)>>>,
+}
+
+impl SessionHistoryCapture {
+    /// Reads every pane's history. Call this off the server loop.
+    pub fn resolve(self) -> SessionHistorySnapshot {
+        SessionHistorySnapshot {
+            version: SNAPSHOT_VERSION,
+            workspaces: self
+                .workspaces
+                .into_iter()
+                .map(|tabs| WorkspaceHistorySnapshot {
+                    tabs: tabs
+                        .into_iter()
+                        .map(|panes| TabHistorySnapshot {
+                            panes: panes
+                                .into_iter()
+                                .filter_map(|(id, source)| {
+                                    let ansi = source()?;
+                                    let lines = ansi.lines().count();
+                                    Some((id, PaneHistorySnapshot { ansi, lines }))
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Names every pane whose history should be saved, without reading any of it.
 pub fn capture_history(
     workspaces: &[Workspace],
     terminal_runtimes: &TerminalRuntimeRegistry,
-) -> SessionHistorySnapshot {
-    SessionHistorySnapshot {
-        version: SNAPSHOT_VERSION,
-        workspaces: workspaces
-            .iter()
-            .map(|workspace| WorkspaceHistorySnapshot {
-                tabs: workspace
+) -> SessionHistoryCapture {
+    SessionHistoryCapture {
+        workspaces: retained_workspace_indices(workspaces)
+            .into_iter()
+            .map(|index| {
+                workspaces[index]
                     .tabs
                     .iter()
-                    .map(|tab| TabHistorySnapshot {
-                        panes: capture_tab_history(tab, terminal_runtimes),
-                    })
-                    .collect(),
+                    .map(|tab| capture_tab_history(tab, terminal_runtimes))
+                    .collect()
             })
             .collect(),
     }
@@ -406,25 +522,17 @@ pub fn capture_history(
 fn capture_tab_history(
     tab: &crate::workspace::Tab,
     terminal_runtimes: &TerminalRuntimeRegistry,
-) -> HashMap<u32, PaneHistorySnapshot> {
-    let mut panes = HashMap::new();
+) -> Vec<(u32, crate::pane::PaneHistorySource)> {
+    let mut panes = Vec::new();
     for (id, pane) in &tab.panes {
-        if let Some(history) = capture_pane_history(Some(pane), terminal_runtimes) {
-            panes.insert(id.raw(), history);
+        if let Some(source) = terminal_runtimes
+            .get(&pane.attached_terminal_id)
+            .and_then(crate::terminal::TerminalRuntime::history_source)
+        {
+            panes.push((id.raw(), source));
         }
     }
     panes
-}
-
-fn capture_pane_history(
-    pane: Option<&crate::pane::PaneState>,
-    terminal_runtimes: &TerminalRuntimeRegistry,
-) -> Option<PaneHistorySnapshot> {
-    let ansi = terminal_runtimes
-        .get(&pane?.attached_terminal_id)?
-        .snapshot_history()?;
-    let lines = ansi.lines().count();
-    Some(PaneHistorySnapshot { ansi, lines })
 }
 
 pub(super) fn capture_node(node: &Node) -> LayoutSnapshot {
@@ -541,6 +649,8 @@ mod tests {
             state.sidebar_width,
             state.sidebar_section_split,
             state.collapsed_space_keys.clone(),
+            state.hidden_peers.clone(),
+            crate::persist::peer_snapshots(&state.peers),
         )
     }
 
@@ -548,7 +658,10 @@ mod tests {
         state: &AppState,
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> SessionHistorySnapshot {
-        capture_history(&state.workspaces, terminal_runtimes)
+        // Resolving here is what the save thread does. The positions come from
+        // the loop-side capture, so the pairing the callers assert is still the
+        // one being tested.
+        capture_history(&state.workspaces, terminal_runtimes).resolve()
     }
 
     fn root_split_ratio(tab: &TabSnapshot) -> Option<f32> {
@@ -605,6 +718,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            hidden_peers: std::collections::HashSet::new(),
+            peers: Vec::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -648,6 +763,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                owner_instance_id: None,
             },
         );
         panes.insert(
@@ -659,6 +775,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                owner_instance_id: None,
             },
         );
 
@@ -692,6 +809,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            hidden_peers: std::collections::HashSet::new(),
+            peers: Vec::new(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -1207,6 +1326,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                owner_instance_id: None,
             },
         );
         panes.insert(
@@ -1220,6 +1340,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                owner_instance_id: None,
             },
         );
 
@@ -1254,6 +1375,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            hidden_peers: std::collections::HashSet::new(),
+            peers: Vec::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();
@@ -1262,6 +1385,216 @@ mod tests {
         assert_eq!(
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
+        );
+    }
+    #[test]
+    fn peer_snapshots_store_reach_but_not_live_state() {
+        let mut peers = crate::app::peers::PeerRegistryState::default();
+        let alpha = crate::app::peers::PeerHandle::new("alpha");
+        peers
+            .add(
+                alpha.clone(),
+                crate::app::peers::PeerTarget::SocketPath("/tmp/a.sock".into()),
+            )
+            .expect("add");
+        peers
+            .add(
+                crate::app::peers::PeerHandle::new("beta"),
+                crate::app::peers::PeerTarget::Ssh {
+                    destination: "user@host".into(),
+                    session: Some("work".into()),
+                },
+            )
+            .expect("add");
+        peers.set_identity(
+            &alpha,
+            crate::app::peers::PeerIdentity {
+                instance_id: "0123456789abcdef0123456789abcdef".into(),
+                version: Some("0.7.5".into()),
+                protocol: Some(20),
+            },
+        );
+        peers.set_connection(&alpha, crate::app::peers::PeerConnectionState::Connected);
+
+        let snapshots = crate::persist::peer_snapshots(&peers);
+        assert_eq!(snapshots.len(), 2);
+        // A label matching the target default is not worth storing.
+        assert_eq!(snapshots[0].label, None);
+
+        let restored = crate::persist::restore_peers(&snapshots);
+        let restored_alpha = restored.get(&alpha).expect("alpha restored");
+        assert_eq!(
+            restored_alpha.target,
+            crate::app::peers::PeerTarget::SocketPath("/tmp/a.sock".into())
+        );
+        // Live state is deliberately not restored: it describes a connection
+        // that no longer exists.
+        assert_eq!(
+            restored_alpha.connection,
+            crate::app::peers::PeerConnectionState::Connecting
+        );
+        assert!(restored_alpha.identity.is_none());
+        assert!(restored_alpha.workspaces.is_empty());
+
+        let beta = restored
+            .get(&crate::app::peers::PeerHandle::new("beta"))
+            .expect("beta restored");
+        assert_eq!(
+            beta.target,
+            crate::app::peers::PeerTarget::Ssh {
+                destination: "user@host".into(),
+                session: Some("work".into()),
+            }
+        );
+        restored.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn restore_peers_drops_hand_edited_duplicates() {
+        let snapshots = vec![
+            crate::persist::PeerSnapshot {
+                name: "alpha".into(),
+                label: Some("first".into()),
+                target: crate::persist::PeerTargetSnapshot::SocketPath {
+                    path: "/tmp/a.sock".into(),
+                },
+            },
+            crate::persist::PeerSnapshot {
+                name: "alpha".into(),
+                label: Some("second".into()),
+                target: crate::persist::PeerTargetSnapshot::SocketPath {
+                    path: "/tmp/b.sock".into(),
+                },
+            },
+        ];
+
+        let restored = crate::persist::restore_peers(&snapshots);
+        assert_eq!(restored.iter().count(), 1);
+        assert_eq!(
+            restored
+                .get(&crate::app::peers::PeerHandle::new("alpha"))
+                .expect("alpha")
+                .label,
+            "first"
+        );
+        restored.assert_invariants_for_test();
+    }
+    #[tokio::test]
+    async fn peer_backed_workspaces_are_not_captured() {
+        let mut state = AppState::test_new();
+        let runtimes = TerminalRuntimeRegistry::new();
+        state.workspaces.push(Workspace::test_new("local-a"));
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (events, _events_rx) = tokio::sync::mpsc::channel(64);
+        let (remote, _terminal, _runtime) = Workspace::new_attached(
+            std::path::PathBuf::from("/"),
+            "beta".to_string(),
+            Some("w1".to_string()),
+            Some("beta:w1:p1".to_string()),
+            runtime,
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        );
+        state.workspaces.push(remote);
+        state.workspaces.push(Workspace::test_new("local-b"));
+
+        // Focus and selection both sit on workspaces after the dropped one.
+        state.active = Some(2);
+        state.selected = 2;
+
+        let snapshot = capture_from_state_with_runtimes(&state, &runtimes);
+
+        assert_eq!(
+            snapshot.workspaces.len(),
+            2,
+            "a peer-backed workspace must not reach the snapshot"
+        );
+        // Index 2 of three becomes index 1 of two once the peer view is dropped.
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.selected, 1);
+    }
+
+    /// The regression this guards: `capture` learned to drop peer-backed
+    /// workspaces and `capture_history` did not. Restore zips the two lists
+    /// positionally, so from the first peer view onward every local workspace
+    /// read somebody else's history entry — and peer views carry none, so each
+    /// one silently came back with no scrollback at all.
+    #[tokio::test]
+    async fn history_describes_exactly_the_workspaces_the_snapshot_captured() {
+        let mut state = AppState::test_new();
+        let runtimes = TerminalRuntimeRegistry::new();
+        state.workspaces.push(Workspace::test_new("local-a"));
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (events, _events_rx) = tokio::sync::mpsc::channel(64);
+        let (remote, _terminal, _runtime) = Workspace::new_attached(
+            std::path::PathBuf::from("/"),
+            "beta".to_string(),
+            Some("w1".to_string()),
+            Some("beta:w1:p1".to_string()),
+            runtime,
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        );
+        state.workspaces.push(remote);
+        state.workspaces.push(Workspace::test_new("local-b"));
+
+        let snapshot = capture_from_state_with_runtimes(&state, &runtimes);
+        let history = capture_history_from_state_with_runtimes(&state, &runtimes);
+
+        assert_eq!(
+            history.workspaces.len(),
+            snapshot.workspaces.len(),
+            "history must describe the same workspace list the snapshot captured"
+        );
+        // The pairing is positional, so equal lengths is necessary but not
+        // sufficient: the shapes have to line up entry for entry too.
+        for (index, (workspace, workspace_history)) in snapshot
+            .workspaces
+            .iter()
+            .zip(&history.workspaces)
+            .enumerate()
+        {
+            assert_eq!(
+                workspace.tabs.len(),
+                workspace_history.tabs.len(),
+                "workspace {index} pairs with a history entry describing a different workspace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn focus_on_a_peer_workspace_does_not_survive_capture() {
+        let mut state = AppState::test_new();
+        let runtimes = TerminalRuntimeRegistry::new();
+        state.workspaces.push(Workspace::test_new("local-a"));
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let (events, _events_rx) = tokio::sync::mpsc::channel(64);
+        let (remote, _terminal, _runtime) = Workspace::new_attached(
+            std::path::PathBuf::from("/"),
+            "beta".to_string(),
+            Some("w1".to_string()),
+            None,
+            runtime,
+            events,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(crate::render_signal::RenderSignal::new()),
+        );
+        state.workspaces.push(remote);
+        state.active = Some(1);
+        state.selected = 1;
+
+        let snapshot = capture_from_state_with_runtimes(&state, &runtimes);
+
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(
+            snapshot.active, None,
+            "focus must not point at a dropped workspace"
+        );
+        assert_eq!(
+            snapshot.selected, 0,
+            "selection falls back to a real workspace"
         );
     }
 }

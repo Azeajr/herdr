@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,16 +18,18 @@ use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_ou
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
-    poll_local_stream_read, remove_socket_file_if_owned, set_local_stream_polling,
-    socket_file_identity, LocalStream, LocalStreamRead, SocketFileIdentity,
+    poll_local_stream_read_count, remove_socket_file_if_owned, set_local_stream_polling,
+    socket_file_identity, LocalStream, LocalStreamReadCount, SocketFileIdentity,
 };
 
 mod pane_graphics_stream;
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INITIAL_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const OVERLOAD_REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
 const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 
@@ -79,6 +81,48 @@ fn default_capabilities() -> Option<ServerCapabilities> {
     })
 }
 
+/// Read size for the initial request line.
+///
+/// This was one byte per read call, so an ordinary multi-kilobyte request cost
+/// thousands of polls and a maximum-sized one roughly a million. Requests are
+/// a single line, so one chunk covers almost all of them outright.
+const INITIAL_REQUEST_READ_CHUNK: usize = 8 * 1024;
+
+/// How many API connections may be open at once.
+///
+/// Each one costs an OS thread and its stack from the moment it is accepted,
+/// before it has sent anything, so connections that never speak are what this
+/// bounds. The limit is far above any real workload — automation runs a handful
+/// of concurrent calls, and the TUI holds one — and low enough that a process
+/// opening sockets in a loop cannot exhaust the server's threads.
+const MAX_CONCURRENT_API_CONNECTIONS: usize = 128;
+
+/// Holds one connection slot for as long as its thread runs.
+///
+/// A guard rather than a decrement at the end of the thread body, so a
+/// connection that panics still gives its slot back instead of narrowing the
+/// server permanently.
+struct ApiConnectionSlot {
+    live: Arc<AtomicUsize>,
+}
+
+impl ApiConnectionSlot {
+    fn claim(live: Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::AcqRel);
+        Self { live }
+    }
+}
+
+impl Drop for ApiConnectionSlot {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn api_connection_slot_available(live: usize) -> bool {
+    live < MAX_CONCURRENT_API_CONNECTIONS
+}
+
 fn start_server_inner(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
@@ -91,31 +135,66 @@ fn start_server_inner(
     let listener = bind_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
-    info!(path = %path.display(), "api server listening");
+    // Establish the instance id up front so the first ping does not pay for it
+    // and so a failure to persist it is reported once, at startup.
+    let instance_id = crate::instance_id::active();
+    info!(
+        path = %path.display(),
+        instance_id = instance_id.as_deref().unwrap_or("unavailable"),
+        "api server listening"
+    );
 
     let running = Arc::new(AtomicBool::new(true));
     let listener_running = Arc::clone(&running);
+    let live_connections = Arc::new(AtomicUsize::new(0));
     let thread = std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(stream) => {
+                Ok(mut stream) => {
+                    // Admission happens here because every accepted connection
+                    // costs an OS thread and a stack whether or not it ever
+                    // sends a request. Connections that only sit there are the
+                    // cheap half of the attack.
+                    let live = live_connections.load(Ordering::Acquire);
+                    if !api_connection_slot_available(live) {
+                        warn!(
+                            live,
+                            limit = MAX_CONCURRENT_API_CONNECTIONS,
+                            "refusing api connection; too many already open"
+                        );
+                        refuse_overloaded_connection(&mut stream, live);
+                        continue;
+                    }
+
                     let api_tx = api_tx.clone();
                     let event_hub = event_hub.clone();
                     let capabilities = capabilities.clone();
                     let server_stop = server_stop.clone();
                     let connection_running = Arc::clone(&listener_running);
-                    std::thread::spawn(move || {
-                        if let Err(err) = handle_connection_with_stop(
-                            stream,
-                            &api_tx,
-                            &event_hub,
-                            &connection_running,
-                            capabilities,
-                            server_stop.as_ref(),
-                        ) {
-                            warn!(err = %err, "api connection failed");
-                        }
-                    });
+                    // Counted before the spawn and released by the guard, so a
+                    // spawn that fails does not leak a slot.
+                    let slot = ApiConnectionSlot::claim(Arc::clone(&live_connections));
+                    let spawned = std::thread::Builder::new()
+                        .name("herdr-api-conn".to_string())
+                        .spawn(move || {
+                            let _slot = slot;
+                            if let Err(err) = handle_connection_with_stop(
+                                stream,
+                                &api_tx,
+                                &event_hub,
+                                &connection_running,
+                                capabilities,
+                                server_stop.as_ref(),
+                            ) {
+                                warn!(err = %err, "api connection failed");
+                            }
+                        });
+                    // An unchecked spawn here used to propagate its panic and
+                    // take the listener with it, which loses the API for the
+                    // rest of the session over one transient failure.
+                    if let Err(err) = spawned {
+                        warn!(err = %err, "could not spawn api connection thread");
+                    }
                 }
                 Err(err) => {
                     error!(err = %err, "api listener accept failed");
@@ -132,6 +211,28 @@ fn start_server_inner(
         identity,
         running,
     })
+}
+
+/// Writes an overload response, then consumes the request the client may still
+/// be sending before the accepted socket is closed.
+///
+/// Closing with unread request bytes can reset a Unix socket and turn the
+/// explicit response into `Broken pipe` at the client. The drain is tightly
+/// bounded because it runs on the listener thread; ordinary API clients have
+/// already sent their one request line by the time admission is decided.
+fn refuse_overloaded_connection(stream: &mut LocalStream, live: usize) {
+    let _ = write_text_line_allow_disconnect(
+        stream,
+        &error_response_json(
+            String::new(),
+            "server_overloaded",
+            format!(
+                "too many concurrent api connections ({live} of \
+                 {MAX_CONCURRENT_API_CONNECTIONS}); retry shortly"
+            ),
+        ),
+    );
+    let _ = read_initial_request_line_with_timeout(stream, OVERLOAD_REQUEST_DRAIN_TIMEOUT);
 }
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
@@ -179,8 +280,8 @@ fn handle_connection_with_stop(
         return Ok(());
     }
 
-    let request = match serde_json::from_str::<Request>(line) {
-        Ok(request) => request,
+    let envelope = match serde_json::from_str::<crate::api::schema::RequestEnvelope>(line) {
+        Ok(envelope) => envelope,
         Err(request_error) => {
             write_json_line_allow_disconnect(
                 &mut stream,
@@ -195,6 +296,27 @@ fn handle_connection_with_stop(
             return Ok(());
         }
     };
+
+    let crate::api::schema::RequestEnvelope {
+        request,
+        if_instance_id,
+    } = envelope;
+    if let Some(expected) = if_instance_id {
+        let active = crate::instance_id::active();
+        if active.as_deref() != Some(expected.as_str()) {
+            write_json_line_allow_disconnect(
+                &mut stream,
+                &ErrorResponse {
+                    id: request.id,
+                    error: ErrorBody {
+                        code: "server_replaced".into(),
+                        message: "the request targeted a different server instance".into(),
+                    },
+                },
+            )?;
+            return Ok(());
+        }
+    }
 
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
@@ -351,6 +473,7 @@ fn handle_request(
                 version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
+                instance_id: crate::instance_id::active(),
             },
         })
         .unwrap_or_else(|_| {
@@ -393,6 +516,13 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
+        Method::PeerAdd(_) => "peer.add",
+        Method::PeerRemove(_) => "peer.remove",
+        Method::PeerList(_) => "peer.list",
+        Method::PeerTerminalOpen(_) => "peer.terminal.open",
+        Method::PeerTerminalClose(_) => "peer.terminal.close",
+        Method::PeerWorkspaceOpen(_) => "peer.workspace.open",
+        Method::PeerWorkspaceCreate(_) => "peer.workspace.create",
         Method::WorkspaceGet(_) => "workspace.get",
         Method::WorkspaceFocus(_) => "workspace.focus",
         Method::WorkspaceRename(_) => "workspace.rename",
@@ -446,6 +576,8 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneRead(_) => "pane.read",
+        Method::PaneReadRange(_) => "pane.read_range",
+        Method::PaneTextQuery(_) => "pane.text_query",
         Method::PaneGraphicsSet(_) => "pane.graphics.set",
         Method::PaneGraphicsClear(_) => "pane.graphics.clear",
         Method::PaneGraphicsInfo(_) => "pane.graphics.info",
@@ -515,42 +647,68 @@ fn read_initial_request_line_with_limits(
     set_local_stream_polling(stream, true)?;
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut chunk = [0u8; INITIAL_REQUEST_READ_CHUNK];
+    let mut poll_interval = INITIAL_REQUEST_POLL_INTERVAL;
 
     let result = loop {
-        let read = match poll_local_stream_read(stream, &mut byte) {
+        let read = match poll_local_stream_read_count(stream, &mut chunk) {
             Ok(read) => read,
             Err(err) => break Err(err),
         };
         match read {
-            LocalStreamRead::Closed => break Ok(None),
-            LocalStreamRead::Data => {
-                bytes.push(byte[0]);
-                if byte[0] == b'\n' {
-                    break String::from_utf8(bytes)
-                        .map(Some)
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
-                }
-                if bytes.len() > max_bytes {
-                    break Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "api request line is too large",
-                    ));
+            LocalStreamReadCount::Closed => break Ok(None),
+            LocalStreamReadCount::Data(count) => {
+                poll_interval = INITIAL_REQUEST_POLL_INTERVAL;
+                let received = &chunk[..count];
+                // Reading past the newline is harmless: this is the only read
+                // the connection ever performs, so anything after the first
+                // line would have been left unread in the socket buffer.
+                match received.iter().position(|byte| *byte == b'\n') {
+                    Some(index) => {
+                        // The newline itself is exempt from the limit, matching
+                        // the byte-at-a-time reader this replaced: a line whose
+                        // content exactly fills the limit is still accepted.
+                        if bytes.len() + index > max_bytes {
+                            break Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "api request line is too large",
+                            ));
+                        }
+                        bytes.extend_from_slice(&received[..=index]);
+                        break String::from_utf8(bytes)
+                            .map(Some)
+                            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
+                    }
+                    None => {
+                        bytes.extend_from_slice(received);
+                        if bytes.len() > max_bytes {
+                            break Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "api request line is too large",
+                            ));
+                        }
+                    }
                 }
             }
-            LocalStreamRead::Pending => {
+            LocalStreamReadCount::Pending => {
                 if Instant::now() >= deadline {
                     break Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "timed out reading api request",
                     ));
                 }
-                std::thread::sleep(CONNECTION_POLL_INTERVAL);
+                std::thread::sleep(next_initial_request_poll_interval(&mut poll_interval));
             }
         }
     };
     set_local_stream_polling(stream, false)?;
     result
+}
+
+fn next_initial_request_poll_interval(interval: &mut Duration) -> Duration {
+    let current = *interval;
+    *interval = (*interval * 2).min(CONNECTION_POLL_INTERVAL);
+    current
 }
 
 #[cfg(all(test, windows))]
@@ -728,7 +886,7 @@ fn stream_subscriptions(
         }
 
         for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
+            for event in subscription.poll_batch(api_tx, event_hub) {
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -927,6 +1085,121 @@ mod tests {
         (client, server, path)
     }
 
+    // Request-line parsing had no coverage on this platform: the tests for it
+    // live in the Windows-only module, so a rewrite of the reader could pass
+    // here having exercised none of it.
+
+    #[test]
+    fn a_line_whose_content_exactly_fills_the_limit_is_accepted() {
+        // The newline is exempt from the limit. The byte-at-a-time reader this
+        // replaced checked for it before checking the length, and a chunked
+        // read has to keep that boundary in the same place.
+        let (mut client, mut server, path) = local_stream_pair("request-limit-exact");
+        client.write_all(b"1234\n").unwrap();
+        client.flush().unwrap();
+
+        let line = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
+            .expect("a line at the limit is not too large");
+
+        assert_eq!(line.as_deref(), Some("1234\n"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_oversized_line_is_rejected_even_when_its_newline_arrives_together() {
+        // A chunked read sees the content and the newline in one buffer, where
+        // the old reader would have hit the limit before reaching the newline.
+        // Arriving together must not smuggle an oversized line through.
+        let (mut client, mut server, path) = local_stream_pair("request-limit-one-chunk");
+        client.write_all(b"12345\n").unwrap();
+        client.flush().unwrap();
+
+        let err = read_initial_request_line_with_limits(&mut server, Duration::from_secs(1), 4)
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "api request line is too large");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_line_split_across_reads_is_reassembled() {
+        let (mut client, mut server, path) = local_stream_pair("request-split");
+        let handle = std::thread::spawn(move || {
+            client.write_all(b"{\"id\":\"a\",").unwrap();
+            client.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"\"method\":\"ping\"}\n").unwrap();
+            client.flush().unwrap();
+            client
+        });
+
+        let line = read_initial_request_line_with_timeout(&mut server, Duration::from_secs(5))
+            .expect("a split line still reads");
+
+        assert_eq!(
+            line.as_deref(),
+            Some("{\"id\":\"a\",\"method\":\"ping\"}\n")
+        );
+        let _client = handle.join().expect("writer finishes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_large_request_no_longer_costs_one_read_per_byte() {
+        // The point of the chunked read: a 256 KiB request used to take a
+        // quarter of a million poll calls.
+        let (mut client, mut server, path) = local_stream_pair("request-large");
+        let payload = "x".repeat(256 * 1024);
+        let handle = std::thread::spawn(move || {
+            client.write_all(payload.as_bytes()).unwrap();
+            client.write_all(b"\n").unwrap();
+            client.flush().unwrap();
+            client
+        });
+
+        let line = read_initial_request_line_with_limits(
+            &mut server,
+            Duration::from_secs(10),
+            MAX_INITIAL_REQUEST_BYTES,
+        )
+        .expect("a large line reads");
+
+        assert_eq!(line.map(|line| line.len()), Some(256 * 1024 + 1));
+        let _client = handle.join().expect("writer finishes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn initial_request_polling_starts_fast_then_backs_off() {
+        let mut interval = INITIAL_REQUEST_POLL_INTERVAL;
+        let observed = (0..9)
+            .map(|_| next_initial_request_poll_interval(&mut interval))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            observed,
+            [1, 2, 4, 8, 16, 32, 64, 100, 100].map(Duration::from_millis)
+        );
+    }
+
+    #[test]
+    fn overload_response_survives_a_request_still_being_written() {
+        let (mut client, mut server, path) = local_stream_pair("overload-drain");
+        let handle = std::thread::spawn(move || {
+            let mut request = vec![b'x'; 256 * 1024];
+            request.push(b'\n');
+            client.write_all(&request).unwrap();
+            client.flush().unwrap();
+            read_line(&mut client)
+        });
+
+        refuse_overloaded_connection(&mut server, MAX_CONCURRENT_API_CONNECTIONS);
+
+        let response = handle.join().expect("client finishes its request");
+        assert!(response.contains("server_overloaded"), "{response}");
+        let _ = std::fs::remove_file(path);
+    }
+
     fn pane_info(
         pane_id: &str,
         agent_status: crate::api::schema::AgentStatus,
@@ -945,11 +1218,18 @@ mod tests {
             terminal_title: None,
             terminal_title_stripped: None,
             display_agent: None,
+            agent_osc_title: None,
+            agent_osc_progress: None,
             agent_status,
             state_labels: HashMap::new(),
             tokens: HashMap::new(),
             agent_session: None,
             scroll: None,
+            keyboard_protocol: None,
+            peer: None,
+            peer_view: None,
+            owner_instance_id: None,
+            owner_attached: None,
             revision: 0,
         }
     }
@@ -1092,6 +1372,38 @@ mod tests {
     }
 
     #[test]
+    fn instance_precondition_rejects_request_before_dispatch() {
+        let (mut client, server, _path) = local_stream_pair("instance-precondition");
+        let active = crate::instance_id::active().expect("server has an instance id");
+        let mut different = active.clone().into_bytes();
+        different[0] = if different[0] == b'0' { b'1' } else { b'0' };
+        let different = String::from_utf8(different).unwrap();
+        let request = serde_json::json!({
+            "id": "guarded",
+            "if_instance_id": different,
+            "method": "workspace.list",
+            "params": {}
+        });
+        writeln!(client, "{request}").unwrap();
+        client.flush().unwrap();
+
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        handle_connection(
+            server,
+            &api_tx,
+            &EventHub::default(),
+            &Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+
+        let response: ErrorResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response.id, "guarded");
+        assert_eq!(response.error.code, "server_replaced");
+        assert!(api_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn server_stop_control_bypasses_app_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1192,6 +1504,53 @@ mod tests {
         let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
         assert_eq!(response.id, "req_write");
         server_thread.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn connection_admission_stops_at_the_thread_cap() {
+        assert!(api_connection_slot_available(
+            MAX_CONCURRENT_API_CONNECTIONS - 1
+        ));
+        assert!(!api_connection_slot_available(
+            MAX_CONCURRENT_API_CONNECTIONS
+        ));
+    }
+
+    #[test]
+    fn one_connection_dispatches_only_one_request() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+        let (mut client, server, _path) = local_stream_pair("one-request");
+        client
+            .write_all(
+                br#"{"id":"first","method":"workspace.list","params":{}}
+{"id":"second","method":"workspace.list","params":{}}
+"#,
+            )
+            .unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let event_hub = EventHub::default();
+        let server_thread = std::thread::spawn(move || {
+            handle_connection(server, &api_tx, &event_hub, &server_running, None)
+        });
+
+        let msg = api_rx.blocking_recv().unwrap();
+        assert_eq!(msg.request.id, "first");
+        msg.respond_to
+            .send(
+                serde_json::to_string(&SuccessResponse {
+                    id: msg.request.id,
+                    result: ResponseResult::Ok {},
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let response: SuccessResponse = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(response.id, "first");
+        server_thread.join().unwrap().unwrap();
+        assert!(api_rx.try_recv().is_err());
     }
 
     #[test]

@@ -327,6 +327,44 @@ pub struct Config {
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
     pub remote: RemoteConfig,
+    pub peer_history: PeerHistoryConfig,
+    pub peer_hidden: PeerHiddenConfig,
+}
+
+/// One recently added peer, remembered so the add-peer dialog can offer it as
+/// a one-click re-add. `last_used` is epoch seconds; `target` is the canonical
+/// history form of the peer's destination (`ssh://…` or `socket://…`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PeerHistoryEntry {
+    pub name: String,
+    pub target: String,
+    pub last_used: u64,
+}
+
+pub const DEFAULT_PEER_HISTORY_MAX_ENTRIES: usize = 10;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PeerHistoryConfig {
+    pub recent: Vec<PeerHistoryEntry>,
+    pub max_entries: usize,
+}
+
+impl Default for PeerHistoryConfig {
+    fn default() -> Self {
+        Self {
+            recent: Vec::new(),
+            max_entries: DEFAULT_PEER_HISTORY_MAX_ENTRIES,
+        }
+    }
+}
+
+/// Peers the user never wants listed in the sidebar, persisted across
+/// restarts. Session-scoped hiding lives in app state, not here.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PeerHiddenConfig {
+    pub peers: Vec<String>,
 }
 
 #[derive(Debug)]

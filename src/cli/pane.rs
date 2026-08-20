@@ -66,6 +66,11 @@ fn pane_list(args: &[String]) -> std::io::Result<i32> {
                 workspace_id = Some(super::normalize_workspace_id(value));
                 index += 2;
             }
+            // Accepted and ignored: this command always answers with JSON, and
+            // `peer list` needs `--json` to get there. A script that passed the
+            // flag to both used to fail on this one with `unknown option`. Kept
+            // out of the public spec, like the same flag on `worktree`.
+            "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);
@@ -744,6 +749,8 @@ fn parse_pane_split_args(
         focus,
         right_click,
         env,
+        // Ownership is only claimed by a federating server, never by the CLI.
+        owner_instance_id: None,
     })
 }
 

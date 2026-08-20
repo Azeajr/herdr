@@ -119,6 +119,10 @@ fn unix_stdin_reader_loop(
         match reader.read(&mut scratch) {
             Ok(0) => break,
             Ok(n) => {
+                // Read size against read count says whether a burst arrives as one
+                // read or a byte at a time, which decides where input can be joined.
+                crate::render_prof::event("client.stdin.reads");
+                crate::render_prof::counter("client.stdin.bytes", n as u64);
                 let sgr_pixels = *pending_mode
                     .get_or_insert_with(|| host_sgr_pixels_active.load(Ordering::Acquire));
                 if sgr_pixels {
@@ -243,12 +247,27 @@ fn send_unix_input_chunks(
     sgr_pixels: bool,
     geometry: Option<crate::input::mouse::HostGeometry>,
 ) -> bool {
+    // Plain input chunks are re-joined before they leave this thread. The framer emits
+    // one chunk per parsed event, and for typed text that is one chunk per character,
+    // so a 4 KB burst became 4,096 socket messages, 4,096 server input batches and
+    // 4,096 one-byte pty writes — 800 KB of it left the server unable to answer for
+    // 42 seconds. The server re-parses the bytes with the same framer, so joining them
+    // produces exactly the same events on the other side.
+    //
+    // Only adjacent *plain* chunks join. Anything the loop below treats specially —
+    // palette and default-colour replies, pixel mouse reports — flushes what has
+    // accumulated first, so ordering is unchanged.
+    let mut joined: Vec<u8> = Vec::new();
+
     for data in chunks {
         let palette_response = std::str::from_utf8(&data)
             .ok()
             .and_then(crate::terminal_theme::parse_palette_color_response)
             .is_some();
         if palette_response {
+            if !flush_joined_unix_input(event_tx, &mut joined) {
+                return false;
+            }
             pending_palette.push(data);
             if pending_palette.len() == 256 && !flush_unix_palette_input(event_tx, pending_palette)
             {
@@ -260,17 +279,41 @@ fn send_unix_input_chunks(
             .ok()
             .and_then(crate::terminal_theme::parse_default_color_response)
             .is_some();
+        // Buffered palette bytes must not be overtaken by what follows them. `joined` is
+        // already empty here whenever any palette bytes are pending, because a palette
+        // reply flushes it above, so ordering holds without flushing it again — and
+        // flushing it here would defeat the joining entirely, since every plain chunk
+        // reaches this line.
         if !default_color_response && !flush_unix_palette_input(event_tx, pending_palette) {
             return false;
         }
         let Some(event) = classify_unix_input(data, sgr_pixels, geometry) else {
             continue;
         };
-        if event_tx.blocking_send(event).is_err() {
-            return false;
+        match event {
+            ClientLoopEvent::StdinInput(bytes) => joined.extend_from_slice(&bytes),
+            other => {
+                if !flush_joined_unix_input(event_tx, &mut joined) {
+                    return false;
+                }
+                if event_tx.blocking_send(other).is_err() {
+                    return false;
+                }
+            }
         }
     }
-    true
+
+    flush_joined_unix_input(event_tx, &mut joined)
+}
+
+#[cfg(unix)]
+fn flush_joined_unix_input(event_tx: &mpsc::Sender<ClientLoopEvent>, joined: &mut Vec<u8>) -> bool {
+    if joined.is_empty() {
+        return true;
+    }
+    event_tx
+        .blocking_send(ClientLoopEvent::StdinInput(std::mem::take(joined)))
+        .is_ok()
 }
 
 #[cfg(unix)]
@@ -688,6 +731,104 @@ mod tests {
                 .count(),
             2
         );
+        assert!(pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn typed_characters_leave_as_one_message_rather_than_one_each() {
+        // The framer emits a chunk per character, and every chunk used to become its
+        // own socket message, its own server input batch and its own one-byte pty
+        // write. Joining them here is the difference between 4,096 messages for a 4 KB
+        // burst and one.
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut pending = Vec::new();
+
+        assert!(send_unix_input_chunks(
+            vec![
+                b"h".to_vec(),
+                b"e".to_vec(),
+                b"l".to_vec(),
+                b"l".to_vec(),
+                b"o".to_vec()
+            ],
+            &tx,
+            &mut pending,
+            false,
+            None,
+        ));
+
+        let ClientLoopEvent::StdinInput(data) = rx.try_recv().unwrap() else {
+            panic!("expected one joined input message");
+        };
+        assert_eq!(data, b"hello");
+        assert!(rx.try_recv().is_err(), "nothing else should have been sent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn joining_stops_at_anything_that_is_not_plain_input() {
+        // Ordering is the invariant: a pixel mouse report is its own event, and the
+        // text on either side of it must not be reordered around it.
+        let geometry = crate::input::mouse::HostGeometry::new(80, 24, 800, 480).unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut pending = Vec::new();
+
+        assert!(send_unix_input_chunks(
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"\x1b[<35;321;241M".to_vec(),
+                b"c".to_vec(),
+            ],
+            &tx,
+            &mut pending,
+            true,
+            Some(geometry),
+        ));
+
+        let ClientLoopEvent::StdinInput(before) = rx.try_recv().unwrap() else {
+            panic!("expected the text before the mouse report");
+        };
+        assert_eq!(before, b"ab");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ClientLoopEvent::PixelMouse(_, _)
+        ));
+        let ClientLoopEvent::StdinInput(after) = rx.try_recv().unwrap() else {
+            panic!("expected the text after the mouse report");
+        };
+        assert_eq!(after, b"c");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffered_palette_replies_still_arrive_before_the_text_after_them() {
+        // A palette reply is held until its batch completes, so text that arrives
+        // afterwards must not be joined past it.
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut pending = Vec::new();
+
+        assert!(send_unix_input_chunks(
+            vec![
+                b"\x1b]4;0;rgb:1111/2222/3333\x1b\\".to_vec(),
+                b"x".to_vec(),
+                b"y".to_vec(),
+            ],
+            &tx,
+            &mut pending,
+            false,
+            None,
+        ));
+
+        let ClientLoopEvent::StdinInput(palette) = rx.try_recv().unwrap() else {
+            panic!("expected the palette reply first");
+        };
+        assert!(palette.starts_with(b"\x1b]4;"));
+        let ClientLoopEvent::StdinInput(text) = rx.try_recv().unwrap() else {
+            panic!("expected the joined text after it");
+        };
+        assert_eq!(text, b"xy");
         assert!(pending.is_empty());
     }
 

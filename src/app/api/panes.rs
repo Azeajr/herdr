@@ -28,9 +28,122 @@ use super::super::api_helpers::{
 use super::super::api_helpers::{METADATA_SOURCE_MAX_CHARS, METADATA_TTL_MAX_MS};
 use super::responses::{encode_error, encode_success};
 
+/// Which instance, if any, a newly created pane belongs to.
+///
+/// A caller naming this very server owns nothing special: the pane is an
+/// ordinary local one, and recording it as owned would make this machine's own
+/// panes look like they were left here by someone else.
+fn owner_for_new_pane(requested: Option<String>, active_instance: Option<&str>) -> Option<String> {
+    requested.filter(|owner| Some(owner.as_str()) != active_instance)
+}
+
+fn pane_text_point(point: crate::pane::TerminalTextPoint) -> crate::api::schema::PaneTextPoint {
+    crate::api::schema::PaneTextPoint {
+        row: point.row,
+        col: point.col,
+    }
+}
+
+fn pane_text_motion_target(
+    runtime: &crate::terminal::TerminalRuntime,
+    row: u32,
+    col: u16,
+    motion: crate::api::schema::PaneTextMotion,
+) -> Option<crate::pane::TerminalTextPoint> {
+    use crate::api::schema::PaneTextMotion;
+    use crate::pane::{TerminalTextPoint, TerminalWordMotion};
+
+    let word_motion = match motion {
+        PaneTextMotion::NextWordStart => Some(TerminalWordMotion::NextStart),
+        PaneTextMotion::PreviousWordStart => Some(TerminalWordMotion::PreviousStart),
+        PaneTextMotion::NextWordEnd => Some(TerminalWordMotion::NextEnd),
+        PaneTextMotion::NextBigWordStart => Some(TerminalWordMotion::NextBigStart),
+        PaneTextMotion::PreviousBigWordStart => Some(TerminalWordMotion::PreviousBigStart),
+        PaneTextMotion::NextBigWordEnd => Some(TerminalWordMotion::NextBigEnd),
+        _ => None,
+    };
+    if let Some(word_motion) = word_motion {
+        return runtime.word_motion_target(row, col, word_motion);
+    }
+
+    let row_text = |row| {
+        let cols = runtime.current_size().cols;
+        runtime.read_text_range((0, row), (cols.saturating_sub(1), row))
+    };
+    match motion {
+        PaneTextMotion::LineEnd => row_text(row).map(|text| TerminalTextPoint {
+            row,
+            col: pane_text_last_character_col(&text).unwrap_or(0),
+        }),
+        PaneTextMotion::FirstNonBlank => row_text(row).map(|text| TerminalTextPoint {
+            row,
+            col: pane_text_first_non_blank_col(&text).unwrap_or(0),
+        }),
+        PaneTextMotion::PreviousParagraph | PaneTextMotion::NextParagraph => {
+            let metrics = runtime.scroll_metrics()?;
+            let row_count = metrics
+                .max_offset_from_bottom
+                .saturating_add(metrics.viewport_rows)
+                .min(u32::MAX as usize) as u32;
+            let last_row = row_count.saturating_sub(1);
+            let mut candidate = row.min(last_row);
+            for _ in 0..1000 {
+                candidate = match motion {
+                    PaneTextMotion::PreviousParagraph => candidate.checked_sub(1)?,
+                    PaneTextMotion::NextParagraph if candidate < last_row => candidate + 1,
+                    PaneTextMotion::NextParagraph => return None,
+                    _ => unreachable!("word and line motions returned above"),
+                };
+                if row_text(candidate).is_some_and(|text| text.trim().is_empty()) {
+                    return Some(TerminalTextPoint {
+                        row: candidate,
+                        col,
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn pane_text_first_non_blank_col(text: &str) -> Option<u16> {
+    let mut col = 0u16;
+    for ch in text.chars() {
+        if !ch.is_whitespace() {
+            return Some(col);
+        }
+        col = col.saturating_add(u16::from(crate::ghostty::unicode_codepoint_width(
+            ch as u32,
+        )));
+    }
+    None
+}
+
+fn pane_text_last_character_col(text: &str) -> Option<u16> {
+    let mut col = 0u16;
+    let mut last_col = None;
+    for ch in text.chars() {
+        let width = u16::from(crate::ghostty::unicode_codepoint_width(ch as u32));
+        if width > 0 {
+            last_col = Some(col);
+            col = col.saturating_add(width);
+        }
+    }
+    last_col
+}
+
 impl App {
-    pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
-        let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
+    /// Which pane a `pane.split` divides: an explicit pane, the focused pane of
+    /// a named workspace, or the focused pane of the active workspace.
+    ///
+    /// Shared with the peer split path, which has to resolve the same target
+    /// before it can tell whether the split belongs to a peer.
+    pub(in crate::app) fn resolve_pane_split_target(
+        &self,
+        params: &PaneSplitParams,
+    ) -> Option<(usize, PaneId)> {
+        if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
             self.parse_workspace_id(workspace_id).and_then(|ws_idx| {
@@ -42,15 +155,18 @@ impl App {
                 let pane_id = self.state.workspaces.get(ws_idx)?.focused_pane_id()?;
                 Some((ws_idx, pane_id))
             })
-        };
-        let Some((ws_idx, target_pane_id)) = target else {
+        }
+    }
+
+    pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
+        let Some((ws_idx, target_pane_id)) = self.resolve_pane_split_target(&params) else {
             return encode_error(id, "pane_not_found", "pane not found");
         };
         let extra_env = match super::env::normalize_launch_env(params.env) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        let (rows, cols) = self.state.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.state.estimate_pane_size();
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
             let follow_cwd = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
             Some(self.resolve_new_terminal_cwd(follow_cwd))
@@ -118,9 +234,14 @@ impl App {
             .insert(new_pane.terminal.id.clone(), new_pane.runtime);
         self.state
             .remove_alias_shadowed_by_new_pane(new_pane.pane_id);
-        self.state
-            .terminals
-            .insert(new_pane.terminal.id.clone(), new_pane.terminal);
+        let mut terminal = new_pane.terminal;
+        // Another server asked for this pane to back a view of its own, so it is
+        // reported as that instance's until the instance stops attaching.
+        terminal.owner_instance_id = owner_for_new_pane(
+            params.owner_instance_id,
+            crate::instance_id::active().as_deref(),
+        );
+        self.state.terminals.insert(terminal.id.clone(), terminal);
         self.schedule_session_save();
         let pane = self.pane_info(ws_idx, new_pane.pane_id).unwrap();
         self.emit_event(EventEnvelope {
@@ -809,6 +930,34 @@ impl App {
             }
         };
 
+        let cross_workspace = match &resolved {
+            ResolvedPaneMoveDestination::ExistingTab {
+                cross_workspace, ..
+            } => *cross_workspace,
+            ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => {
+                workspace_id != &previous_workspace_id
+            }
+            ResolvedPaneMoveDestination::NewWorkspace { .. } => true,
+        };
+        if cross_workspace {
+            let target_is_peer_backed = match &resolved {
+                ResolvedPaneMoveDestination::ExistingTab { tab_id, .. } => self
+                    .parse_tab_id(tab_id)
+                    .is_some_and(|(ws_idx, _)| self.state.workspaces[ws_idx].peer.is_some()),
+                ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => self
+                    .parse_workspace_id(workspace_id)
+                    .is_some_and(|ws_idx| self.state.workspaces[ws_idx].peer.is_some()),
+                ResolvedPaneMoveDestination::NewWorkspace { .. } => false,
+            };
+            if self.state.workspaces[source_ws_idx].peer.is_some() || target_is_peer_backed {
+                return encode_error(
+                    id,
+                    "invalid_request",
+                    "panes cannot move across a peer workspace boundary",
+                );
+            }
+        }
+
         let previous_focus = self.state.current_pane_focus_target();
         let taken = match self
             .state
@@ -822,15 +971,6 @@ impl App {
         let source_removed_tab_id = taken.removed_tab_idx.map(|_| previous_tab_id.clone());
         let source_workspace_empty = taken.workspace_empty;
         let moved = taken.moved;
-        let cross_workspace = match &resolved {
-            ResolvedPaneMoveDestination::ExistingTab {
-                cross_workspace, ..
-            } => *cross_workspace,
-            ResolvedPaneMoveDestination::NewTab { workspace_id, .. } => {
-                workspace_id != &previous_workspace_id
-            }
-            ResolvedPaneMoveDestination::NewWorkspace { .. } => true,
-        };
         if cross_workspace {
             if let Some(ws) = self.state.workspaces.get_mut(source_ws_idx) {
                 ws.unregister_moved_pane(source_pane_id);
@@ -1184,6 +1324,94 @@ impl App {
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
 
         encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    /// Answers for a span of a pane's screen named in buffer coordinates.
+    ///
+    /// Exists so a server holding a selection over a pane it does not own can
+    /// ask the server that does. The read itself is the terminal's own, so the
+    /// answer is identical to the one a local copy would produce rather than a
+    /// reconstruction that agrees most of the time.
+    pub(super) fn handle_pane_read_range(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneReadRangeParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some((pane, _workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        let text = pane
+            .read_text_range(
+                (params.start_col, params.start_row),
+                (params.end_col, params.end_row),
+            )
+            .unwrap_or_default();
+
+        encode_success(
+            id,
+            ResponseResult::PaneReadRange {
+                read: crate::api::schema::PaneReadRangeResult {
+                    pane_id: public_pane_id,
+                    text,
+                },
+            },
+        )
+    }
+
+    /// Runs search or text motion beside the terminal buffer that owns the
+    /// relevant scrollback and soft-wrap state.
+    pub(super) fn handle_pane_text_query(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneTextQueryParams,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some((runtime, _workspace_id)) = self.lookup_runtime(ws_idx, pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+
+        let answer = match params.query {
+            crate::api::schema::PaneTextQuery::Search {
+                query,
+                case_sensitive,
+            } => crate::api::schema::PaneTextQueryAnswer::Search {
+                matches: runtime
+                    .search_text_matches(&query, case_sensitive)
+                    .into_iter()
+                    .map(|text_match| crate::api::schema::PaneTextMatch {
+                        start: pane_text_point(text_match.start),
+                        end: pane_text_point(text_match.end),
+                    })
+                    .collect(),
+            },
+            crate::api::schema::PaneTextQuery::Motion { row, col, motion } => {
+                crate::api::schema::PaneTextQueryAnswer::Motion {
+                    target: pane_text_motion_target(runtime, row, col, motion).map(pane_text_point),
+                }
+            }
+        };
+
+        encode_success(
+            id,
+            ResponseResult::PaneTextQuery {
+                query: crate::api::schema::PaneTextQueryResult {
+                    pane_id: public_pane_id,
+                    answer,
+                },
+            },
+        )
     }
 
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
@@ -1951,6 +2179,142 @@ mod tests {
                 .pane_state(other)
                 .unwrap()
                 .right_click_passthrough
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_text_query_searches_and_moves_with_terminal_authority() {
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .expect("terminal id")
+            .clone();
+        app.terminal_runtimes.insert(
+            terminal_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                20,
+                4,
+                b"alpha beta\r\n\r\nalpha gamma\r\n",
+            ),
+        );
+
+        let response = app.handle_pane_text_query(
+            "search".into(),
+            crate::api::schema::PaneTextQueryParams {
+                pane_id: public_pane_id.clone(),
+                query: crate::api::schema::PaneTextQuery::Search {
+                    query: "alpha".into(),
+                    case_sensitive: true,
+                },
+            },
+        );
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneTextQuery { query } = response.result else {
+            panic!("unexpected text-query result")
+        };
+        let crate::api::schema::PaneTextQueryAnswer::Search { matches } = query.answer else {
+            panic!("unexpected search answer")
+        };
+        assert_eq!(matches.len(), 2);
+        assert_eq!(
+            matches[0].start,
+            crate::api::schema::PaneTextPoint { row: 0, col: 0 }
+        );
+
+        let response = app.handle_pane_text_query(
+            "motion".into(),
+            crate::api::schema::PaneTextQueryParams {
+                pane_id: public_pane_id,
+                query: crate::api::schema::PaneTextQuery::Motion {
+                    row: 0,
+                    col: 0,
+                    motion: crate::api::schema::PaneTextMotion::NextWordStart,
+                },
+            },
+        );
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneTextQuery { query } = response.result else {
+            panic!("unexpected text-query result")
+        };
+        assert_eq!(
+            query.answer,
+            crate::api::schema::PaneTextQueryAnswer::Motion {
+                target: Some(crate::api::schema::PaneTextPoint { row: 0, col: 6 }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pane_reports_its_owner_and_whether_that_owner_is_attached() {
+        const OWNER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let (mut app, public_pane_id) = app_with_test_workspace();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .pane_state(pane_id)
+            .expect("pane exists")
+            .attached_terminal_id
+            .clone();
+
+        // A pane this machine's own user opened has no other owner at all.
+        let pane = app.pane_info(0, pane_id).expect("pane info");
+        assert_eq!(pane.pane_id, public_pane_id);
+        assert_eq!(pane.owner_instance_id, None);
+        assert_eq!(pane.owner_attached, None);
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal exists")
+            .owner_instance_id = Some(OWNER.to_string());
+
+        // Owned but with nothing connected from that instance: still running
+        // here for a machine that is not watching it.
+        let pane = app.pane_info(0, pane_id).expect("pane info");
+        assert_eq!(pane.owner_instance_id.as_deref(), Some(OWNER));
+        assert_eq!(pane.owner_attached, Some(false));
+
+        // An unrelated instance attaching does not make it attended.
+        app.state.set_terminal_attached_instances(
+            [(terminal_id.clone(), vec!["someone-else".to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            app.pane_info(0, pane_id).expect("pane info").owner_attached,
+            Some(false)
+        );
+
+        app.state.set_terminal_attached_instances(
+            [(terminal_id, vec![OWNER.to_string()])]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            app.pane_info(0, pane_id).expect("pane info").owner_attached,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_split_claiming_this_server_as_owner_records_no_owner() {
+        // A caller naming this server would otherwise make a pane look like it
+        // was left here by someone else.
+        assert_eq!(
+            owner_for_new_pane(Some("self".into()), Some("self")),
+            None,
+            "a pane is not foreign to the server that created it"
+        );
+        assert_eq!(
+            owner_for_new_pane(Some("other".into()), Some("self")),
+            Some("other".to_string())
+        );
+        assert_eq!(owner_for_new_pane(None, Some("self")), None);
+        // A server with no instance id of its own still records the claim: the
+        // pane really was requested by someone else.
+        assert_eq!(
+            owner_for_new_pane(Some("other".into()), None),
+            Some("other".to_string())
         );
     }
 
@@ -2818,6 +3182,74 @@ mod tests {
             Err(crate::app::terminal_targets::TerminalTargetError::NotFound { .. })
         ));
         assert!(app.resolve_agent_target(&move_result.pane.pane_id).is_ok());
+    }
+
+    #[test]
+    fn api_pane_move_rejects_crossing_peer_workspace_ownership() {
+        for (source_peer, target_peer) in [(true, false), (false, true)] {
+            let mut app = app_with_linked_worktree();
+            app.state.workspaces.push(Workspace::test_new("other"));
+            if source_peer {
+                app.state.workspaces[0].peer = Some("beta".into());
+                app.state.workspaces[0].peer_workspace = Some("w1".into());
+            }
+            if target_peer {
+                app.state.workspaces[1].peer = Some("beta".into());
+                app.state.workspaces[1].peer_workspace = Some("w2".into());
+            }
+            let source = app.state.workspaces[0].tabs[0].root_pane;
+            let source_terminal = app.state.workspaces[0].terminal_id(source).unwrap().clone();
+            let target = app.state.workspaces[1].tabs[0].root_pane;
+            let response = app.handle_pane_move(
+                "req".into(),
+                PaneMoveParams {
+                    pane_id: app.public_pane_id(0, source).unwrap(),
+                    destination: PaneMoveDestination::Tab {
+                        tab_id: app.public_tab_id(1, 0).unwrap(),
+                        target_pane_id: Some(app.public_pane_id(1, target).unwrap()),
+                        split: SplitDirection::Right,
+                        ratio: None,
+                    },
+                    focus: false,
+                },
+            );
+
+            let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(error.error.code, "invalid_request");
+            assert_eq!(app.state.workspaces.len(), 2);
+            assert_eq!(
+                app.state.workspaces[0].terminal_id(source),
+                Some(&source_terminal)
+            );
+        }
+    }
+
+    #[test]
+    fn api_pane_move_rejects_promoting_peer_pane_to_local_workspace() {
+        let mut app = app_with_linked_worktree();
+        app.state.workspaces[0].peer = Some("beta".into());
+        app.state.workspaces[0].peer_workspace = Some("w1".into());
+        let source = app.state.workspaces[0].tabs[0].root_pane;
+        let source_terminal = app.state.workspaces[0].terminal_id(source).unwrap().clone();
+        let response = app.handle_pane_move(
+            "req".into(),
+            PaneMoveParams {
+                pane_id: app.public_pane_id(0, source).unwrap(),
+                destination: PaneMoveDestination::NewWorkspace {
+                    label: None,
+                    tab_label: None,
+                },
+                focus: true,
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "invalid_request");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].terminal_id(source),
+            Some(&source_terminal)
+        );
     }
 
     #[test]

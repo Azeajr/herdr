@@ -7,6 +7,7 @@ mod integrations;
 mod layouts;
 mod pane_graphics;
 mod panes;
+mod peers;
 pub(crate) mod plugins;
 mod responses;
 mod session;
@@ -28,30 +29,26 @@ enum RuntimeExitAction {
 }
 
 impl App {
-    pub(crate) fn dispatch_api_request(
-        &mut self,
-        id: &'static str,
-        method: crate::api::schema::Method,
-    ) -> String {
-        self.handle_api_request(crate::api::schema::Request {
-            id: id.to_string(),
-            method,
-        })
-    }
-
     pub(crate) fn dispatch_deferred_api_request(
         &mut self,
         id: &'static str,
         method: crate::api::schema::Method,
     ) -> Option<String> {
+        let request = crate::api::schema::Request {
+            id: id.to_string(),
+            method,
+        };
         let (respond_to, response_rx) = std::sync::mpsc::channel();
-        if !self.handle_deferred_worktree_api_request(
-            crate::api::schema::Request {
-                id: id.to_string(),
-                method,
-            },
-            respond_to,
-        ) {
+        // Same gate the socket path applies, for the same reason: a worktree
+        // action inside a peer view runs where the checkout is. What comes back
+        // here is only a refusal that never reached the peer — everything the
+        // peer answers lands on the event loop, which is also where the dialog
+        // waiting on it lives.
+        if self.request_targets_peer_workspace(&request) {
+            self.handle_deferred_peer_workspace_api_request(request, respond_to);
+            return response_rx.try_recv().ok();
+        }
+        if !self.handle_deferred_worktree_api_request(request, respond_to) {
             return None;
         }
 
@@ -122,7 +119,7 @@ impl App {
             return Vec::new();
         }
 
-        if let AppEvent::ClipboardWrite { content } = ev {
+        if let AppEvent::ClipboardWrite { content, .. } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
             #[cfg(test)]
@@ -205,6 +202,116 @@ impl App {
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
             return Vec::new();
+        }
+
+        // A peer-backed pane's agent facts arrive as its peer's detection, not
+        // this server's: nothing local can read a screen rendered elsewhere.
+        // They are replayed as ordinary state changes so a remote agent reaches
+        // labels, statuses, and notifications by the same path a local one does.
+        if let AppEvent::PeerPanesUpdated { handle, panes } = &ev {
+            let detected = self.handle_peer_panes_updated(handle, panes);
+            for detection in detected {
+                self.handle_internal_event(detection);
+            }
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerPaneSplitFinished(result) = ev {
+            self.handle_peer_pane_split_finished(*result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerWorkspaceCreateFinished(result) = ev {
+            self.handle_peer_workspace_create_finished(*result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerTabCreateFinished(result) = ev {
+            self.handle_peer_tab_create_finished(*result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerWorktreeViewFinished(result) = ev {
+            self.handle_peer_worktree_view_finished(*result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerWorktreeRemoveFinished(result) = ev {
+            self.handle_peer_worktree_remove_finished(*result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerWorktreeListFinished {
+            workspace_id,
+            result,
+        } = ev
+        {
+            self.handle_peer_worktree_list_finished(workspace_id, result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerViewOpenFinished(result) = ev {
+            self.handle_peer_view_open_finished(*result);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerCopyModeQueryFinished(result) = ev {
+            self.handle_peer_copy_mode_query_finished(*result);
+            return Vec::new();
+        }
+
+        // The forward already failed on the peer and nothing local can be rolled
+        // back, so this only has to be said. Without it the user watches a
+        // closed workspace reappear on the peer's next enumeration with no
+        // explanation at all.
+        if let AppEvent::PeerForwardFailed { message } = ev {
+            self.report_action_outcome("the peer refused the request", message);
+            return Vec::new();
+        }
+
+        if let AppEvent::PeerViewReconnected(result) = ev {
+            self.handle_peer_view_reconnected(*result);
+            return Vec::new();
+        }
+
+        // A peer coming back is the moment its views should stop waiting out a
+        // backoff they earned while it was down. The state transition itself is
+        // recorded below, where peer state lives.
+        if let AppEvent::PeerConnectionChanged {
+            handle,
+            connection,
+            identity,
+        } = &ev
+        {
+            // A different server answering on the same target invalidates every
+            // fact bound to the old one. The registry drops the enumeration; the
+            // views, their peer-local targets and their cleanup claims live here
+            // and have to be abandoned before anything reconnects, or a view
+            // would silently re-attach to an unrelated pane on the new server
+            // and closing it would kill that pane. Read before the state below
+            // records the new id, which is what makes the comparison possible.
+            if let Some(identity) = identity {
+                let replaced = self
+                    .state
+                    .peers
+                    .get(handle)
+                    .and_then(crate::app::peers::PeerState::instance_id)
+                    .is_some_and(|previous| previous != identity.instance_id);
+                if replaced {
+                    let handle = handle.clone();
+                    let instance_id = identity.instance_id.clone();
+                    self.abandon_views_of_replaced_peer(&handle, &instance_id);
+                }
+            }
+            if connection.is_connected() {
+                let handle = handle.clone();
+                self.retry_peer_views_now(&handle);
+                // A peer coming back is also the only chance to undo a cleanup
+                // that failed while it was away. Gated on the instance, so a
+                // replacement server is never sent pane ids that mean nothing
+                // to it.
+                self.retry_pending_pane_cleanups(&handle);
+            }
         }
 
         if let AppEvent::PaneDied { pane_id } = &ev {
@@ -464,6 +571,42 @@ impl App {
         }
     }
 
+    /// The peer backing the focused pane, if a peer backs it.
+    ///
+    /// The one test every "this needs the pane's screen" gate asks. A remote
+    /// pane's screen lives on another machine, so anything derived from it —
+    /// selection, search, scrollback, word motion — has no local answer, and the
+    /// accessors return empty rather than failing. A caller that presents an
+    /// affordance from one of those has to check here first, or it shows a
+    /// feature that silently does nothing.
+    pub(crate) fn focused_pane_peer(&self) -> Option<String> {
+        let ws_idx = self.state.active?;
+        let pane_id = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.focused_pane_id())?;
+        self.state
+            .focused_pane_peer(&self.terminal_runtimes, ws_idx, pane_id)
+    }
+
+    /// Says why `what` cannot be done on the focused pane, when a peer backs it.
+    ///
+    /// Reports whether it said anything, so a caller can use it as the gate
+    /// itself. Naming the limit is the point: a remote pane that silently
+    /// ignores a keybind reads as broken, while one that explains reads as
+    /// limited — which is what it is.
+    pub(crate) fn report_unavailable_on_a_peer_pane(&mut self, what: &str) -> bool {
+        let Some(peer) = self.focused_pane_peer() else {
+            return false;
+        };
+        self.state.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: format!("{what} needs the pane's screen, which lives on '{peer}'"),
+        });
+        self.copy_feedback_deadline = Some(Instant::now() + super::COPY_FEEDBACK_DURATION);
+        true
+    }
+
     pub(crate) fn show_clipboard_feedback(&mut self) {
         if !self.state.toast_config.clipboard.enabled {
             self.state.copy_feedback = None;
@@ -566,7 +709,7 @@ impl App {
         };
 
         let cwd = terminal.cwd.clone();
-        let (rows, cols) = self
+        let crate::terminal::TerminalSize { rows, cols } = self
             .terminal_runtimes
             .get(&terminal_id)
             .map(|runtime| runtime.current_size())
@@ -730,6 +873,35 @@ impl App {
                 )),
             );
         }
+    }
+
+    /// Tells the user how the action they just took turned out.
+    ///
+    /// Deliberately not `config_diagnostic`. That channel describes problems
+    /// with `config.toml`, and the headless server owns it: it writes its own
+    /// config diagnostic there whenever a client's keybinding source changes
+    /// (`sync_visible_server_config_diagnostic`), and only replaces the message
+    /// when it still finds its own. Parking action feedback in the same slot
+    /// therefore suppresses a real config problem for as long as the feedback
+    /// lasts, and reads to the user as a config error besides.
+    ///
+    /// Expiry comes free with the toast, which is the other half of it — the
+    /// refusals here had to remember a deadline by hand, and `de82729b` is the
+    /// commit that fixed one that had forgotten.
+    pub(crate) fn report_action_outcome(
+        &mut self,
+        title: impl Into<String>,
+        context: impl Into<String>,
+    ) {
+        let previous_toast = self.state.toast.clone();
+        self.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::NeedsAttention,
+            title: title.into(),
+            context: context.into(),
+            position: None,
+            target: None,
+        });
+        self.sync_toast_deadline(previous_toast);
     }
 
     pub(crate) fn sync_toast_deadline(
@@ -1011,6 +1183,24 @@ impl App {
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
+            Method::PeerAdd(params) => return self.handle_peer_add(request.id, params),
+            Method::PeerRemove(target) => return self.handle_peer_remove(request.id, target),
+            Method::PeerList(_) => return self.handle_peer_list(request.id),
+            Method::PeerTerminalClose(target) => {
+                return self.handle_peer_terminal_close(request.id, target)
+            }
+            // Only reachable when a caller bypassed the deferred interception
+            // sites. Creating on a peer is a round trip, and opening a view onto
+            // one is a handshake with another machine; neither may run here.
+            Method::PeerWorkspaceCreate(_)
+            | Method::PeerWorkspaceOpen(_)
+            | Method::PeerTerminalOpen(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "this peer method must be dispatched through the deferred peer path",
+                )
+            }
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
                 return self.handle_workspace_create(request.id, params);
@@ -1106,6 +1296,12 @@ impl App {
             Method::PaneInputSet(params) => return self.handle_pane_input_set(request.id, params),
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
+            Method::PaneReadRange(params) => {
+                return self.handle_pane_read_range(request.id, params)
+            }
+            Method::PaneTextQuery(params) => {
+                return self.handle_pane_text_query(request.id, params)
+            }
             Method::PaneGraphicsSet(params) => {
                 return self.handle_pane_graphics_set(request.id, params);
             }

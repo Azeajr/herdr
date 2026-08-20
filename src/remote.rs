@@ -4,12 +4,67 @@ mod host_unix;
 
 pub(crate) use attach::*;
 #[cfg(unix)]
-pub(crate) use host_unix::run_remote_client_bridge;
+pub(crate) use host_unix::{run_remote_api_bridge, run_remote_client_bridge};
 
 #[cfg(windows)]
 pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {
     Err(std::io::Error::other(
         "remote Windows hosts are not supported yet",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn run_remote_api_bridge() -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "remote API bridge is not supported on Windows yet",
+    ))
+}
+
+/// Why an ssh peer bridge could not be stood up.
+#[cfg(windows)]
+pub(crate) enum PeerSshBridgeError {
+    /// The remote could not be reached. Retrying may work.
+    #[allow(dead_code)] // Constructed only by the Unix implementation.
+    Unreachable(String),
+    /// The remote answered but cannot be federated with as configured.
+    Unsupported(String),
+}
+
+/// Uninhabited on Windows: ssh peers cannot be bridged there, so no value of
+/// this type can exist and its accessor is unreachable rather than a stub that
+/// would report a socket path that does not work.
+#[cfg(windows)]
+pub(crate) enum PeerSshBridge {}
+
+#[cfg(windows)]
+impl PeerSshBridge {
+    pub(crate) fn api_socket(&self) -> &std::path::Path {
+        match *self {}
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn start_peer_ssh_bridge(
+    _destination: &str,
+    _session: Option<&str>,
+    _running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<PeerSshBridge, PeerSshBridgeError> {
+    Err(PeerSshBridgeError::Unsupported(
+        "ssh peers are not supported on Windows yet".to_string(),
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_peer_ssh_ready(_destination: &str, _assume_yes: bool) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "ssh peers are not supported on Windows yet",
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn ensure_peer_remote_binary(_destination: &str) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "ssh peers are not supported on Windows yet",
     ))
 }
 

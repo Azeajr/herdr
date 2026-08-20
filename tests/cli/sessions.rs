@@ -1,5 +1,44 @@
 use super::harness::*;
 
+/// A spawned test server begins empty no matter what spawned the test.
+///
+/// `HERDR_STARTUP_CWD` is set in every Herdr pane, and `CLAUDE.md` tells agents
+/// to work from one, so the suite is routinely run from inside a session that
+/// exports it. A server that inherits it seeds a startup workspace, and every
+/// assertion counting workspaces or tabs then fails in a way that reads like a
+/// routing defect in the code under test rather than like a dirty environment —
+/// the failure this pins was `left: ["~", "alpha-ws"]`.
+#[test]
+fn a_spawned_server_ignores_an_inherited_startup_cwd() {
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+
+    // Set on the parent, which is what a herdr pane does to this process.
+    // Safe here because nextest runs each test in its own process, so nothing
+    // else is reading the environment while this moves it.
+    unsafe { std::env::set_var("HERDR_STARTUP_CWD", "/tmp") };
+    let _server = spawn_named_server(&config_home, &runtime_dir, "clean");
+    unsafe { std::env::remove_var("HERDR_STARTUP_CWD") };
+
+    wait_for_socket(
+        &named_session_socket(&config_home, "clean"),
+        Duration::from_secs(5),
+    );
+
+    let list = run_named_cli_json(
+        &config_home,
+        &runtime_dir,
+        &["--session", "clean", "workspace", "list"],
+    );
+    let workspaces = list["result"]["workspaces"].as_array().unwrap();
+
+    assert!(
+        workspaces.is_empty(),
+        "a server spawned from a herdr pane still starts empty, got {workspaces:?}"
+    );
+}
+
 #[test]
 fn named_sessions_use_separate_servers_and_workspace_state() {
     let base = unique_test_dir();
@@ -389,7 +428,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 20"),
+        full_stdout.contains("  protocol: 22"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -422,7 +461,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 20"),
+        server_stdout.contains("protocol: 22"),
         "stdout: {server_stdout}"
     );
 
@@ -434,7 +473,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 20"),
+        client_stdout.contains("protocol: 22"),
         "stdout: {client_stdout}"
     );
     assert!(
@@ -444,7 +483,7 @@ fn status_commands_report_client_and_server_versions() {
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(full_json["client"]["protocol"], 20);
+    assert_eq!(full_json["client"]["protocol"], 22);
     assert_eq!(full_json["server"]["status"], "running");
     assert_eq!(full_json["server"]["running"], true);
     assert_eq!(full_json["server"]["compatible"], true);
@@ -458,12 +497,12 @@ fn status_commands_report_client_and_server_versions() {
     let server_json = run_cli_json(&socket_path, &["status", "server", "--json"]);
     assert_eq!(server_json["status"], "running");
     assert_eq!(server_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(server_json["protocol"], 20);
+    assert_eq!(server_json["protocol"], 22);
     assert_eq!(server_json["compatible"], true);
 
     let client_json = run_cli_json(&socket_path, &["status", "client", "--json"]);
     assert_eq!(client_json["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(client_json["protocol"], 20);
+    assert_eq!(client_json["protocol"], 22);
     assert!(client_json["binary"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));

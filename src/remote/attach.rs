@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use interprocess::local_socket::traits::Listener as _;
 #[cfg(windows)]
@@ -31,6 +31,24 @@ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
+#[cfg(unix)]
+const PEER_SSH_KEY_NAME: &str = "peer_id_ed25519";
+#[cfg(unix)]
+const PEER_SSH_KEY_COMMENT_PREFIX: &str = "herdr-peer";
+#[cfg(unix)]
+/// The comment every herdr release before per-client comments wrote.
+const PEER_SSH_LEGACY_KEY_COMMENT: &str = "herdr-peer";
+#[cfg(unix)]
+const PEER_SSH_IDENTITY_COMPONENT_LIMIT: usize = 64;
+/// How long ssh may spend on the TCP connect to a peer.
+///
+/// Without it ssh inherits the OS default, which on Linux is roughly two
+/// minutes of SYN retries. A peer is dialed by a server that reconnects on its
+/// own and is joined during shutdown, so waiting out the kernel there is never
+/// the right answer — the host is either up or worth retrying later.
+const PEER_SSH_CONNECT_TIMEOUT_SECS: u32 = 10;
+/// How often an interruptible ssh wait rechecks whether it should still wait.
+const PEER_SSH_CANCEL_POLL: Duration = Duration::from_millis(100);
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
@@ -192,10 +210,54 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         prepared_remote.remote_herdr,
         local_socket.clone(),
         session_name,
+        BridgeSocket::Client,
         remote_ssh.options(),
     )?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
+}
+
+/// Which of a server's two sockets a bridge carries.
+///
+/// Both are needed to federate with a remote server: the JSON API socket for
+/// identification, workspace enumeration and events, and the client protocol
+/// socket for terminal frames. They are separate listeners, so each needs its
+/// own bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BridgeSocket {
+    /// The client protocol socket.
+    Client,
+    /// The newline-delimited JSON API socket.
+    // Peer federation is Unix-only for now: the bridge that opens this socket
+    // and the remote host side that serves it both live behind `cfg(unix)`.
+    #[cfg_attr(windows, allow(dead_code))]
+    Api,
+}
+
+impl BridgeSocket {
+    fn subcommand(self) -> &'static str {
+        match self {
+            Self::Client => "remote-client-bridge",
+            Self::Api => "remote-api-bridge",
+        }
+    }
+
+    // Only the Unix remote host side reads these; see `Api` above.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(super) fn local_path(self) -> PathBuf {
+        match self {
+            Self::Client => crate::server::socket_paths::client_socket_path(),
+            Self::Api => crate::api::socket_path(),
+        }
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(super) fn describe(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Api => "API",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,6 +482,30 @@ impl Drop for ManagedSshConfig {
 struct RemoteSsh {
     target: String,
     managed_config: Option<ManagedSshConfig>,
+    /// Extra identity to offer, used only by the peer path.
+    ///
+    /// Passed as `-i` rather than written into the managed ssh config so it
+    /// still applies when `remote.manage_ssh_config` is off and there is no
+    /// managed config to write into.
+    identity: Option<PathBuf>,
+    /// Refuse anything interactive, used only by the peer path.
+    ///
+    /// A peer is dialed by the server, which has no terminal, so a prompt there
+    /// can only fail — slowly, after ssh exhausts its password attempts, and
+    /// with three copies of the same refusal in the reported error. Declaring
+    /// that up front turns it into one clean failure that
+    /// [`ssh_failed_to_authenticate`] can classify.
+    batch: bool,
+    /// Whether the connection these commands serve is still wanted, used only
+    /// by the peer path.
+    ///
+    /// A peer's thread is joined during shutdown, so every ssh it is parked on
+    /// has to be abandonable. [`PEER_SSH_CONNECT_TIMEOUT_SECS`] bounds the
+    /// common case, but it covers the TCP connect alone — a host that answers
+    /// and then stalls in the handshake is bounded by nothing. Set, the waits
+    /// below kill their child the moment this turns false; unset, they wait the
+    /// way an interactive `herdr --remote` should.
+    running: Option<Arc<AtomicBool>>,
 }
 
 impl RemoteSsh {
@@ -437,7 +523,35 @@ impl RemoteSsh {
         Self {
             target,
             managed_config,
+            identity: None,
+            batch: false,
+            running: None,
         }
+    }
+
+    #[cfg(unix)]
+    /// A session for reaching a peer server.
+    ///
+    /// Identical to [`Self::new`] except that it offers herdr's own peer key
+    /// when one has been set up. The key is only offered when it exists, so a
+    /// user whose existing agent or default key already works never has herdr's
+    /// key pushed into their authentication attempts.
+    fn for_peer(target: String, manage_ssh_config: bool) -> Self {
+        let mut ssh = Self::new(target, manage_ssh_config);
+        let key = peer_ssh_key_path();
+        if key.is_file() {
+            ssh.identity = Some(key);
+        }
+        ssh.batch = true;
+        ssh
+    }
+
+    #[cfg(unix)]
+    /// Ties these commands to the lifetime of a peer connection, so shutdown
+    /// does not have to wait for ssh to notice the peer is gone.
+    fn cancelled_with(mut self, running: Arc<AtomicBool>) -> Self {
+        self.running = Some(running);
+        self
     }
 
     fn target(&self) -> &str {
@@ -457,6 +571,21 @@ impl RemoteSsh {
     fn base_command(&self) -> Command {
         let mut command = Command::new("ssh");
         apply_managed_ssh_options(&mut command, self.options());
+        if let Some(identity) = &self.identity {
+            command.arg("-i").arg(identity);
+        }
+        if self.batch {
+            // Both restrictions belong to the peer path: it is dialed by a
+            // headless server that cannot answer a prompt and must not sit on
+            // an unreachable host. Passed on the command line rather than
+            // written into the managed ssh config so they still apply when
+            // `remote.manage_ssh_config` is off and there is no config to write.
+            command
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg(format!("ConnectTimeout={PEER_SSH_CONNECT_TIMEOUT_SECS}"));
+        }
         command
     }
 
@@ -477,13 +606,64 @@ impl RemoteSsh {
                 "ssh bootstrap stdin missing",
             ))
         };
-        let output = child.wait_with_output()?;
+        let output = self.wait_for_output(child)?;
         write_result?;
         Ok(output)
     }
 
     fn user_shell_output(&self, command: &str) -> io::Result<Output> {
-        self.command().arg(command).output()
+        let child = self
+            .command()
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        self.wait_for_output(child)
+    }
+
+    /// Collects `child`'s output, giving up on it if this connection stops
+    /// being wanted while it runs.
+    ///
+    /// Only the peer path sets [`Self::running`]; everything else waits exactly
+    /// as [`Child::wait_with_output`] does. The pipes are drained on their own
+    /// threads even while polling, because a child that fills a pipe buffer
+    /// blocks until someone reads it — polling for exit without reading would
+    /// reintroduce the hang from the other end.
+    fn wait_for_output(&self, mut child: Child) -> io::Result<Output> {
+        let Some(running) = self.running.as_ref() else {
+            return child.wait_with_output();
+        };
+
+        let stdout = child.stdout.take().map(spawn_pipe_reader);
+        let stderr = child.stderr.take().map(spawn_pipe_reader);
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if !running.load(Ordering::Relaxed) {
+                tracing::debug!(target = %self.target, "abandoning ssh command; peer connection stopped");
+                // A kill can only fail because the child already exited, which
+                // is the outcome being asked for either way.
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            thread::sleep(PEER_SSH_CANCEL_POLL);
+        };
+
+        // The readers end when their pipe closes, which the kill above
+        // guarantees. A panicked reader costs its stream, not the wait.
+        let collect = |reader: Option<JoinHandle<Vec<u8>>>| {
+            reader
+                .map(|reader| reader.join().unwrap_or_default())
+                .unwrap_or_default()
+        };
+        Ok(Output {
+            status,
+            stdout: collect(stdout),
+            stderr: collect(stderr),
+        })
     }
 
     fn install_herdr(&self, remote_herdr: &RemoteHerdr, source_path: &Path) -> io::Result<()> {
@@ -603,6 +783,15 @@ impl Drop for RemoteSsh {
     }
 }
 
+/// Reads a child's pipe to end on its own thread.
+fn spawn_pipe_reader<R: io::Read + Send + 'static>(mut pipe: R) -> JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
 fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshOptions>) {
     let Some(options) = options else {
         return;
@@ -708,9 +897,31 @@ fn prepare_remote_herdr(
     })
 }
 
+/// Whether ssh gave up because it could not authenticate.
+///
+/// Retrying this cannot help: the server has no terminal, so the credential it
+/// was missing on the first attempt is missing on every attempt. Detected from
+/// ssh's own words rather than the exit status alone, because 255 is also what
+/// an unreachable host produces and that one *is* worth retrying.
+fn ssh_failed_to_authenticate(output: &Output) -> bool {
+    if output.status.code() != Some(255) {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("permission denied")
+        || stderr.contains("too many authentication failures")
+        || stderr.contains("no supported authentication methods")
+}
+
 fn detect_remote_platform(ssh: &RemoteSsh) -> io::Result<RemotePlatform> {
     let output = ssh.sh_output("uname -s\nuname -m\n")?;
     if !output.status.success() {
+        if ssh_failed_to_authenticate(&output) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                command_failed("ssh authentication failed", &output).to_string(),
+            ));
+        }
         return Err(command_failed("remote platform detection failed", &output));
     }
 
@@ -1614,13 +1825,18 @@ fn confirm_remote_install(
     Ok(())
 }
 
-fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+fn remote_bridge_command(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    socket: BridgeSocket,
+) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
     }
-    command.push_str(" remote-client-bridge");
+    command.push(' ');
+    command.push_str(socket.subcommand());
     command
 }
 
@@ -1671,6 +1887,7 @@ impl SshStdioBridge {
         remote_herdr: RemoteHerdr,
         local_socket: PathBuf,
         session_name: String,
+        socket: BridgeSocket,
         ssh_options: Option<&ManagedSshOptions>,
     ) -> io::Result<Self> {
         crate::ipc::prepare_socket_path(&local_socket, |path| {
@@ -1693,7 +1910,16 @@ impl SshStdioBridge {
         let thread_stop = Arc::clone(&should_stop);
         let thread_ssh_options = ssh_options.cloned();
         let thread = thread::spawn(move || {
+            // Each accepted connection gets its own ssh child and its own
+            // thread. A federating server holds a long-lived event
+            // subscription and still has to issue requests and open terminals
+            // over the same bridge, so serving connections one at a time would
+            // deadlock everything behind the subscription.
+            let mut connections: Vec<JoinHandle<()>> = Vec::new();
+
             while !thread_stop.load(Ordering::Acquire) {
+                connections.retain(|connection| !connection.is_finished());
+
                 match listener.accept() {
                     Ok(stream) => {
                         let stream = match prepare_remote_bridge_stream(stream) {
@@ -1706,15 +1932,30 @@ impl SshStdioBridge {
                                 continue;
                             }
                         };
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_herdr,
-                            &session_name,
-                            thread_ssh_options.as_ref(),
-                            &thread_stop,
-                        ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
+                        let target = target.clone();
+                        let remote_herdr = remote_herdr.clone();
+                        let session_name = session_name.clone();
+                        let ssh_options = thread_ssh_options.clone();
+                        let connection_stop = Arc::clone(&thread_stop);
+                        match thread::Builder::new()
+                            .name("herdr-bridge-conn".to_string())
+                            .spawn(move || {
+                                if let Err(err) = bridge_connection(
+                                    stream,
+                                    &target,
+                                    &remote_herdr,
+                                    &session_name,
+                                    socket,
+                                    ssh_options.as_ref(),
+                                    &connection_stop,
+                                ) {
+                                    eprintln!("herdr: remote bridge failed: {err}");
+                                }
+                            }) {
+                            Ok(connection) => connections.push(connection),
+                            Err(err) => {
+                                eprintln!("herdr: remote bridge could not spawn connection: {err}")
+                            }
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -1725,6 +1966,13 @@ impl SshStdioBridge {
                         break;
                     }
                 }
+            }
+
+            // Connections cut themselves short once the stop flag is set, so
+            // joining them here reaps every ssh child without waiting on the
+            // remote side to finish.
+            for connection in connections {
+                let _ = connection.join();
             }
         });
 
@@ -1757,6 +2005,621 @@ impl Drop for SshStdioBridge {
     }
 }
 
+#[cfg(unix)]
+/// Local name of an ssh peer's bridged JSON API socket.
+const PEER_API_SOCKET_NAME: &str = "api.sock";
+#[cfg(unix)]
+/// Local name of an ssh peer's bridged client protocol socket. Must stay what
+/// [`crate::server::socket_paths::derive_client_socket_from_api_socket`] derives
+/// from [`PEER_API_SOCKET_NAME`]; a test below pins that.
+const PEER_CLIENT_SOCKET_NAME: &str = "api-client.sock";
+
+#[cfg(unix)]
+/// Why an ssh peer bridge could not be stood up.
+pub(crate) enum PeerSshBridgeError {
+    /// The remote could not be reached. Retrying may work.
+    Unreachable(String),
+    /// The remote answered but cannot be federated with as configured.
+    /// Retrying would only hide the misconfiguration.
+    Unsupported(String),
+}
+
+#[cfg(unix)]
+/// Makes a remote herdr server reachable as if it were listening locally.
+///
+/// Federating with a peer needs both of its sockets — the JSON API for
+/// identity, workspaces and events, and the client protocol for terminal
+/// frames — so this owns one bridge each. The two local sockets are named the
+/// way a server names its own pair, so everything downstream derives the client
+/// socket from the API socket and treats an ssh peer exactly like a socket-path
+/// peer.
+pub(crate) struct PeerSshBridge {
+    api_socket: PathBuf,
+    /// Held only for their `Drop`. Declaration order is load-bearing: both
+    /// bridges must stop before the ssh session carrying them is torn down, and
+    /// both sockets must be gone before their directory is removed.
+    _api_bridge: SshStdioBridge,
+    _client_bridge: SshStdioBridge,
+    _ssh: RemoteSsh,
+    _socket_dir: PrivateDir,
+}
+
+#[cfg(unix)]
+impl PeerSshBridge {
+    /// Local socket the peer's JSON API is reachable on.
+    pub(crate) fn api_socket(&self) -> &Path {
+        &self.api_socket
+    }
+}
+
+/// Stands up a bridge to the herdr server at `destination`.
+///
+/// Blocking and ssh-bound: several round trips before it returns. Callers must
+/// run it off the event loop.
+///
+/// `running` is the caller's own stop flag. Setting it up costs one ssh round
+/// trip per step and the calling thread is joined during shutdown, so the flag
+/// is carried into every one of them rather than checked between them: the wait
+/// that has to end is the one already in progress.
+#[cfg(unix)]
+pub(crate) fn start_peer_ssh_bridge(
+    destination: &str,
+    session: Option<&str>,
+    running: Arc<AtomicBool>,
+) -> Result<PeerSshBridge, PeerSshBridgeError> {
+    let session_name = session
+        .unwrap_or(crate::session::DEFAULT_SESSION_NAME)
+        .to_string();
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let ssh =
+        RemoteSsh::for_peer(destination.to_string(), manage_ssh_config).cancelled_with(running);
+    let remote_herdr = resolve_peer_remote_herdr(&ssh)?;
+
+    let socket_dir = PrivateDir(private_peer_socket_dir().map_err(|err| {
+        PeerSshBridgeError::Unreachable(format!("could not create peer socket directory: {err}"))
+    })?);
+    let api_socket = socket_dir.path().join(PEER_API_SOCKET_NAME);
+    let client_socket =
+        crate::server::socket_paths::derive_client_socket_from_api_socket(&api_socket);
+
+    let start = |local_socket: PathBuf, socket: BridgeSocket| {
+        SshStdioBridge::start(
+            destination.to_string(),
+            remote_herdr.clone(),
+            local_socket,
+            session_name.clone(),
+            socket,
+            ssh.options(),
+        )
+        .map_err(|err| {
+            PeerSshBridgeError::Unreachable(format!(
+                "could not start peer {} bridge: {err}",
+                socket.describe()
+            ))
+        })
+    };
+
+    let api_bridge = start(api_socket.clone(), BridgeSocket::Api)?;
+    let client_bridge = start(client_socket, BridgeSocket::Client)?;
+
+    Ok(PeerSshBridge {
+        api_socket,
+        _api_bridge: api_bridge,
+        _client_bridge: client_bridge,
+        _ssh: ssh,
+        _socket_dir: socket_dir,
+    })
+}
+
+#[cfg(unix)]
+fn private_peer_socket_dir() -> io::Result<PathBuf> {
+    private_runtime_dir("herdr-peer", PEER_CLIENT_SOCKET_NAME)
+}
+
+#[cfg(unix)]
+/// Finds a remote herdr this build can federate with.
+///
+/// Unlike `herdr --remote`, this never installs or replaces anything: the
+/// server doing the federating is headless and cannot ask anyone to approve
+/// writing a binary to another machine. A missing or mismatched remote build is
+/// therefore a configuration problem to report, not something to fix silently.
+fn resolve_peer_remote_herdr(ssh: &RemoteSsh) -> Result<RemoteHerdr, PeerSshBridgeError> {
+    // An unsupported remote platform lands here as `Unreachable` and so retries
+    // forever with its reason showing. That is worth accepting rather than
+    // pattern-matching on this error's text to reclassify it.
+    //
+    // An authentication failure is the exception, and it is reported by kind
+    // rather than by text: the server has no terminal, so whatever ssh wanted
+    // typed will still be missing on every retry. Spinning on it for the rest
+    // of the peer's life only buries the reason.
+    let platform = detect_remote_platform(ssh).map_err(|err| {
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            PeerSshBridgeError::Unsupported(format!(
+                "{err}; run `herdr peer setup-ssh {}` once from a terminal to install a key",
+                shell_quote(ssh.target())
+            ))
+        } else {
+            PeerSshBridgeError::Unreachable(err.to_string())
+        }
+    })?;
+
+    let default = RemoteHerdr::for_platform(platform);
+    let mut candidates = remote_binary_candidates(ssh, &default)
+        .map_err(|err| PeerSshBridgeError::Unreachable(err.to_string()))?;
+    push_if_new_remote_binary_candidate(&mut candidates, default);
+
+    for candidate in &candidates {
+        match remote_binary_matches(ssh, candidate) {
+            Ok(true) => return Ok(candidate.clone()),
+            Ok(false) => {}
+            Err(err) => {
+                return Err(PeerSshBridgeError::Unreachable(format!(
+                    "remote herdr version check failed: {err}"
+                )))
+            }
+        }
+    }
+
+    Err(PeerSshBridgeError::Unsupported(format!(
+        "no herdr {} speaking protocol {CURRENT_PROTOCOL} found on {}; run `herdr --remote {}` once to install a matching build",
+        current_version(),
+        ssh.target(),
+        shell_quote(ssh.target()),
+    )))
+}
+
+#[cfg(unix)]
+/// Makes sure `destination` has a herdr this build can federate with,
+/// installing one interactively if it does not.
+///
+/// The server refuses to install ([`resolve_peer_remote_herdr`]) because it
+/// cannot ask anyone to approve writing a binary to another machine. The CLI
+/// can, so it reuses `herdr --remote`'s own preparation rather than sending the
+/// user away to run that command and come back.
+///
+/// Deliberately stops at the binary: [`ensure_remote_server_ready`] is not
+/// called, because the peer bridge boots the remote server itself and
+/// `identify()` already gates protocol.
+pub(crate) fn ensure_peer_remote_binary(destination: &str) -> io::Result<()> {
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let ssh = RemoteSsh::for_peer(destination.to_string(), manage_ssh_config);
+    prepare_remote_herdr(&ssh, false)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Where herdr keeps the key it dials peer servers with.
+fn peer_ssh_key_path() -> PathBuf {
+    crate::config::config_dir().join(PEER_SSH_KEY_NAME)
+}
+
+#[cfg(unix)]
+fn peer_ssh_public_key_path() -> PathBuf {
+    peer_ssh_key_path().with_extension("pub")
+}
+
+/// The `authorized_keys` comment that identifies this client's peer key.
+///
+/// A peer target keeps herdr's key until something removes it, and the only
+/// thing that can remove it is a later setup run from the same client. That
+/// makes the comment the identity: it has to name the client rather than the
+/// key, so a regenerated key replaces its own predecessor instead of stacking
+/// another entry, and it has to live outside the config directory so wiping
+/// that directory does not also lose the ability to find what it installed.
+///
+/// The build's directory name is part of it because a debug build keeps its
+/// state in `herdr-dev`; treating the two as one client would have each evict
+/// the other's key on the same machine.
+#[cfg(unix)]
+fn peer_ssh_key_comment() -> String {
+    format!(
+        "{PEER_SSH_KEY_COMMENT_PREFIX} {}/{}@{}",
+        crate::config::app_dir_name(),
+        local_user_name(),
+        local_host_name()
+    )
+}
+
+#[cfg(unix)]
+fn local_user_name() -> String {
+    let name = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    sanitized_identity_component(&name, "user")
+}
+
+#[cfg(unix)]
+fn local_host_name() -> String {
+    let from_command = Command::new("hostname")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .unwrap_or_default();
+    let name = if from_command.trim().is_empty() {
+        fs::read_to_string("/etc/hostname").unwrap_or_default()
+    } else {
+        from_command
+    };
+
+    sanitized_identity_component(name.lines().next().unwrap_or_default(), "host")
+}
+
+#[cfg(unix)]
+/// Keeps a comment to characters that survive both `authorized_keys` line
+/// splitting and `awk -v`, which would otherwise read a backslash as the start
+/// of an escape.
+fn sanitized_identity_component(value: &str, fallback: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+        .take(PEER_SSH_IDENTITY_COMPONENT_LIMIT)
+        .collect();
+    if cleaned.is_empty() {
+        fallback.to_string()
+    } else {
+        cleaned
+    }
+}
+
+#[cfg(unix)]
+/// Whether ssh can reach `destination` with nobody watching.
+///
+/// This is the only question that matters for a peer. The server dials peers
+/// from a process with no controlling terminal, and ssh reads passwords and
+/// passphrases from `/dev/tty` rather than stdin, so anything that would prompt
+/// fails there with no way to say why — on the first connection and on every
+/// automatic reconnect after it. `BatchMode=yes` reproduces that restriction
+/// here, in a process that can still do something about the answer.
+fn peer_ssh_auth_works(destination: &str) -> bool {
+    let manage_ssh_config = crate::config::Config::load()
+        .config
+        .remote
+        .manage_ssh_config;
+    let ssh = RemoteSsh::for_peer(destination.to_string(), manage_ssh_config);
+    // `BatchMode=yes` and `ConnectTimeout` ride along on every peer command,
+    // which is exactly the restriction being probed for here.
+    let mut command = ssh.base_command();
+    command
+        .arg("-T")
+        .arg(destination)
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    matches!(command.status(), Ok(status) if status.success())
+}
+
+/// Makes sure `destination` can be reached without a prompt, installing a key
+/// interactively if it cannot.
+///
+/// Runs in the CLI process on purpose: that is the only part of herdr that has
+/// a terminal for ssh to prompt against. The server never calls this.
+#[cfg(unix)]
+pub(crate) fn ensure_peer_ssh_ready(destination: &str, assume_yes: bool) -> io::Result<()> {
+    if peer_ssh_auth_works(destination) {
+        return Ok(());
+    }
+
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::other(format!(
+            "ssh cannot reach {destination} without a prompt, and herdr's server has no terminal to prompt from; run `herdr peer setup-ssh {}` from an interactive terminal once",
+            shell_quote(destination)
+        )));
+    }
+
+    eprintln!("ssh could not reach {destination} without asking for something interactively.");
+    eprintln!(
+        "herdr's server dials peers with no terminal attached, so it cannot answer a password"
+    );
+    eprintln!(
+        "prompt — not for the first connection, and not for the reconnects it makes on its own."
+    );
+
+    let key = peer_ssh_key_path();
+    if !assume_yes
+        && !confirm_peer_setup(&format!(
+            "Install herdr's ssh key ({}) on {destination}? [Y/n] ",
+            key.display()
+        ))?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "ssh key setup declined",
+        ));
+    }
+
+    ensure_peer_ssh_key()?;
+    install_peer_ssh_key(destination)?;
+
+    if !peer_ssh_auth_works(destination) {
+        return Err(io::Error::other(format!(
+            "installed herdr's ssh key on {destination}, but ssh still cannot connect without a prompt"
+        )));
+    }
+
+    eprintln!("ssh key installed; {destination} can now be reached without a prompt.");
+    Ok(())
+}
+
+/// Creates herdr's peer key if it is missing.
+///
+/// The key deliberately has no passphrase. A peer view reconnects on its own
+/// for as long as the peer might come back, from a server process that may have
+/// been started by a service manager and inherited no ssh-agent — a key that
+/// needs anything unlocked would turn every one of those reconnects into the
+/// same silent failure this whole path exists to remove.
+#[cfg(unix)]
+fn ensure_peer_ssh_key() -> io::Result<PathBuf> {
+    let key = peer_ssh_key_path();
+    if key.is_file() {
+        return Ok(key);
+    }
+
+    if let Some(parent) = key.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let output = Command::new("ssh-keygen")
+        .arg("-t")
+        .arg("ed25519")
+        .arg("-N")
+        .arg("")
+        .arg("-C")
+        .arg(peer_ssh_key_comment())
+        .arg("-f")
+        .arg(&key)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| io::Error::new(err.kind(), format!("could not run ssh-keygen: {err}")))?;
+    if !output.status.success() {
+        return Err(command_failed(
+            "could not generate herdr's ssh key",
+            &output,
+        ));
+    }
+
+    eprintln!("generated {}", key.display());
+    Ok(key)
+}
+
+/// The `authorized_keys` line to install for herdr's peer key.
+///
+/// The comment stored on disk is ignored in favour of [`peer_ssh_key_comment`].
+/// Keys generated by earlier herdr versions carry a comment that names no
+/// client, so reading it back would leave those installs unable to recognise
+/// their own entry on the target forever.
+#[cfg(unix)]
+fn peer_ssh_key_line() -> io::Result<String> {
+    let path = peer_ssh_public_key_path();
+    let text = fs::read_to_string(&path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("could not read {}: {err}", path.display()),
+        )
+    })?;
+
+    let mut fields = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .split_whitespace();
+    let (Some(key_type), Some(blob)) = (fields.next(), fields.next()) else {
+        return Err(io::Error::other(format!(
+            "{} does not hold an ssh public key",
+            path.display()
+        )));
+    };
+
+    Ok(format!("{key_type} {blob} {}", peer_ssh_key_comment()))
+}
+
+/// Installs herdr's public key on `destination`.
+///
+/// `ssh-copy-id` is deliberately not used. It can only append, so it cannot
+/// retire the entry a previous key of this client left behind, and pairing it
+/// with a separate cleanup connection would ask the human for their password
+/// twice. The script below does both in the one connection, and handles the
+/// remote directory permissions `ssh-copy-id` was otherwise wanted for.
+///
+/// Stdout and stderr are inherited so ssh's password prompt reaches the
+/// terminal this process is attached to. This is the one moment a human types
+/// their password; everything afterwards authenticates with the key.
+#[cfg(unix)]
+fn install_peer_ssh_key(destination: &str) -> io::Result<()> {
+    install_peer_ssh_key_over_ssh(destination, &peer_ssh_key_line()?)
+}
+
+#[cfg(unix)]
+/// Runs the install script on the peer.
+///
+/// The script goes over stdin while stdout and stderr stay inherited: ssh
+/// reads a password from `/dev/tty`, not stdin, so piping the script in does
+/// not cost the prompt its terminal.
+fn install_peer_ssh_key_over_ssh(destination: &str, key_line: &str) -> io::Result<()> {
+    let mut child = Command::new("ssh")
+        .arg("-T")
+        .arg(destination)
+        .arg("/bin/sh -s")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| io::Error::new(err.kind(), format!("could not run ssh: {err}")))?;
+
+    let write_result = if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(peer_ssh_key_install_script(key_line.trim()).as_bytes())
+            .and_then(|()| stdin.flush())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "ssh key install stdin missing",
+        ))
+    };
+    let status = child.wait()?;
+    write_result?;
+
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "could not install herdr's ssh key on {destination}: {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+/// Replaces this client's entry in `authorized_keys` rather than adding one.
+///
+/// Every line herdr has ever installed for this client is dropped before the
+/// current key is written back, so a key that was regenerated — after the
+/// config directory was cleared, say — retires the entry its predecessor left
+/// rather than stranding it there with nothing able to remove it later.
+///
+/// What it will not touch is anything it cannot prove it owns. Lines carrying
+/// options are left alone even when their comment matches, because herdr never
+/// writes options and a line that has them was edited by hand. Another
+/// machine's herdr key carries that machine's comment and survives untouched;
+/// only [`PEER_SSH_LEGACY_KEY_COMMENT`], which no herdr version wrote from more
+/// than one client without also being replaceable this way, is claimed on sight
+/// so that upgrading migrates the old entry instead of doubling it.
+///
+/// The file is rebuilt beside itself and moved into place, so a connection that
+/// drops midway leaves the original `authorized_keys` intact rather than a
+/// half-written one.
+fn peer_ssh_key_install_script(key_line: &str) -> String {
+    let blob = key_line.split_whitespace().nth(1).unwrap_or_default();
+    let comment = key_line
+        .split_whitespace()
+        .skip(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!(
+        "set -eu\n\
+         umask 077\n\
+         mkdir -p \"$HOME/.ssh\"\n\
+         chmod 700 \"$HOME/.ssh\"\n\
+         auth=\"$HOME/.ssh/authorized_keys\"\n\
+         tmp=\"$auth.herdr.$$\"\n\
+         trap 'rm -f \"$tmp\"' EXIT\n\
+         key={key}\n\
+         blob={blob}\n\
+         comment={comment}\n\
+         legacy={legacy}\n\
+         touch \"$auth\"\n\
+         awk -v blob=\"$blob\" -v comment=\"$comment\" -v legacy=\"$legacy\" '\n\
+         $1 !~ /^(ssh-|ecdsa-|sk-)/ {{ print; next }}\n\
+         $2 == blob {{ next }}\n\
+         {{\n\
+         found = \"\";\n\
+         for (i = 3; i <= NF; i++) found = found (i > 3 ? \" \" : \"\") $i;\n\
+         if (found == comment || found == legacy) next;\n\
+         print;\n\
+         }}\n\
+         ' \"$auth\" > \"$tmp\"\n\
+         printf '%s\\n' \"$key\" >> \"$tmp\"\n\
+         chmod 600 \"$tmp\"\n\
+         mv \"$tmp\" \"$auth\"\n",
+        key = shell_quote(key_line),
+        blob = shell_quote(blob),
+        comment = shell_quote(&comment),
+        legacy = shell_quote(PEER_SSH_LEGACY_KEY_COMMENT),
+    )
+}
+
+#[cfg(unix)]
+/// Same shape as [`confirm_remote_install`]'s prompt, defaulting to yes.
+fn confirm_peer_setup(prompt: &str) -> io::Result<bool> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(!matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "n" | "no"
+    ))
+}
+
+#[cfg(unix)]
+/// A private directory removed once everything inside it is gone.
+struct PrivateDir(PathBuf);
+
+#[cfg(unix)]
+impl PrivateDir {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Creates a fresh user-only (`0700`) directory whose longest child will be
+/// `longest_child`, returning its path.
+///
+/// Using a private directory created with fail-if-exists semantics — rather
+/// than a predictable file in the world-writable temp dir — stops a local user
+/// from pre-planting a symlink or world-writable file that herdr would write
+/// and then read back (`ssh -F`) or connect to.
+///
+/// `longest_child` is what the socket-path length budget is checked against, so
+/// a base directory that cannot fit the eventual socket is skipped before
+/// anything is created.
+#[cfg(unix)]
+fn private_runtime_dir(prefix: &str, longest_child: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut bases = vec![std::env::temp_dir()];
+    let short_tmp = PathBuf::from("/tmp");
+    if bases.first() != Some(&short_tmp) {
+        bases.push(short_tmp);
+    }
+
+    let mut last_error = None;
+    for base in bases {
+        for attempt in 0..100 {
+            let dir = base.join(format!("{prefix}-{}-{attempt}", std::process::id()));
+            if !fits_unix_socket_path(&dir.join(longest_child)) {
+                continue;
+            }
+            match fs::DirBuilder::new().mode(0o700).create(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    last_error = Some(err);
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("failed to create private herdr directory under {prefix}"),
+        )
+    }))
+}
+
+/// Quotes a path for an ssh_config `Include` so a path containing spaces (or
+/// glob metacharacters) is treated as one literal token instead of being split
+/// or expanded by ssh — otherwise the user's config might not be Included and
+/// herdr's fallback would wrongly take effect.
 fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
@@ -1819,15 +2682,17 @@ fn bridge_connection(
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
+    socket: BridgeSocket,
     ssh_options: Option<&ManagedSshOptions>,
-    _bridge_stop: &Arc<AtomicBool>,
+    should_stop: &AtomicBool,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_bridge_command(remote_herdr, session_name, socket));
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1844,7 +2709,7 @@ fn bridge_connection(
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
     let mut stream_to_child = stream.try_clone()?;
-    let mut child_to_stream = stream;
+    let mut child_to_stream = stream.try_clone()?;
 
     let upload = thread::spawn(move || {
         let _ = copy_flush(&mut stream_to_child, &mut child_stdin);
@@ -1854,11 +2719,30 @@ fn bridge_connection(
         let _ = crate::ipc::shutdown_local_stream_write(&child_to_stream);
     });
 
-    let status = child.wait()?;
+    // Polled rather than a blocking wait so a stopping bridge can cut this
+    // connection short. A terminal attach streams for as long as its pane is
+    // open, so waiting for the remote side to finish on its own would pin the
+    // bridge's teardown — and whoever is joining it — to the pane's lifetime.
+    let status = loop {
+        if should_stop.load(Ordering::Acquire) {
+            let _ = child.kill();
+        }
+        match child.try_wait()? {
+            Some(status) => break status,
+            None => thread::sleep(BRIDGE_ACCEPT_POLL),
+        }
+    };
+
+    // Releases both copy threads. `upload` is parked reading the local socket
+    // whenever the local peer is idle, so without this the joins below would
+    // wait on traffic that is never coming.
+    let _ = crate::ipc::shutdown_local_stream(&stream);
     let _ = upload.join();
     let _ = download.join();
 
-    if status.success() {
+    // A killed child reports failure; that is this bridge shutting down, not a
+    // connection that broke.
+    if status.success() || should_stop.load(Ordering::Acquire) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -1874,6 +2758,7 @@ fn bridge_connection(
     target: &str,
     remote_herdr: &RemoteHerdr,
     session_name: &str,
+    socket: BridgeSocket,
     ssh_options: Option<&ManagedSshOptions>,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
@@ -1882,7 +2767,7 @@ fn bridge_connection(
     command
         .arg("-T")
         .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name))
+        .arg(remote_bridge_command(remote_herdr, session_name, socket))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -2153,7 +3038,7 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     crate::platform::remote_bridge_endpoint_path(&readable_name, &short_name)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 fn fits_unix_socket_path(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
@@ -2190,6 +3075,333 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    fn ssh_output(code: i32, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn ssh_permission_denied_is_an_auth_failure() {
+        assert!(ssh_failed_to_authenticate(&ssh_output(
+            255,
+            "spark343@host: Permission denied (publickey,password)."
+        )));
+        assert!(ssh_failed_to_authenticate(&ssh_output(
+            255,
+            "Received disconnect from host: Too many authentication failures"
+        )));
+    }
+
+    /// 255 is also what an unreachable host produces, and that one is worth
+    /// retrying — so the exit status alone must not classify.
+    #[test]
+    fn ssh_unreachable_is_not_an_auth_failure() {
+        assert!(!ssh_failed_to_authenticate(&ssh_output(
+            255,
+            "ssh: connect to host brainiac port 22: No route to host"
+        )));
+        assert!(!ssh_failed_to_authenticate(&ssh_output(
+            255,
+            "ssh: Could not resolve hostname nope: Name or service not known"
+        )));
+    }
+
+    /// A remote command that fails on its own terms is not an ssh problem.
+    #[test]
+    fn a_failing_remote_command_is_not_an_auth_failure() {
+        assert!(!ssh_failed_to_authenticate(&ssh_output(
+            1,
+            "uname: command not found"
+        )));
+    }
+
+    /// The key text reaches the remote shell as one quoted word, so a key
+    /// comment containing spaces or quotes cannot break out of the assignment.
+    #[test]
+    fn key_install_script_quotes_the_key() {
+        let script = peer_ssh_key_install_script("ssh-ed25519 AAAA it's mine");
+        assert!(script.contains(r#"key='ssh-ed25519 AAAA it'\''s mine'"#));
+    }
+
+    /// A client is named by where it runs, not by the key it currently holds,
+    /// so the comment still matches after the key is regenerated.
+    #[test]
+    fn key_comment_names_the_client() {
+        let comment = peer_ssh_key_comment();
+        assert!(comment.starts_with("herdr-peer "));
+        assert!(comment.contains(crate::config::app_dir_name()));
+        assert!(comment.contains('@'));
+    }
+
+    /// `awk -v` reads a backslash in a value as an escape, and a space would
+    /// split the comment across `authorized_keys` fields.
+    #[test]
+    fn identity_components_drop_characters_that_would_break_the_script() {
+        assert_eq!(sanitized_identity_component("a b\\c'd", "fallback"), "abcd");
+        assert_eq!(sanitized_identity_component("  ", "fallback"), "fallback");
+        assert_eq!(
+            sanitized_identity_component("host.local-1_x", "f"),
+            "host.local-1_x"
+        );
+        assert_eq!(
+            sanitized_identity_component(&"a".repeat(200), "f").len(),
+            PEER_SSH_IDENTITY_COMPONENT_LIMIT
+        );
+    }
+
+    /// Runs the install script against a throwaway `$HOME` and reports the
+    /// `authorized_keys` it left behind.
+    fn run_key_install_script(name: &str, existing: &str, key_line: &str) -> String {
+        let home = std::env::temp_dir().join(format!(
+            "herdr-authorized-keys-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let ssh_dir = home.join(".ssh");
+        fs::create_dir_all(&ssh_dir).expect("temp ssh dir");
+        let authorized_keys = ssh_dir.join("authorized_keys");
+        if !existing.is_empty() {
+            fs::write(&authorized_keys, existing).expect("seed authorized_keys");
+        }
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(peer_ssh_key_install_script(key_line))
+            .env("HOME", &home)
+            .output()
+            .expect("run install script");
+        assert!(
+            output.status.success(),
+            "install script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let installed = fs::read_to_string(&authorized_keys).expect("read authorized_keys");
+        let _ = fs::remove_dir_all(&home);
+        installed
+    }
+
+    /// The whole point of the rewrite: a client that regenerated its key takes
+    /// the entry its previous key left with it instead of adding a second one.
+    #[test]
+    fn key_install_replaces_this_clients_previous_entry() {
+        let comment = peer_ssh_key_comment();
+        let installed = run_key_install_script(
+            "replaces-own",
+            &format!("ssh-ed25519 STALEKEY {comment}\n"),
+            &format!("ssh-ed25519 FRESHKEY {comment}"),
+        );
+
+        assert_eq!(installed, format!("ssh-ed25519 FRESHKEY {comment}\n"));
+    }
+
+    /// Upgrading migrates the entry older herdr versions wrote rather than
+    /// leaving it beside the new one with nothing able to remove it.
+    #[test]
+    fn key_install_claims_the_legacy_entry() {
+        let comment = peer_ssh_key_comment();
+        let installed = run_key_install_script(
+            "claims-legacy",
+            "ssh-ed25519 OLDHERDRKEY herdr-peer\n",
+            &format!("ssh-ed25519 FRESHKEY {comment}"),
+        );
+
+        assert_eq!(installed, format!("ssh-ed25519 FRESHKEY {comment}\n"));
+    }
+
+    /// Another machine's herdr key names that machine, and a hand-edited line
+    /// carries options herdr never writes. Neither is this client's to remove.
+    #[test]
+    fn key_install_leaves_entries_it_does_not_own() {
+        let comment = peer_ssh_key_comment();
+        let other_client = "ssh-ed25519 OTHERMACHINE herdr-peer herdr/someone@elsewhere";
+        let plain = "ssh-rsa UNRELATED me@laptop";
+        let restricted = "command=\"true\" ssh-ed25519 RESTRICTED herdr-peer";
+        let installed = run_key_install_script(
+            "keeps-others",
+            &format!("{other_client}\n{plain}\n{restricted}\n"),
+            &format!("ssh-ed25519 FRESHKEY {comment}"),
+        );
+
+        assert_eq!(
+            installed,
+            format!("{other_client}\n{plain}\n{restricted}\nssh-ed25519 FRESHKEY {comment}\n")
+        );
+    }
+
+    /// Re-running setup with the key already installed is a no-op, including
+    /// when an earlier run left it under a different comment.
+    #[test]
+    fn key_install_is_idempotent() {
+        let comment = peer_ssh_key_comment();
+        let key_line = format!("ssh-ed25519 FRESHKEY {comment}");
+
+        let once = run_key_install_script("idempotent-a", "", &key_line);
+        assert_eq!(once, format!("{key_line}\n"));
+
+        let twice = run_key_install_script("idempotent-b", &once, &key_line);
+        assert_eq!(twice, once);
+
+        let renamed = run_key_install_script(
+            "idempotent-c",
+            "ssh-ed25519 FRESHKEY renamed by hand\n",
+            &key_line,
+        );
+        assert_eq!(renamed, format!("{key_line}\n"));
+    }
+
+    /// A file that was never there is created rather than reported missing.
+    #[test]
+    fn key_install_creates_authorized_keys() {
+        let comment = peer_ssh_key_comment();
+        let installed =
+            run_key_install_script("creates", "", &format!("ssh-ed25519 FRESHKEY {comment}"));
+
+        assert_eq!(installed, format!("ssh-ed25519 FRESHKEY {comment}\n"));
+    }
+
+    /// The peer key rides as an explicit `-i` so it applies whether or not a
+    /// managed ssh config was written.
+    #[test]
+    fn peer_identity_is_passed_on_the_command_line() {
+        let mut ssh = RemoteSsh::new("host".to_string(), false);
+        assert!(!command_args(&ssh).iter().any(|arg| arg == "-i"));
+
+        ssh.identity = Some(PathBuf::from("/tmp/peer_id_ed25519"));
+        let args = command_args(&ssh);
+        let index = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("identity flag");
+        assert_eq!(args[index + 1], "/tmp/peer_id_ed25519");
+    }
+
+    /// The `--remote` path stays interactive: it runs in a terminal and a
+    /// password prompt there is something a human can actually answer.
+    #[test]
+    fn only_the_peer_path_refuses_prompts() {
+        let interactive = RemoteSsh::new("host".to_string(), false);
+        assert!(!command_args(&interactive)
+            .iter()
+            .any(|arg| arg == "BatchMode=yes"));
+
+        let mut peer = RemoteSsh::new("host".to_string(), false);
+        peer.batch = true;
+        assert!(command_args(&peer).iter().any(|arg| arg == "BatchMode=yes"));
+    }
+
+    /// Without this, ssh dialing a peer that has gone away waits out the OS
+    /// TCP timeout — around two minutes on Linux — and the server's shutdown
+    /// waits with it, because it joins the peer's thread.
+    #[test]
+    fn a_peer_connect_is_bounded() {
+        let interactive = RemoteSsh::new("host".to_string(), false);
+        assert!(!command_args(&interactive)
+            .iter()
+            .any(|arg| arg.starts_with("ConnectTimeout=")));
+
+        let mut peer = RemoteSsh::new("host".to_string(), false);
+        peer.batch = true;
+        assert!(command_args(&peer)
+            .iter()
+            .any(|arg| arg == &format!("ConnectTimeout={PEER_SSH_CONNECT_TIMEOUT_SECS}")));
+    }
+
+    /// `ConnectTimeout` bounds the TCP connect and nothing after it, so a peer
+    /// that answers and then stalls is held only by this. The wait has to end
+    /// when the connection it serves does, or shutdown joins a thread that is
+    /// parked on a host with no reason to ever reply.
+    #[test]
+    fn a_peer_ssh_wait_ends_when_the_connection_stops() {
+        let running = Arc::new(AtomicBool::new(true));
+        let ssh = RemoteSsh::new("host".to_string(), false).cancelled_with(Arc::clone(&running));
+
+        // Stands in for ssh parked on an unresponsive peer: it will not exit on
+        // its own inside this test's lifetime.
+        let child = Command::new("sleep")
+            .arg("120")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in child");
+
+        let stopper = Arc::clone(&running);
+        let stop = thread::spawn(move || {
+            thread::sleep(PEER_SSH_CANCEL_POLL * 2);
+            stopper.store(false, Ordering::Relaxed);
+        });
+
+        let started = Instant::now();
+        let output = ssh.wait_for_output(child).expect("wait returns");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "wait outlived the connection it serves"
+        );
+        assert!(!output.status.success(), "the child was killed, not reaped");
+
+        stop.join().expect("stopper finishes");
+    }
+
+    /// Everything that is not a peer keeps waiting the way it always has: a
+    /// human at an interactive `--remote` prompt is the one deciding when to
+    /// give up.
+    #[test]
+    fn an_uncancelled_ssh_wait_collects_output() {
+        let ssh = RemoteSsh::new("host".to_string(), false);
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("echo out; echo err >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in child");
+
+        let output = ssh.wait_for_output(child).expect("wait returns");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+    }
+
+    /// The cancellable path drains both pipes rather than only polling for
+    /// exit: a child that fills a pipe buffer blocks until it is read, so a
+    /// poll that never read would hang on output instead of on the network.
+    #[test]
+    fn a_cancellable_wait_still_collects_output() {
+        let running = Arc::new(AtomicBool::new(true));
+        let ssh = RemoteSsh::new("host".to_string(), false).cancelled_with(running);
+        let child = Command::new("sh")
+            .arg("-c")
+            // Comfortably past a pipe buffer, which a wait that only polled
+            // would deadlock on.
+            .arg("yes herdr | head -c 200000; echo err >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn stand-in child");
+
+        let output = ssh.wait_for_output(child).expect("wait returns");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+    }
+
+    fn command_args(ssh: &RemoteSsh) -> Vec<String> {
+        ssh.base_command()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -2207,6 +3419,7 @@ mod tests {
             remote_herdr,
             socket.clone(),
             "default".to_string(),
+            BridgeSocket::Client,
             None,
         )
         .expect("start bridge listener");
@@ -2364,6 +3577,9 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
+            identity: None,
+            batch: false,
+            running: None,
         };
 
         let command = ssh.command();
@@ -2433,6 +3649,9 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: None,
+            identity: None,
+            batch: false,
+            running: None,
         };
 
         let command = ssh.command();
@@ -2721,9 +3940,80 @@ mod tests {
             arch: "x86_64",
         });
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                BridgeSocket::Client
+            ),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
         );
+    }
+
+    #[test]
+    fn remote_bridge_command_selects_the_api_subcommand() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                BridgeSocket::Api
+            ),
+            "exec \"$HOME/.local/bin/herdr\" remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_bridge_command_carries_a_named_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "work", BridgeSocket::Api),
+            "exec \"$HOME/.local/bin/herdr\" --session work remote-api-bridge"
+        );
+    }
+
+    /// A peer's two bridged sockets have to sit in the same directory under the
+    /// names the server's own derivation produces, or `resolve_peer_connection`
+    /// would look for the client socket somewhere nothing is listening.
+    #[test]
+    fn peer_socket_names_match_the_server_derivation() {
+        let dir = Path::new("/tmp/herdr-peer-1-0");
+        let derived = crate::server::socket_paths::derive_client_socket_from_api_socket(
+            &dir.join(PEER_API_SOCKET_NAME),
+        );
+
+        assert_eq!(derived, dir.join(PEER_CLIENT_SOCKET_NAME));
+    }
+
+    #[test]
+    fn peer_socket_dir_fits_the_socket_path_budget() {
+        let dir = PrivateDir(private_peer_socket_dir().expect("create peer socket dir"));
+
+        for name in [PEER_API_SOCKET_NAME, PEER_CLIENT_SOCKET_NAME] {
+            let socket = dir.path().join(name);
+            assert!(
+                fits_unix_socket_path(&socket),
+                "{} does not fit sun_path",
+                socket.display()
+            );
+        }
+    }
+
+    #[test]
+    fn private_dir_is_removed_with_its_contents() {
+        let path = {
+            let dir = PrivateDir(private_peer_socket_dir().expect("create peer socket dir"));
+            let path = dir.path().to_path_buf();
+            fs::write(path.join("leftover"), b"x").expect("write leftover file");
+            path
+        };
+
+        assert!(!path.exists(), "{} was not removed", path.display());
     }
 
     #[test]
@@ -2736,7 +4026,11 @@ mod tests {
             .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                BridgeSocket::Client
+            ),
             "exec /usr/bin/herdr remote-client-bridge"
         );
     }
@@ -2752,7 +4046,11 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                BridgeSocket::Client
+            ),
             "exec '/opt/herdr bin/herdr' remote-client-bridge"
         );
     }
@@ -2768,7 +4066,11 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                BridgeSocket::Client
+            ),
             "exec /opt/homebrew/bin/herdr remote-client-bridge"
         );
         assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
@@ -2855,7 +4157,11 @@ mod tests {
                 .expect("path binary");
 
         assert_eq!(
-            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            remote_bridge_command(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                BridgeSocket::Client
+            ),
             "exec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
         );
     }

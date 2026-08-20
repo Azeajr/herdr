@@ -784,7 +784,9 @@ fn spawn_basic_detection_task(
                 last_process_check = now;
                 let had_process_probe = has_process_probe;
                 has_process_probe = true;
+                let probe_started = crate::render_prof::timer();
                 let probe = probe_foreground_process(pid, foreground_pgid);
+                crate::render_prof::histogram_since("detection.process_probe", probe_started);
                 let process_group_id = probe.process_group_id;
                 let tracked_process_group_id =
                     process_group_for_change_tracking(foreground_pgid, process_group_id);
@@ -897,7 +899,9 @@ fn spawn_basic_detection_task(
                 DetectionScreenReadDecision::Skip => continue,
             }
 
+            let screen_read_started = crate::render_prof::timer();
             let content = terminal.detection_text();
+            crate::render_prof::histogram_since("detection.screen_read", screen_read_started);
             last_screen_scan_detection_content_seq = current_detection_content_seq;
             let content_changed = content != last_detection_text;
             last_detection_text.clone_from(&content);
@@ -917,13 +921,16 @@ fn spawn_basic_detection_task(
 
             let osc_title = terminal.agent_osc_title();
             let osc_progress = terminal.agent_osc_progress();
-            let Some(screen_detection) = detection_update_for_publish_with_osc(
+            let classify_started = crate::render_prof::timer();
+            let screen_detection = detection_update_for_publish_with_osc(
                 agent,
                 &content,
                 &osc_title,
                 &osc_progress,
                 process_exited,
-            ) else {
+            );
+            crate::render_prof::histogram_since("detection.classify", classify_started);
+            let Some(screen_detection) = screen_detection else {
                 pending_idle.clear();
                 continue;
             };
@@ -1030,6 +1037,12 @@ impl AgentDetectionPresence {
 // PaneRuntime — PTY, parser, channels, background tasks
 // ---------------------------------------------------------------------------
 
+/// Reads a pane's retained history, once, wherever it is called.
+///
+/// Holds the terminal alive on its own, so it can outlive the borrow of the
+/// runtime registry that produced it and be resolved on another thread.
+pub type PaneHistorySource = Box<dyn FnOnce() -> Option<String> + Send>;
+
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this shuts down all background tasks and closes the PTY.
 pub struct PaneRuntime {
@@ -1043,12 +1056,34 @@ pub struct PaneRuntime {
     kitty_keyboard_flags: Arc<AtomicU16>,
     content_seq: Arc<AtomicU64>,
     detection_content_seq: Arc<AtomicU64>,
+    /// Last answer from [`Self::foreground_cwd`], and what it was computed
+    /// against.
+    ///
+    /// Measured at roughly 580 µs, and it dominates every `PaneInfo` — which
+    /// idle subscriptions rebuild ten times a second per pane, and the peer
+    /// pane refresh rebuilds for every pane on every peer.
+    foreground_cwd_cache: Arc<Mutex<Option<ForegroundCwdCache>>>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
     preserve_processes_on_drop: bool,
     // Task handles for deterministic shutdown
     detect_handle: Option<tokio::task::AbortHandle>,
+}
+
+/// How long a foreground cwd may be reused when nothing was printed.
+///
+/// The content sequence is the primary gate and covers the ordinary case: a
+/// `cd`, or a job starting or ending, redraws a prompt or prints something, so
+/// the sequence moves and the answer is recomputed. This bounds the exception —
+/// a directory change that produces no output at all — so a stale answer cannot
+/// outlast it.
+const FOREGROUND_CWD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct ForegroundCwdCache {
+    content_seq: u64,
+    computed_at: std::time::Instant,
+    value: Option<std::path::PathBuf>,
 }
 
 enum PaneRuntimeIo {
@@ -1957,7 +1992,10 @@ impl PaneRuntime {
                     publish_reported_cwd(pane_id, cwd, &reported_cwd, &read_events);
                 }
                 for content in result.clipboard_writes {
-                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite { content }) {
+                    if let Err(err) = read_events.try_send(AppEvent::ClipboardWrite {
+                        pane_id: Some(pane_id),
+                        content,
+                    }) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -1997,6 +2035,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            foreground_cwd_cache: Arc::new(Mutex::new(None)),
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
             reported_cwd,
@@ -2128,7 +2167,10 @@ impl PaneRuntime {
                     publish_reported_cwd(pane_id, cwd, &reported_cwd, &events);
                 }
                 for content in result.clipboard_writes {
-                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite { content }) {
+                    if let Err(err) = events.try_send(AppEvent::ClipboardWrite {
+                        pane_id: Some(pane_id),
+                        content,
+                    }) {
                         warn!(
                             pane = pane_id.raw(),
                             err = %err,
@@ -2308,7 +2350,12 @@ impl PaneRuntime {
                         let had_process_probe = has_process_probe;
                         has_process_probe = true;
                         if pid > 0 {
+                            let probe_started = crate::render_prof::timer();
                             let probe = probe_foreground_process(pid, foreground_pgid);
+                            crate::render_prof::histogram_since(
+                                "detection.process_probe",
+                                probe_started,
+                            );
                             let process_name = probe.process_name;
                             let process_group_id = probe.process_group_id;
                             let tracked_process_group_id = process_group_for_change_tracking(
@@ -2459,7 +2506,12 @@ impl PaneRuntime {
                         DetectionScreenReadDecision::Skip => continue,
                     }
 
+                    let screen_read_started = crate::render_prof::timer();
                     let content = terminal.detection_text();
+                    crate::render_prof::histogram_since(
+                        "detection.screen_read",
+                        screen_read_started,
+                    );
                     last_screen_scan_detection_content_seq = current_detection_content_seq;
                     let content_changed = content != last_detection_text;
                     last_detection_text.clone_from(&content);
@@ -2479,13 +2531,16 @@ impl PaneRuntime {
 
                     let osc_title = terminal.agent_osc_title();
                     let osc_progress = terminal.agent_osc_progress();
-                    let Some(screen_detection) = detection_update_for_publish_with_osc(
+                    let classify_started = crate::render_prof::timer();
+                    let screen_detection = detection_update_for_publish_with_osc(
                         agent,
                         &content,
                         &osc_title,
                         &osc_progress,
                         process_exited,
-                    ) else {
+                    );
+                    crate::render_prof::histogram_since("detection.classify", classify_started);
+                    let Some(screen_detection) = screen_detection else {
                         pending_idle.clear();
                         continue;
                     };
@@ -2548,6 +2603,7 @@ impl PaneRuntime {
             pane_id,
             terminal,
             io,
+            foreground_cwd_cache: Arc::new(Mutex::new(None)),
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
             reported_cwd,
@@ -2596,9 +2652,9 @@ impl PaneRuntime {
         }
     }
 
-    pub(crate) fn current_size(&self) -> (u16, u16) {
+    pub(crate) fn current_size(&self) -> crate::terminal::TerminalSize {
         let (rows, cols, _, _) = self.current_size.get();
-        (rows, cols)
+        crate::terminal::TerminalSize::new(rows, cols)
     }
 
     pub(crate) fn content_seq(&self) -> u64 {
@@ -2721,6 +2777,10 @@ impl PaneRuntime {
         self.terminal.alternate_screen_active()
     }
 
+    pub fn read_text_range(&self, start: (u16, u32), end: (u16, u32)) -> Option<String> {
+        self.terminal.read_text_range(start, end)
+    }
+
     pub fn cursor_state(&self, area: Rect, show_cursor: bool) -> Option<TerminalCursorState> {
         if !show_cursor {
             return None;
@@ -2777,6 +2837,11 @@ impl PaneRuntime {
         self.terminal.recent_unwrapped_text_snapshot(lines)
     }
 
+    // Reached only from `handoff_history_ansi`, which is unix-only, now that
+    // the session save reads history through `history_source` instead. Allowed
+    // rather than `#[cfg(unix)]` because the Windows target still compiles the
+    // tests, and those construct panes that use these.
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn recent_unwrapped_ansi(&self, lines: usize) -> String {
         self.terminal.recent_unwrapped_ansi(lines)
     }
@@ -2785,9 +2850,25 @@ impl PaneRuntime {
         self.terminal.recent_unwrapped_ansi_snapshot(lines)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub fn snapshot_history(&self) -> Option<String> {
         let ansi = self.recent_unwrapped_ansi(usize::MAX);
         (!ansi.trim().is_empty()).then_some(ansi)
+    }
+
+    /// A handle that will read this pane's history later, off the server loop.
+    ///
+    /// Taking it is a reference-count bump; reading through it materializes
+    /// every retained line, which was measured at 5–10 ms for a single pane
+    /// against a 16.7 ms frame. The session save needs the *positions* while it
+    /// holds consistent state on the loop, but not the bytes, so only the
+    /// handle is taken there and the read happens on the save thread.
+    pub fn history_source(&self) -> PaneHistorySource {
+        let terminal = Arc::clone(&self.terminal);
+        Box::new(move || {
+            let ansi = terminal.recent_unwrapped_ansi(usize::MAX);
+            (!ansi.trim().is_empty()).then_some(ansi)
+        })
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2987,6 +3068,37 @@ impl PaneRuntime {
 
     /// Get the current working directory of the process group controlling the pane PTY.
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
+        let content_seq = self.content_seq();
+        let now = std::time::Instant::now();
+        if let Ok(cache) = self.foreground_cwd_cache.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.content_seq == content_seq
+                    && now.duration_since(cached.computed_at) < FOREGROUND_CWD_CACHE_TTL
+                {
+                    crate::render_prof::event("pane.foreground_cwd.cached");
+                    return cached.value.clone();
+                }
+            }
+        }
+
+        crate::render_prof::event("pane.foreground_cwd.computed");
+        let value = self.compute_foreground_cwd();
+        if let Ok(mut cache) = self.foreground_cwd_cache.lock() {
+            *cache = Some(ForegroundCwdCache {
+                content_seq,
+                computed_at: now,
+                value: value.clone(),
+            });
+        }
+        value
+    }
+
+    /// Walks the process tree for the foreground job's working directory.
+    ///
+    /// The expensive half of [`Self::foreground_cwd`], and the reason that one
+    /// caches: this reads a chain of `/proc` entries and is the single largest
+    /// cost in building a `PaneInfo`.
+    fn compute_foreground_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
@@ -3061,6 +3173,7 @@ impl PaneRuntime {
 
         (
             Self {
+                foreground_cwd_cache: Arc::new(Mutex::new(None)),
                 pane_id: PaneId::from_raw(0),
                 terminal: Arc::new(PaneTerminal::new(
                     GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
@@ -3099,6 +3212,74 @@ mod tests {
         apply_pane_launch_env(&mut cmd, &PaneLaunchEnv::default());
 
         assert!(cmd.get_env("CODEX_THREAD_ID").is_none());
+    }
+
+    /// The foreground cwd walk is the single largest cost in a `PaneInfo`, and
+    /// idle subscriptions rebuild one ten times a second per pane. Repeating
+    /// the walk when nothing was printed is the waste being removed.
+    #[tokio::test]
+    async fn foreground_cwd_is_not_recomputed_while_nothing_is_printed() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+
+        let first = runtime.foreground_cwd();
+        let cached = runtime.foreground_cwd();
+
+        assert_eq!(first, cached);
+        let held = runtime
+            .foreground_cwd_cache
+            .lock()
+            .expect("cache is not poisoned");
+        let held = held.as_ref().expect("an answer was cached");
+        assert_eq!(held.content_seq, runtime.content_seq());
+    }
+
+    #[tokio::test]
+    async fn new_output_retires_the_cached_foreground_cwd() {
+        // A cd, or a job starting or ending, prints something. That is what
+        // makes the content sequence a sound gate rather than a guess.
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let _ = runtime.foreground_cwd();
+        let seq_before = runtime.content_seq();
+
+        runtime.content_seq.fetch_add(1, Ordering::AcqRel);
+        let _ = runtime.foreground_cwd();
+
+        let held = runtime
+            .foreground_cwd_cache
+            .lock()
+            .expect("cache is not poisoned");
+        let held = held.as_ref().expect("an answer was cached");
+        assert_ne!(held.content_seq, seq_before);
+        assert_eq!(held.content_seq, runtime.content_seq());
+    }
+
+    #[tokio::test]
+    async fn a_stale_cached_foreground_cwd_expires() {
+        // The backstop for the exception the sequence gate cannot see: a
+        // directory change that printed nothing at all.
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let _ = runtime.foreground_cwd();
+
+        {
+            let mut cache = runtime
+                .foreground_cwd_cache
+                .lock()
+                .expect("cache is not poisoned");
+            let entry = cache.as_mut().expect("an answer was cached");
+            entry.computed_at -= FOREGROUND_CWD_CACHE_TTL * 2;
+        }
+        let before = std::time::Instant::now();
+        let _ = runtime.foreground_cwd();
+
+        let held = runtime
+            .foreground_cwd_cache
+            .lock()
+            .expect("cache is not poisoned");
+        let held = held.as_ref().expect("an answer was cached");
+        assert!(
+            held.computed_at >= before,
+            "an expired answer must be recomputed rather than reused"
+        );
     }
 
     #[tokio::test]
@@ -3620,6 +3801,7 @@ mod tests {
             .mode_set(crate::ghostty::MODE_FOCUS_EVENT, true)
             .unwrap();
         let runtime = PaneRuntime {
+            foreground_cwd_cache: Arc::new(Mutex::new(None)),
             pane_id: PaneId::from_raw(0),
             terminal: Arc::new(PaneTerminal::new(
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
@@ -3652,6 +3834,7 @@ mod tests {
         let (resize_tx, _resize_rx) = watch::channel((80, 24, 0, 0));
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
         let runtime = PaneRuntime {
+            foreground_cwd_cache: Arc::new(Mutex::new(None)),
             pane_id: PaneId::from_raw(0),
             terminal: Arc::new(PaneTerminal::new(
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),

@@ -1,0 +1,22 @@
+[project]
+name = "herdr-peer-test"
+version = "0"
+description = "End-to-end scenarios for herdr's peer, UI and ssh behaviour."
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3", "pytest-timeout>=2.3"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "e2e: drives real servers and TUI clients through tmux; needs tmux and a herdr build",
+    "boxes: needs the Docker peer boxes (peer-test/docker/boxes.sh)",
+    "ssh: needs the lab's throwaway sshd (lab.py ssh-up)",
+    "stress: the load bounds from scripts/stress.py; hundreds of connections and megabytes of pty",
+]
+# A hung tmux client looks exactly like a slow one, and an unbounded run of this
+# suite is indistinguishable from progress. Every test gets a ceiling.
+timeout = 300

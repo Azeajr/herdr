@@ -24,6 +24,14 @@ pub fn is_preview() -> bool {
     channel() == "preview"
 }
 
+pub(crate) fn is_source_build() -> bool {
+    is_source_channel(channel())
+}
+
+fn is_source_channel(channel: &str) -> bool {
+    channel == "source"
+}
+
 fn non_empty(value: Option<&'static str>) -> Option<&'static str> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -40,5 +48,13 @@ mod tests {
     #[test]
     fn stable_version_defaults_to_cargo_version() {
         assert!(!super::version().is_empty());
+    }
+
+    #[test]
+    fn only_source_channel_is_source_managed() {
+        assert!(super::is_source_channel("source"));
+        assert!(!super::is_source_channel("stable"));
+        assert!(!super::is_source_channel("preview"));
+        assert!(!super::is_source_channel("peer-test"));
     }
 }

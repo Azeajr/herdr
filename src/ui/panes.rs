@@ -279,7 +279,7 @@ pub(super) fn compute_pane_infos(
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, focused_id) {
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
-            if resize_panes
+            if (resize_panes || rt.is_remote())
                 && ws.terminal_id(focused_id).is_some_and(|terminal_id| {
                     !app.direct_attach_resize_locks.contains(terminal_id)
                 })
@@ -317,7 +317,13 @@ pub(super) fn compute_pane_infos(
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             (inner_rect, scrollbar_rect) =
                 stable_scrollbar_gutter(rt, pane_inner, app.pane_scrollbars);
-            if resize_panes
+            // A remote pane resizes even when the layout is frozen. The freeze
+            // keeps a detached session from churning local pty sizes nothing is
+            // looking at; a peer-backed pane is being rendered on the machine
+            // that owns it, so a size this side never sent is a size the remote
+            // program is actually wrapping at. `resize` is a no-op when
+            // unchanged, so this costs nothing on the ticks that agree.
+            if (resize_panes || rt.is_remote())
                 && ws.terminal_id(info.id).is_some_and(|terminal_id| {
                     !app.direct_attach_resize_locks.contains(terminal_id)
                 })
@@ -1374,7 +1380,7 @@ mod tests {
             assert_eq!(infos[0].scrollbar_rect.is_some(), has_scrollbar);
             assert_eq!(
                 app.workspaces[0].tabs[0].runtimes[&root_pane].current_size(),
-                (area.height, expected_width)
+                crate::terminal::TerminalSize::new(area.height, expected_width)
             );
         };
 

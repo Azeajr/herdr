@@ -19,12 +19,13 @@ mod sidebar;
 mod status;
 mod tab_surface;
 mod tabs;
-mod text;
+pub(crate) mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_new_linked_worktree_overlay,
-    render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
+    render_add_peer_overlay, render_confirm_close_overlay, render_hidden_peers_overlay,
+    render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
+    render_open_peer_workspace_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
@@ -65,10 +66,14 @@ pub(crate) use self::tab_surface::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
+        add_peer_button_rects, add_peer_field_rects, add_peer_inner_rect, add_peer_recent_entries,
+        add_peer_recent_row_rects, confirm_close_button_rects, confirm_close_popup_rect,
+        hidden_peers_inner_rect, hidden_peers_row_rects, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
-        open_existing_worktree_visible_start, remove_worktree_button_rects,
+        open_existing_worktree_visible_start, peer_workspace_open_button_rects,
+        peer_workspace_open_inner_rect, peer_workspace_open_max_visible_rows,
+        peer_workspace_open_visible_start, remove_worktree_button_rects,
         remove_worktree_popup_rect, rename_button_rects,
     },
     settings::{
@@ -80,11 +85,11 @@ pub(crate) use self::{
         agent_panel_scroll_for_target, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, all_agent_panel_entries, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        expanded_sidebar_toggle_rect, normalized_workspace_scroll, sidebar_section_divider_rect,
-        workspace_drop_slots, workspace_group_chevron_rect, workspace_list_entries,
-        workspace_list_entries_expanded, workspace_list_rect, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        WorkspaceListEntry,
+        expanded_sidebar_toggle_rect, normalized_workspace_scroll, peer_collapse_key,
+        sidebar_section_divider_rect, workspace_drop_slots, workspace_group_chevron_rect,
+        workspace_list_entries, workspace_list_entries_expanded, workspace_list_rect,
+        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
+        AgentPanelEntry, WorkspaceListEntry,
     },
 };
 
@@ -255,10 +260,10 @@ fn compute_view_internal(
         app.agent_panel_scroll = 0;
     }
 
-    let workspace_card_areas = if app.sidebar_collapsed {
-        Vec::new()
+    let (workspace_card_areas, peer_header_areas) = if app.sidebar_collapsed {
+        (Vec::new(), Vec::new())
     } else {
-        compute_workspace_card_areas(app, sidebar_area)
+        crate::ui::sidebar::compute_workspace_list_areas(app, sidebar_area)
     };
 
     let tab_bar_view = app
@@ -308,6 +313,7 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
         workspace_card_areas,
+        peer_header_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
         tab_scroll_left_hit_area: tab_bar_view.scroll_left_hit_area,
@@ -371,6 +377,7 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
+        peer_header_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
         tab_scroll_left_hit_area: Rect::default(),
@@ -453,6 +460,9 @@ pub fn render_with_runtime_registry(
         Mode::OpenExistingWorktree => {
             render_open_existing_worktree_overlay(app, frame, frame.area())
         }
+        Mode::OpenPeerWorkspace => render_open_peer_workspace_overlay(app, frame, frame.area()),
+        Mode::AddPeer => render_add_peer_overlay(app, frame, frame.area()),
+        Mode::UnhidePeers => render_hidden_peers_overlay(app, frame, frame.area()),
         Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
@@ -928,8 +938,8 @@ mod tests {
         let one_tab_size = app.workspaces[0].tabs[0].runtimes[&one_tab_pane].current_size();
         let two_tab_size =
             app.workspaces[1].tabs[background_tab].runtimes[&two_tab_pane].current_size();
-        assert_eq!(one_tab_size, (20, 53));
-        assert_eq!(two_tab_size, (19, 53));
+        assert_eq!(one_tab_size, crate::terminal::TerminalSize::new(20, 53));
+        assert_eq!(two_tab_size, crate::terminal::TerminalSize::new(19, 53));
     }
 
     #[tokio::test]
@@ -955,7 +965,7 @@ mod tests {
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 44, 18));
         assert_eq!(
             app.workspaces[0].tabs[background_tab].runtimes[&background_pane].current_size(),
-            (18, 43)
+            crate::terminal::TerminalSize::new(18, 43)
         );
     }
 

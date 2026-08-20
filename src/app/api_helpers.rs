@@ -23,7 +23,10 @@ fn normalize_api_key_alias(key: &str) -> &str {
 }
 
 pub(super) fn encode_api_text(runtime: &crate::terminal::TerminalRuntime, text: &str) -> Vec<u8> {
-    let bracketed = runtime.bracketed_paste_enabled();
+    // Narrow accessor rather than the aggregate snapshot, so a peer-backed
+    // terminal is answered from the mode the peer reported instead of the
+    // local default. See `TerminalRuntime::bracketed_paste`.
+    let bracketed = runtime.bracketed_paste();
     if bracketed {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {

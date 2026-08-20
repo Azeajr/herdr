@@ -15,8 +15,9 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde_json::Value;
 use support::{
     cleanup_test_base, client_handshake, drain_messages, read_server_message, register_runtime_dir,
-    register_spawned_herdr_pid, send_detach, send_input, unregister_spawned_herdr_pid,
-    wait_for_disconnect, wait_for_message_variant, wait_for_socket, wait_until, CURRENT_PROTOCOL,
+    register_spawned_herdr_pid, scrub_inherited_herdr_env, send_detach, send_input,
+    unregister_spawned_herdr_pid, wait_for_disconnect, wait_for_message_variant, wait_for_socket,
+    wait_until, CURRENT_PROTOCOL,
 };
 
 const CUSTOM_HEADLESS_SIZE_CONFIG: &str = r#"onboarding = false
@@ -119,6 +120,11 @@ fn spawn_server_with_config(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);

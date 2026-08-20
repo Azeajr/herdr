@@ -438,7 +438,7 @@ mod tests {
         let marker = "restored agent: shell quoted | marker";
         for _ in 0..20 {
             if runtime
-                .snapshot_history()
+                .read_history_now()
                 .is_some_and(|text| text.contains(marker))
             {
                 break;
@@ -447,7 +447,7 @@ mod tests {
         }
         assert!(
             runtime
-                .snapshot_history()
+                .read_history_now()
                 .expect("runtime should expose terminal history")
                 .contains(marker),
             "deferred restore should inject the resume argv into the restored shell"
@@ -783,7 +783,7 @@ mod tests {
                 .get(&terminal_id)
                 .expect("pending resume should launch")
                 .current_size(),
-            (28, 98)
+            crate::terminal::TerminalSize::new(28, 98)
         );
 
         for (_, runtime) in app.terminal_runtimes.drain() {

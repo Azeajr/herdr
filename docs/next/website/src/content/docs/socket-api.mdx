@@ -33,6 +33,10 @@ Schema document for tools, and `--output PATH` writes that document to a file.
 The schema covers raw requests, success responses, error responses, emitted
 events, and subscription events.
 
+Requests may include `if_instance_id`. The server rejects the request with
+`server_replaced` unless its current instance ID matches. Federation uses this
+precondition so an ID learned from one server cannot act on its replacement.
+
 ## What you can control
 
 The socket API can:
@@ -107,6 +111,7 @@ Raw socket method names use dot notation:
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Peer | `peer.add`, `peer.remove`, `peer.list`, `peer.workspace.open`, `peer.workspace.create`, `peer.terminal.open`, `peer.terminal.close` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
@@ -840,6 +845,125 @@ herdr pane read w1:p1 --source detection
 
 `recent-unwrapped` is useful for logs because it ignores soft wrapping.
 `detection` returns the bottom-buffer snapshot used by agent screen detection.
+
+Reading a peer-backed pane is answered by the peer that owns the screen, and
+returns the same shape with your own pane, tab, and workspace ids. When the peer
+is unreachable the read fails with `unavailable` naming the peer's connection
+state, instead of returning an empty screen.
+
+## Peer servers
+
+Peers let one Herdr server show another Herdr server's workspaces. See
+[Persistence and remote access](/docs/persistence-remote/) for what a peer is
+and how a peer-backed pane behaves, and `herdr peer` in the
+[CLI reference](/docs/cli-reference/) for the same methods without the JSON.
+
+```json
+{"id":"req_add","method":"peer.add","params":{"name":"beta","target":{"type":"socket_path","path":"/home/you/.config/herdr/sessions/beta/herdr.sock"}}}
+{"id":"req_ssh","method":"peer.add","params":{"name":"workbox","target":{"type":"ssh","destination":"workbox","session":"agents"}}}
+{"id":"req_list","method":"peer.list","params":{}}
+{"id":"req_open","method":"peer.workspace.open","params":{"target":"<instance-id>:w1","focus":true}}
+{"id":"req_new","method":"peer.workspace.create","params":{"name":"workbox","focus":true}}
+{"id":"req_term","method":"peer.terminal.open","params":{"target":"<instance-id>:w1:p1","cols":80,"rows":24}}
+{"id":"req_term_close","method":"peer.terminal.close","params":{"terminal_id":"t7"}}
+{"id":"req_rm","method":"peer.remove","params":{"name":"beta"}}
+```
+
+`peer.add`, `peer.remove`, and `peer.list` all return the full peer list. Each
+entry carries `connection` (`connecting`, `connected`, `reconnecting`, `error`),
+`attempt` and `error` while retrying or after giving up, the peer's
+`instance_id`, `version`, and `protocol`, a `stale` flag, and the `workspaces`
+it last reported. `reconnecting` means still trying; `error` means stopped.
+`attempt` counts consecutive failures and restarts once a connection is proven,
+so a peer that flapped and then ran healthily reports its next failure as the
+first one it is.
+
+Two peers that turn out to reach the same server are refused: the second reports
+`error` naming the peer that already holds it, because both would resolve the
+same namespaced ids and every one of them would route to whichever was added
+first.
+
+A peer whose `instance_id` changes is a different server on the same target. Its
+retained workspaces are dropped, and every view onto it stops rather than
+reconnecting: a peer-local id like `w1:p1` names an unrelated pane on a server
+that was restarted with a fresh session, so those views report
+`peer_view.state` `disconnected` instead of silently showing someone else's
+terminal.
+
+`peer.workspace.open` takes a workspace, pane, or terminal id and opens a local
+workspace viewing it. `peer.terminal.open` opens a single peer-backed terminal
+without a workspace around it. Both accept ids namespaced with the peer's
+instance id, as `peer.list` reports them; `name` is required only for a bare
+peer-local id. Opening the same target twice returns the view you already have,
+whichever of the two opened it: a target already held by a bare terminal is
+refused for `peer.workspace.open` rather than connected to twice, because two
+views onto one peer terminal reclaim each other's control of it indefinitely.
+
+Both are handled off the event loop, like `peer.workspace.create`: connecting is
+a handshake with another machine, and for an SSH peer it starts an SSH child.
+The same applies to `workspace.focus` on a namespaced workspace id, which opens
+a view rather than focusing a local one.
+
+`peer.terminal.close` releases a terminal `peer.terminal.open` returned. A
+terminal a pane is attached to is released by closing that pane, and is refused
+here.
+
+`peer.workspace.create` asks a peer to create a workspace and opens a local view
+onto it, for reaching a peer that has nothing to attach to yet. It names the
+peer rather than one of its workspaces, since there is no id yet to route on,
+and takes an optional `cwd` resolved on the peer. It answers with the **local**
+workspace, like `peer.workspace.open`, because that is the one the caller can
+act on. Handled off the event loop: it is a round trip to the peer followed by
+opening a connection.
+
+`workspace.rename` and `workspace.close` on a namespaced workspace id are
+forwarded to the owning peer. `workspace.focus` on one is local: it opens or
+switches to your view of that workspace.
+
+`PaneInfo` reports `peer` on a pane that views a peer's terminal, naming the
+peer. Read it before offering anything that needs the pane's own screen, such as
+selection or search. Everything else on `PaneInfo` is still filled in for such a
+pane — `cwd`, `foreground_cwd`, `terminal_title`, `agent`, `agent_status`, and
+`keyboard_protocol` come from the peer that owns the screen, so a peer's agent
+appears in `agent.list` and can be waited on with `agent.wait` like a local one.
+`keyboard_protocol` is what a view uses to encode keys the way the remote
+program asked, which is what makes Shift+Enter and other enhanced keys reach a
+program using the Kitty keyboard protocol on the other machine. Those
+fields refresh within about a second and a half rather than immediately, and a
+dropped connection keeps the last values instead of clearing them.
+
+Because they are kept, read `peer_view` before trusting them. It is present on
+every peer-backed pane and absent on a local one, and its `state` is one of:
+
+- `connected` — the peer is streaming the pane and everything else is current.
+- `reconnecting` — the connection dropped and is being reopened. The pane still
+  shows the peer's last frame, and `reason` carries the last failure when one is
+  known.
+- `disconnected` — reopening was given up on, `reason` says why, and nothing
+  will change until the pane is closed and the view opened again. This state is
+  for a peer that is unreachable or was replaced by a different server; when the
+  peer reports the pane itself is gone, the view closes instead of entering this
+  state.
+
+A `pane.updated` event is emitted whenever `state` changes, so a client can
+follow a view's liveness without polling. A `reason` that changes while `state`
+does not gets no event of its own — `pane.updated` is emitted for other reasons
+too, and carries whatever `peer_view` says at that moment.
+
+`agent.read` on a peer-backed pane is forwarded to the peer, the same as
+`pane.read`. So is `agent.explain`: the rules that decided the pane's state ran
+on the peer, against a screen this server does not have. The forwarded
+explanation gains two fields, `peer` and `peer_pane_id`, naming where it came
+from — every other field in it, including the manifest source, the manifest
+version, and the rule ids, describes the peer's install rather than this one.
+A refusal from the peer is passed through with its message prefixed by the peer
+name, and an unreachable peer answers `unavailable` naming the peer's state
+rather than an explanation this server invented.
+
+The reverse direction is `owner_instance_id` and
+`owner_attached`, which a server reports about a pane another server had it
+create — `owner_attached: false` means the instance that asked for the pane is
+gone while the pane is still running here.
 
 ## Waiting for state
 

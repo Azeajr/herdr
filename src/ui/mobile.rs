@@ -106,15 +106,29 @@ fn mobile_agents_block_height(app: &AppState) -> usize {
     }
 }
 
+/// The space rows the mobile switcher actually draws.
+///
+/// Peer headers are sidebar furniture: the switcher draws no row for one, so
+/// every row below a peer group would sit two rows off from where the hit-test
+/// and scroll math expect it if headers were counted here.
+fn mobile_space_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
+    workspace_list_entries_expanded(app)
+        .into_iter()
+        .filter(|entry| matches!(entry, WorkspaceListEntry::Workspace { .. }))
+        .collect()
+}
+
 pub(crate) fn mobile_switcher_workspace_doc_range(
     app: &AppState,
     idx: usize,
 ) -> std::ops::Range<usize> {
     // Spaces render in grouped order, so a workspace's row position is its index
     // in the entry list, not its raw array index.
-    let pos = workspace_list_entries_expanded(app)
+    let pos = mobile_space_entries(app)
         .iter()
-        .position(|WorkspaceListEntry::Workspace { ws_idx, .. }| *ws_idx == idx)
+        .position(
+            |entry| matches!(entry, WorkspaceListEntry::Workspace { ws_idx, .. } if *ws_idx == idx),
+        )
         .unwrap_or(idx);
     // spaces sit after the agents block, then a title + "new workspace" row.
     let start = mobile_agents_block_height(app) + 2 + pos * 2;
@@ -173,13 +187,16 @@ pub(crate) fn mobile_switcher_target_at(
     cursor += 1;
     // Spaces render in grouped (worktree-tree) order, which differs from raw
     // array order, so map the clicked row to the entry's real workspace index.
-    let space_entries = workspace_list_entries_expanded(app);
+    let space_entries = mobile_space_entries(app);
     let spaces_end = cursor + space_entries.len() * 2;
     if doc_row >= cursor && doc_row < spaces_end {
         let entry_idx = (doc_row - cursor) / 2;
-        return space_entries.get(entry_idx).map(
-            |WorkspaceListEntry::Workspace { ws_idx, .. }| MobileSwitcherTarget::Workspace(*ws_idx),
-        );
+        return space_entries.get(entry_idx).and_then(|entry| match entry {
+            WorkspaceListEntry::Workspace { ws_idx, .. } => {
+                Some(MobileSwitcherTarget::Workspace(*ws_idx))
+            }
+            WorkspaceListEntry::PeerHeader { .. } => None,
+        });
     }
     cursor = spaces_end;
 
@@ -454,7 +471,7 @@ fn render_close_button(app: &AppState, frame: &mut Frame, area: Rect) {
 fn mobile_switcher_content_height(app: &AppState) -> usize {
     // Derive spaces height from the same entry list the render/hit-test use so
     // the three never disagree.
-    let spaces_h = 2 + workspace_list_entries_expanded(app).len() * 2;
+    let spaces_h = 2 + mobile_space_entries(app).len() * 2;
     let tabs_h = app
         .active
         .and_then(|idx| app.workspaces.get(idx))
@@ -586,10 +603,11 @@ fn render_mobile_switcher_content(
         p,
     );
     doc_y += 1;
-    let space_entries = workspace_list_entries_expanded(app);
-    for (entry_idx, WorkspaceListEntry::Workspace { ws_idx, indented }) in
-        space_entries.iter().enumerate()
-    {
+    let space_entries = mobile_space_entries(app);
+    for (entry_idx, entry) in space_entries.iter().enumerate() {
+        let WorkspaceListEntry::Workspace { ws_idx, indented } = entry else {
+            continue;
+        };
         let Some(ws) = app.workspaces.get(*ws_idx) else {
             continue;
         };
@@ -1417,8 +1435,10 @@ mod tests {
         // workspace" (2) before the first workspace ribbon at doc row 7.
         assert_eq!(mobile_switcher_workspace_doc_range(&app, 0).start, 7);
 
+        // Unscrolled, so a viewport row is the doc row asserted above rather
+        // than an offset from a clamp that moves whenever the menu grows.
         let viewport = mobile_switcher_areas(&app).viewport;
-        app.mobile_switcher_scroll = 100;
+        app.mobile_switcher_scroll = 0;
         let agent_hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 1);
         assert!(matches!(
             agent_hit,
@@ -1470,6 +1490,39 @@ mod tests {
         assert_eq!(mobile_switcher_workspace_doc_range(&app, 2).start, 4);
         let hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 4);
         assert_eq!(hit, Some(MobileSwitcherTarget::Workspace(2)));
+    }
+
+    #[test]
+    fn switcher_rows_skip_peer_headers_like_the_render_loop_does() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut peer_ws = crate::workspace::Workspace::test_new("remote");
+        peer_ws.peer = Some("alpha".to_string());
+        app.workspaces = vec![crate::workspace::Workspace::test_new("local"), peer_ws];
+        app.peers
+            .add(
+                crate::app::peers::PeerHandle::new("alpha"),
+                crate::app::peers::PeerTarget::SocketPath(std::path::PathBuf::from("/tmp/a.sock")),
+            )
+            .expect("add peer");
+        app.active = Some(0);
+        app.selected = 0;
+        app.view.mobile_header_rect = Rect::new(0, 0, 40, 2);
+        app.view.terminal_area = Rect::new(0, 2, 40, 18);
+
+        // The entry list carries a header the switcher draws no row for, so the
+        // peer workspace sits directly below the local one on screen. Counting
+        // the header would put it two rows lower than it is drawn, which made
+        // tapping it hit the header's row and resolve to nothing.
+        assert!(matches!(
+            workspace_list_entries_expanded(&app).get(1),
+            Some(WorkspaceListEntry::PeerHeader { .. })
+        ));
+        assert_eq!(mobile_switcher_workspace_doc_range(&app, 0).start, 2);
+        assert_eq!(mobile_switcher_workspace_doc_range(&app, 1).start, 4);
+
+        let viewport = mobile_switcher_areas(&app).viewport;
+        let hit = mobile_switcher_target_at(&app, viewport.x + 2, viewport.y + 4);
+        assert_eq!(hit, Some(MobileSwitcherTarget::Workspace(1)));
     }
 
     #[test]

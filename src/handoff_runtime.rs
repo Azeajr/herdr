@@ -31,6 +31,24 @@ pub(crate) struct HandoffRuntimeState {
 
 #[cfg(unix)]
 impl HandoffRuntimeState {
+    /// State for a pane that has no local pty to export, such as one backed by
+    /// a peer server's terminal.
+    pub fn empty_for_pane(pane_id: u32) -> Self {
+        Self {
+            pane_id,
+            child_pid: 0,
+            rows: 0,
+            cols: 0,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            keyboard_protocol_flags: 0,
+            keyboard_protocol_ansi: None,
+            input_state: None,
+            terminal_title: None,
+            initial_history_ansi: None,
+        }
+    }
+
     pub fn with_pane_id(mut self, pane_id: crate::layout::PaneId) -> Self {
         self.pane_id = pane_id.raw();
         self

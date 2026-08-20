@@ -16,6 +16,7 @@ impl App {
             return;
         }
         self.state.update_dismissed = true;
+        self.state.invalidate_peer_copy_mode_query();
         if self.state.is_prefix_key(&key) {
             self.state.mode = Mode::Prefix;
             return;
@@ -23,26 +24,186 @@ impl App {
         self.state
             .handle_copy_mode_key(&self.terminal_runtimes, key);
         self.dispatch_pending_clipboard_write();
+        self.dispatch_pending_peer_selection_copy();
+        self.dispatch_pending_peer_copy_mode_query();
+    }
+
+    pub(super) fn dispatch_pending_peer_copy_mode_query(&mut self) -> bool {
+        let Some(request) = self.state.request_peer_copy_mode_query.take() else {
+            return false;
+        };
+        let Some(ws_idx) = self.state.active else {
+            return false;
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, request.pane_id) else {
+            return false;
+        };
+
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
+        self.start_peer_pane_text_query(
+            format!("copy:text:{}", request.generation),
+            crate::api::schema::PaneTextQueryParams {
+                pane_id: public_pane_id,
+                query: request.query.clone(),
+            },
+            response_tx,
+        );
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let result = response_rx
+                .recv()
+                .map_err(|_| "peer text query ended without a response".to_string())
+                .and_then(|response| peer_text_query_answer(&response));
+            let _ = event_tx.blocking_send(crate::events::AppEvent::PeerCopyModeQueryFinished(
+                Box::new(crate::events::PeerCopyModeQueryResult { request, result }),
+            ));
+        });
+        true
+    }
+
+    pub(crate) fn handle_peer_copy_mode_query_finished(
+        &mut self,
+        result: crate::events::PeerCopyModeQueryResult,
+    ) {
+        let request = result.request;
+        if request.generation != self.state.peer_copy_mode_query_generation
+            || self
+                .state
+                .copy_mode
+                .as_ref()
+                .is_none_or(|copy_mode| copy_mode.pane_id != request.pane_id)
+        {
+            return;
+        }
+        let answer = match result.result {
+            Ok(answer) => answer,
+            Err(message) => {
+                self.report_action_outcome("peer text query failed", message);
+                return;
+            }
+        };
+
+        match (request.action, request.query, answer) {
+            (
+                crate::app::state::PeerCopyModeQueryAction::Search {
+                    direction,
+                    repeat,
+                    cursor,
+                    previous,
+                },
+                crate::api::schema::PaneTextQuery::Search { query, .. },
+                crate::api::schema::PaneTextQueryAnswer::Search { matches },
+            ) => {
+                let scan_cols = self
+                    .state
+                    .copy_mode
+                    .as_ref()
+                    .and_then(|copy_mode| copy_mode.search.geometry)
+                    .map_or(0, |geometry| geometry.0);
+                let matches = matches
+                    .into_iter()
+                    .map(|text_match| crate::pane::TerminalTextMatch {
+                        start: terminal_text_point(text_match.start),
+                        end: terminal_text_point(text_match.end),
+                        // Peer replies are protected by the query generation;
+                        // these local-only validation fields are never read for
+                        // a remote match.
+                        source_fingerprint: 0,
+                        scan_cols,
+                        scan_screen: crate::ghostty::ActiveScreen::Primary,
+                    })
+                    .collect::<Vec<_>>();
+                let previous = previous.filter(|previous| matches.contains(previous));
+                let current = search_match_index(&matches, direction, cursor, previous);
+                if let Some(copy_mode) = self.state.copy_mode.as_mut() {
+                    copy_mode.search.query = query;
+                    if !repeat {
+                        copy_mode.search.direction = Some(direction);
+                    }
+                    copy_mode.search.matches = matches;
+                    copy_mode.search.current = current;
+                }
+                let target = current.and_then(|index| {
+                    self.state
+                        .copy_mode
+                        .as_ref()
+                        .and_then(|copy_mode| copy_mode.search.matches.get(index).copied())
+                });
+                if let Some(target) = target {
+                    self.state.move_copy_cursor_to_absolute(
+                        &self.terminal_runtimes,
+                        target.start,
+                        true,
+                    );
+                }
+            }
+            (
+                crate::app::state::PeerCopyModeQueryAction::Motion,
+                crate::api::schema::PaneTextQuery::Motion { .. },
+                crate::api::schema::PaneTextQueryAnswer::Motion { target },
+            ) => {
+                if let Some(target) = target {
+                    self.state.move_copy_cursor_to_absolute(
+                        &self.terminal_runtimes,
+                        terminal_text_point(target),
+                        false,
+                    );
+                }
+            }
+            _ => self.report_action_outcome(
+                "peer text query failed",
+                "peer returned the wrong text-query result".to_string(),
+            ),
+        }
+    }
+}
+
+fn peer_text_query_answer(
+    response: &str,
+) -> Result<crate::api::schema::PaneTextQueryAnswer, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(response).map_err(|err| format!("invalid peer response: {err}"))?;
+    if let Some(error) = value.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("peer text query failed")
+            .to_string());
+    }
+    serde_json::from_value(value["result"]["query"].clone())
+        .map(|result: crate::api::schema::PaneTextQueryResult| result.answer)
+        .map_err(|err| format!("invalid peer text-query result: {err}"))
+}
+
+fn terminal_text_point(point: crate::api::schema::PaneTextPoint) -> crate::pane::TerminalTextPoint {
+    crate::pane::TerminalTextPoint {
+        row: point.row,
+        col: point.col,
     }
 }
 
 impl AppState {
-    pub(crate) fn enter_copy_mode(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) {
+    /// Opens copy mode on the focused pane, reporting whether it opened.
+    ///
+    /// Peer-backed panes open too. Operations that need the terminal buffer are
+    /// deferred to its owning peer; navigation that only needs frame-stamped
+    /// scroll metrics stays local.
+    pub(crate) fn enter_copy_mode(&mut self, terminal_runtimes: &TerminalRuntimeRegistry) -> bool {
         let Some(ws_idx) = self.active else {
-            return;
+            return false;
         };
         let Some(pane_id) = self
             .workspaces
             .get(ws_idx)
             .and_then(|ws| ws.focused_pane_id())
         else {
-            return;
+            return false;
         };
         let Some(info) = self.pane_info_by_id(pane_id).cloned() else {
-            return;
+            return false;
         };
         if info.inner_rect.width == 0 || info.inner_rect.height == 0 {
-            return;
+            return false;
         }
 
         let cursor = self
@@ -60,6 +221,7 @@ impl AppState {
             .pane_scroll_metrics(terminal_runtimes, pane_id)
             .map_or(0, |metrics| metrics.offset_from_bottom);
 
+        self.invalidate_peer_copy_mode_query();
         self.clear_selection();
         self.copy_mode = Some(CopyModeState {
             pane_id,
@@ -73,6 +235,42 @@ impl AppState {
             },
         });
         self.mode = Mode::Copy;
+        true
+    }
+
+    pub(crate) fn invalidate_peer_copy_mode_query(&mut self) {
+        self.peer_copy_mode_query_generation = self.peer_copy_mode_query_generation.wrapping_add(1);
+        self.request_peer_copy_mode_query = None;
+    }
+
+    fn schedule_peer_copy_mode_query(
+        &mut self,
+        pane_id: crate::layout::PaneId,
+        query: crate::api::schema::PaneTextQuery,
+        action: crate::app::state::PeerCopyModeQueryAction,
+    ) {
+        self.peer_copy_mode_query_generation = self.peer_copy_mode_query_generation.wrapping_add(1);
+        self.request_peer_copy_mode_query = Some(crate::app::state::PeerCopyModeQuery {
+            generation: self.peer_copy_mode_query_generation,
+            pane_id,
+            query,
+            action,
+        });
+    }
+
+    /// The peer backing a pane, when one does.
+    ///
+    /// Kept here because input paths use the same runtime lookup to distinguish
+    /// peer-owned terminal facts from local presentation state.
+    pub(crate) fn focused_pane_peer(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<String> {
+        self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?
+            .remote()
+            .map(|remote| remote.peer().to_string())
     }
 
     pub(crate) fn handle_copy_mode_key(
@@ -305,8 +503,33 @@ impl AppState {
             })
             .flatten()
             .filter(|text_match| {
-                text_match.start == cursor && runtime.text_match_is_current(*text_match)
+                text_match.start == cursor
+                    && (runtime.is_remote() || runtime.text_match_is_current(*text_match))
             });
+        if runtime.is_remote() {
+            if let Some(copy_mode) = self.copy_mode.as_mut() {
+                copy_mode.search.query = query.clone();
+                if !repeat {
+                    copy_mode.search.direction = Some(direction);
+                }
+                copy_mode.search.matches.clear();
+                copy_mode.search.current = None;
+            }
+            self.schedule_peer_copy_mode_query(
+                pane_id,
+                crate::api::schema::PaneTextQuery::Search {
+                    case_sensitive: query.chars().any(char::is_uppercase),
+                    query,
+                },
+                crate::app::state::PeerCopyModeQueryAction::Search {
+                    direction,
+                    repeat,
+                    cursor,
+                    previous: previous_match,
+                },
+            );
+            return;
+        }
         let matches = runtime.search_text_matches(&query, query.chars().any(char::is_uppercase));
         let current = search_match_index(&matches, direction, cursor, previous_match);
 
@@ -361,10 +584,20 @@ impl AppState {
             .max_offset_from_bottom
             .saturating_sub(desired_top as usize);
         self.set_pane_scroll_offset(terminal_runtimes, pane_id, desired_offset);
-        let Some(updated_metrics) = self.pane_scroll_metrics(terminal_runtimes, pane_id) else {
-            return;
+        let remote = self
+            .active
+            .and_then(|ws_idx| {
+                self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            })
+            .is_some_and(crate::terminal::TerminalRuntime::is_remote);
+        let updated_top = if remote {
+            desired_top
+        } else {
+            let Some(updated_metrics) = self.pane_scroll_metrics(terminal_runtimes, pane_id) else {
+                return;
+            };
+            viewport_top_row(updated_metrics)
         };
-        let updated_top = viewport_top_row(updated_metrics);
         if let Some(copy_mode) = self.copy_mode.as_mut() {
             copy_mode.cursor_row = target
                 .row
@@ -381,6 +614,7 @@ impl AppState {
     }
 
     fn exit_copy_mode(&mut self, terminal_runtimes: &TerminalRuntimeRegistry, copy: bool) {
+        self.invalidate_peer_copy_mode_query();
         let restore_scroll = self
             .copy_mode
             .as_ref()
@@ -597,6 +831,29 @@ impl AppState {
             self.exit_copy_mode(terminal_runtimes, false);
             return;
         };
+        if end {
+            let Some(metrics) = self.pane_scroll_metrics(terminal_runtimes, pane_id) else {
+                return;
+            };
+            let remote = self
+                .active
+                .and_then(|ws_idx| {
+                    self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+                })
+                .is_some_and(crate::terminal::TerminalRuntime::is_remote);
+            if remote {
+                self.schedule_peer_copy_mode_query(
+                    pane_id,
+                    crate::api::schema::PaneTextQuery::Motion {
+                        row: viewport_top_row(metrics).saturating_add(u32::from(cursor_row)),
+                        col: 0,
+                        motion: crate::api::schema::PaneTextMotion::LineEnd,
+                    },
+                    crate::app::state::PeerCopyModeQueryAction::Motion,
+                );
+                return;
+            }
+        }
         let cursor_col = if end {
             let Some(text) = self.copy_mode_visible_row_text(terminal_runtimes, cursor_row) else {
                 return;
@@ -618,6 +875,28 @@ impl AppState {
             return;
         };
         let cursor_row = copy_mode.cursor_row;
+        let pane_id = copy_mode.pane_id;
+        let Some(metrics) = self.pane_scroll_metrics(terminal_runtimes, pane_id) else {
+            return;
+        };
+        let remote = self
+            .active
+            .and_then(|ws_idx| {
+                self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            })
+            .is_some_and(crate::terminal::TerminalRuntime::is_remote);
+        if remote {
+            self.schedule_peer_copy_mode_query(
+                pane_id,
+                crate::api::schema::PaneTextQuery::Motion {
+                    row: viewport_top_row(metrics).saturating_add(u32::from(cursor_row)),
+                    col: 0,
+                    motion: crate::api::schema::PaneTextMotion::FirstNonBlank,
+                },
+                crate::app::state::PeerCopyModeQueryAction::Motion,
+            );
+            return;
+        }
         let Some(text) = self.copy_mode_visible_row_text(terminal_runtimes, cursor_row) else {
             return;
         };
@@ -648,15 +927,46 @@ impl AppState {
         };
         let absolute_row =
             viewport_top_row(metrics).saturating_add(u32::from(copy_mode.cursor_row));
-        let motion = match motion {
-            WordMotion::NextStart => crate::pane::TerminalWordMotion::NextStart,
-            WordMotion::PreviousStart => crate::pane::TerminalWordMotion::PreviousStart,
-            WordMotion::NextEnd => crate::pane::TerminalWordMotion::NextEnd,
-            WordMotion::NextBigStart => crate::pane::TerminalWordMotion::NextBigStart,
-            WordMotion::PreviousBigStart => crate::pane::TerminalWordMotion::PreviousBigStart,
-            WordMotion::NextBigEnd => crate::pane::TerminalWordMotion::NextBigEnd,
+        let (terminal_motion, peer_motion) = match motion {
+            WordMotion::NextStart => (
+                crate::pane::TerminalWordMotion::NextStart,
+                crate::api::schema::PaneTextMotion::NextWordStart,
+            ),
+            WordMotion::PreviousStart => (
+                crate::pane::TerminalWordMotion::PreviousStart,
+                crate::api::schema::PaneTextMotion::PreviousWordStart,
+            ),
+            WordMotion::NextEnd => (
+                crate::pane::TerminalWordMotion::NextEnd,
+                crate::api::schema::PaneTextMotion::NextWordEnd,
+            ),
+            WordMotion::NextBigStart => (
+                crate::pane::TerminalWordMotion::NextBigStart,
+                crate::api::schema::PaneTextMotion::NextBigWordStart,
+            ),
+            WordMotion::PreviousBigStart => (
+                crate::pane::TerminalWordMotion::PreviousBigStart,
+                crate::api::schema::PaneTextMotion::PreviousBigWordStart,
+            ),
+            WordMotion::NextBigEnd => (
+                crate::pane::TerminalWordMotion::NextBigEnd,
+                crate::api::schema::PaneTextMotion::NextBigWordEnd,
+            ),
         };
-        let Some(target) = runtime.word_motion_target(absolute_row, copy_mode.cursor_col, motion)
+        if runtime.is_remote() {
+            self.schedule_peer_copy_mode_query(
+                copy_mode.pane_id,
+                crate::api::schema::PaneTextQuery::Motion {
+                    row: absolute_row,
+                    col: copy_mode.cursor_col,
+                    motion: peer_motion,
+                },
+                crate::app::state::PeerCopyModeQueryAction::Motion,
+            );
+            return;
+        }
+        let Some(target) =
+            runtime.word_motion_target(absolute_row, copy_mode.cursor_col, terminal_motion)
         else {
             return;
         };
@@ -668,6 +978,31 @@ impl AppState {
             return;
         };
         let pane_id = copy_mode.pane_id;
+        let Some(metrics) = self.pane_scroll_metrics(terminal_runtimes, pane_id) else {
+            return;
+        };
+        let remote = self
+            .active
+            .and_then(|ws_idx| {
+                self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            })
+            .is_some_and(crate::terminal::TerminalRuntime::is_remote);
+        if remote {
+            self.schedule_peer_copy_mode_query(
+                pane_id,
+                crate::api::schema::PaneTextQuery::Motion {
+                    row: viewport_top_row(metrics).saturating_add(u32::from(copy_mode.cursor_row)),
+                    col: copy_mode.cursor_col,
+                    motion: if direction < 0 {
+                        crate::api::schema::PaneTextMotion::PreviousParagraph
+                    } else {
+                        crate::api::schema::PaneTextMotion::NextParagraph
+                    },
+                },
+                crate::app::state::PeerCopyModeQueryAction::Motion,
+            );
+            return;
+        }
         let Some(pane_height) = self
             .pane_info_by_id(pane_id)
             .map(|info| info.inner_rect.height)
@@ -774,9 +1109,11 @@ impl AppState {
         if self.copy_mode_pane_is_focused() {
             self.mode = Mode::Copy;
         } else if self.active.is_some() {
+            self.invalidate_peer_copy_mode_query();
             self.clear_copy_mode_selection();
             self.mode = Mode::Terminal;
         } else {
+            self.invalidate_peer_copy_mode_query();
             self.clear_copy_mode_selection();
             self.mode = Mode::Navigate;
         }
@@ -802,6 +1139,8 @@ impl AppState {
             if copy_mode.search.geometry.is_some() && copy_mode.search.geometry != Some(geometry) {
                 copy_mode.search.matches.clear();
                 copy_mode.search.current = None;
+                self.peer_copy_mode_query_generation =
+                    self.peer_copy_mode_query_generation.wrapping_add(1);
             }
             copy_mode.search.geometry = Some(geometry);
         }
@@ -825,6 +1164,7 @@ impl AppState {
             .into_iter()
             .any(|pane_id| pane_id == copy_mode.pane_id)
         {
+            self.invalidate_peer_copy_mode_query();
             self.clear_selection();
             self.copy_mode = None;
             if self.mode == Mode::Copy {
@@ -1120,7 +1460,7 @@ mod tests {
 
     fn copy_mode_clipboard_text(app: &mut App) -> String {
         match app.event_rx.try_recv().expect("clipboard event") {
-            AppEvent::ClipboardWrite { content } => {
+            AppEvent::ClipboardWrite { content, .. } => {
                 String::from_utf8(content).expect("utf8 clipboard")
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1173,6 +1513,40 @@ mod tests {
             app.state.copy_mode.as_ref().expect("copy mode").pane_id,
             pane_id
         );
+    }
+
+    #[tokio::test]
+    async fn stale_peer_search_reply_cannot_replace_newer_copy_mode_state() {
+        let (mut app, pane_id) = app_with_copy_screen(b"alpha\nbeta\n");
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+        app.state.peer_copy_mode_query_generation = 2;
+
+        app.handle_peer_copy_mode_query_finished(crate::events::PeerCopyModeQueryResult {
+            request: crate::app::state::PeerCopyModeQuery {
+                generation: 1,
+                pane_id,
+                query: crate::api::schema::PaneTextQuery::Search {
+                    query: "stale".into(),
+                    case_sensitive: false,
+                },
+                action: crate::app::state::PeerCopyModeQueryAction::Search {
+                    direction: CopyModeSearchDirection::Forward,
+                    repeat: false,
+                    cursor: crate::pane::TerminalTextPoint { row: 0, col: 0 },
+                    previous: None,
+                },
+            },
+            result: Ok(crate::api::schema::PaneTextQueryAnswer::Search {
+                matches: vec![crate::api::schema::PaneTextMatch {
+                    start: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+                    end: crate::api::schema::PaneTextPoint { row: 0, col: 4 },
+                }],
+            }),
+        });
+
+        let search = &app.state.copy_mode.as_ref().expect("copy mode").search;
+        assert!(search.query.is_empty());
+        assert!(search.matches.is_empty());
     }
 
     #[tokio::test]
@@ -2124,7 +2498,7 @@ mod tests {
         app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()));
 
         match app.event_rx.try_recv().expect("clipboard event") {
-            AppEvent::ClipboardWrite { content } => assert_eq!(content, b"alp"),
+            AppEvent::ClipboardWrite { content, .. } => assert_eq!(content, b"alp"),
             other => panic!("unexpected event: {other:?}"),
         }
         assert_eq!(app.state.mode, Mode::Terminal);

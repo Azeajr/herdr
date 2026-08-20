@@ -40,6 +40,10 @@ fn tab_list(args: &[String]) -> std::io::Result<i32> {
                 workspace_id = Some(super::normalize_workspace_id(value));
                 index += 2;
             }
+            // Accepted and ignored, like the same flag on `pane list` and
+            // `worktree`: the answer is always JSON, but `peer list` needs the
+            // flag to get there.
+            "--json" => index += 1,
             other => {
                 eprintln!("unknown option: {other}");
                 return Ok(2);

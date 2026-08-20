@@ -1,8 +1,36 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use tokio::sync::Notify;
 
 use crate::layout::PaneId;
+
+/// The running server loop's wake handle.
+///
+/// Local PTY output reaches the loop through a pane that was handed this at
+/// construction. A peer view cannot be: it is opened on a worker thread, from a
+/// call chain several frames deep that carries no application state, and the
+/// runtime is only handed back to the loop afterwards. Threading the handle
+/// through that chain would mean widening every function on it, and installing
+/// it afterwards would mean every install site remembering to — with a missed
+/// one costing that view a render deadline and nothing louder.
+///
+/// So it is published once, when the server starts, and read by whoever needs
+/// to wake it. [`crate::instance_id::active`] is reached the same way from the
+/// same code path.
+static SERVER_WAKE: OnceLock<Arc<Notify>> = OnceLock::new();
+
+/// Publishes the loop's wake handle. Called once, as the server starts.
+pub(crate) fn set_server_wake(notify: Arc<Notify>) {
+    let _ = SERVER_WAKE.set(notify);
+}
+
+/// The loop's wake handle, absent outside a running server — in tests, and in
+/// the client process, where there is no loop to wake.
+pub(crate) fn server_wake() -> Option<Arc<Notify>> {
+    SERVER_WAKE.get().cloned()
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct RenderRequest {

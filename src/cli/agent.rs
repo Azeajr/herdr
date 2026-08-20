@@ -158,6 +158,14 @@ fn agent_explain(args: &[String]) -> std::io::Result<i32> {
 fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
     println!("agent: {}", explain["agent"].as_str().unwrap_or("unknown"));
     println!("state: {}", explain["state"].as_str().unwrap_or("unknown"));
+    // Printed above the manifest line because it qualifies it: everything below
+    // comes from the peer's install, not this one.
+    if let Some(peer) = explain["peer"].as_str() {
+        match explain["peer_pane_id"].as_str() {
+            Some(pane) => println!("peer: {peer} ({pane})"),
+            None => println!("peer: {peer}"),
+        }
+    }
     println!(
         "manifest: {} {}",
         explain["manifest_source"].as_str().unwrap_or("none"),

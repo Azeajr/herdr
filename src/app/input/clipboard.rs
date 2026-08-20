@@ -7,6 +7,21 @@ use crate::{
 
 use super::{ConsumedInputLease, InputLeaseKey};
 
+/// Pulls the text out of a `pane.read_range` reply, or `None` if it failed.
+///
+/// Parsed rather than deserialized into the schema type because the reply may
+/// be an error envelope, and an error here is a copy that does not happen —
+/// not something to report as empty text.
+fn peer_selection_text(response: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(response).ok()?;
+    value
+        .get("result")?
+        .get("read")?
+        .get("text")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn is_retained_selection_copy_key(key: &TerminalKey) -> bool {
     matches!(key.code, KeyCode::Char('c' | 'C'))
         && matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER)
@@ -19,11 +34,80 @@ impl App {
         };
         if self
             .event_tx
-            .try_send(crate::events::AppEvent::ClipboardWrite { content })
+            .try_send(crate::events::AppEvent::ClipboardWrite {
+                pane_id: None,
+                content,
+            })
             .is_err()
         {
             tracing::warn!("failed to queue clipboard write event");
         }
+        true
+    }
+
+    /// Asks the server that owns a pane's screen for the text just selected on
+    /// it, and writes the clipboard when it answers.
+    ///
+    /// Off the event loop: this is a request to another machine, and the reply
+    /// arrives as an ordinary clipboard write, which is already how a local
+    /// copy reaches the clipboard. The user sees the copy land a beat later
+    /// rather than the loop stalling for a round trip.
+    pub(super) fn dispatch_pending_peer_selection_copy(&mut self) -> bool {
+        let Some(request) = self.state.request_peer_selection_copy.take() else {
+            return false;
+        };
+        tracing::debug!(
+            pane = request.pane_id.raw(),
+            start = ?request.start,
+            end = ?request.end,
+            "asking peer for selection text"
+        );
+        // The selection this came from was taken on the active workspace, which
+        // is the same one `copy_selection` resolved the runtime through.
+        let Some(ws_idx) = self.state.active else {
+            return false;
+        };
+        let Some(public_pane_id) = self.public_pane_id(ws_idx, request.pane_id) else {
+            return false;
+        };
+
+        let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
+        self.start_peer_pane_read_range(
+            "copy:selection".to_string(),
+            crate::api::schema::PaneReadRangeParams {
+                pane_id: public_pane_id,
+                start_row: request.start.0,
+                start_col: request.start.1,
+                end_row: request.end.0,
+                end_col: request.end.1,
+            },
+            response_tx,
+        );
+
+        std::thread::spawn(move || {
+            let Ok(response) = response_rx.recv() else {
+                return;
+            };
+            let Some(text) = peer_selection_text(&response) else {
+                tracing::warn!(response = %response, "peer selection copy failed");
+                return;
+            };
+            if text.is_empty() {
+                return;
+            }
+            let Some(events) = crate::events::server_events() else {
+                return;
+            };
+            if events
+                .try_send(crate::events::AppEvent::ClipboardWrite {
+                    pane_id: None,
+                    content: text.into_bytes(),
+                })
+                .is_err()
+            {
+                tracing::warn!("failed to queue peer selection copy");
+            }
+        });
         true
     }
 
@@ -44,7 +128,12 @@ impl App {
         }
 
         self.state.copy_selection(&self.terminal_runtimes);
-        if !self.dispatch_pending_clipboard_write() {
+        // A peer-backed pane queues a request rather than a write, and the key
+        // is just as consumed either way — otherwise Ctrl-C over a remote
+        // selection falls through to the pane as an interrupt.
+        let copied =
+            self.dispatch_pending_clipboard_write() | self.dispatch_pending_peer_selection_copy();
+        if !copied {
             return false;
         }
 
@@ -58,6 +147,26 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    /// The reply is parsed rather than trusted: a peer that answered with an
+    /// error must not be read as a successful copy of nothing, which would
+    /// clear nothing but also report nothing.
+    #[test]
+    fn peer_selection_text_reads_only_a_successful_reply() {
+        assert_eq!(
+            peer_selection_text(
+                r#"{"id":"copy:selection","result":{"type":"pane_read_range","read":{"pane_id":"w2:p1","text":"hello"}}}"#
+            ),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            peer_selection_text(
+                r#"{"id":"copy:selection","error":{"code":"unavailable","message":"peer request failed"}}"#
+            ),
+            None
+        );
+        assert_eq!(peer_selection_text("not json at all"), None);
+    }
+
     use bytes::Bytes;
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
@@ -116,7 +225,7 @@ mod tests {
 
     fn clipboard_write_content(app: &mut App) -> Vec<u8> {
         match app.event_rx.try_recv().expect("clipboard write event") {
-            AppEvent::ClipboardWrite { content } => content,
+            AppEvent::ClipboardWrite { content, .. } => content,
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -158,7 +267,10 @@ mod tests {
         assert!(app.state.selection.is_none());
         assert!(input_rx.try_recv().is_err());
 
-        app.handle_internal_event(AppEvent::ClipboardWrite { content });
+        app.handle_internal_event(AppEvent::ClipboardWrite {
+            pane_id: None,
+            content,
+        });
         assert_eq!(
             app.state
                 .copy_feedback

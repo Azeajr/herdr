@@ -10,12 +10,6 @@ use interprocess::local_socket::traits::Stream as _;
 pub(crate) type LocalListener = interprocess::local_socket::Listener;
 pub(crate) type LocalStream = interprocess::local_socket::Stream;
 
-pub(crate) enum LocalStreamRead {
-    Data,
-    Pending,
-    Closed,
-}
-
 pub(crate) enum LocalStreamReadCount {
     Data(usize),
     Pending,
@@ -168,20 +162,6 @@ pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListen
     }
 }
 
-pub(crate) fn poll_local_stream_read(
-    stream: &mut LocalStream,
-    buf: &mut [u8],
-) -> io::Result<LocalStreamRead> {
-    match poll_local_stream_read_count(stream, buf)? {
-        LocalStreamReadCount::Data(read) => {
-            let _ = read;
-            Ok(LocalStreamRead::Data)
-        }
-        LocalStreamReadCount::Pending => Ok(LocalStreamRead::Pending),
-        LocalStreamReadCount::Closed => Ok(LocalStreamRead::Closed),
-    }
-}
-
 pub(crate) fn poll_local_stream_read_count(
     stream: &mut LocalStream,
     buf: &mut [u8],
@@ -265,6 +245,92 @@ fn windows_named_pipe_available(stream: &mut LocalStream) -> io::Result<Option<u
         return Ok(None);
     }
     Err(err)
+}
+
+/// Applies (or clears, with `None`) both directions' timeouts on `stream`.
+///
+/// Windows named pipes report `Unsupported` for these rather than failing the
+/// operation, and a caller that only wanted a bound is better served by an
+/// unbounded socket than by a connection that refuses to open.
+pub(crate) fn set_local_stream_timeouts(
+    stream: &LocalStream,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
+    use interprocess::local_socket::traits::Stream as _;
+
+    for result in [
+        stream.set_recv_timeout(timeout),
+        stream.set_send_timeout(timeout),
+    ] {
+        match result {
+            Ok(()) => {}
+            #[cfg(windows)]
+            Err(err) if err.kind() == io::ErrorKind::Unsupported => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+/// Applies (or clears, with `None`) only the send timeout on `stream`.
+///
+/// A framed reader cannot carry a timeout without risking a half-consumed
+/// message, but the write half has no such constraint: a caller that wants a
+/// bound on writes while leaving reads parked needs the two set apart.
+/// `Unsupported` is tolerated for the same reason as in
+/// [`set_local_stream_timeouts`].
+pub(crate) fn set_local_stream_send_timeout(
+    stream: &LocalStream,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
+    use interprocess::local_socket::traits::Stream as _;
+
+    match stream.set_send_timeout(timeout) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Wakes a thread parked reading `stream`, reporting whether it could.
+///
+/// A framed reader cannot use a read timeout to notice a shutdown request: the
+/// framing reads a length prefix and then exactly that many bytes, so a timeout
+/// firing mid-message would leave the stream desynchronized with a partial frame
+/// consumed. Shutting the socket down has no such hazard — the blocked read
+/// returns end-of-stream immediately and the connection is over either way.
+///
+/// `Ok(false)` means the platform offers no such interruption, so a caller must
+/// abandon that thread rather than wait for it.
+pub(crate) fn shutdown_local_stream(stream: &LocalStream) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let LocalStream::UdSocket(socket) = stream;
+        // SAFETY: the borrow keeps the descriptor open for the whole call, and
+        // `shutdown` only changes the socket's own read/write state.
+        let result = unsafe { libc::shutdown(socket.as_fd().as_raw_fd(), libc::SHUT_RDWR) };
+        if result == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        // A connection that is already down needs no interrupting: the reader is
+        // on its way out of the blocking read regardless.
+        if is_connection_closed_error(&err) || err.raw_os_error() == Some(libc::ENOTCONN) {
+            return Ok(true);
+        }
+        Err(err)
+    }
+
+    #[cfg(windows)]
+    {
+        // A named pipe has no equivalent that unblocks a read already pending on
+        // another thread, so callers detach rather than join there.
+        let _ = stream;
+        Ok(false)
+    }
 }
 
 pub(crate) fn is_connection_closed_error(err: &io::Error) -> bool {

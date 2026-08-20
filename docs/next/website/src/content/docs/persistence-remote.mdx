@@ -100,6 +100,154 @@ Use `--session` with `--remote` to attach to a named session on the remote host:
 herdr --remote workbox --session agents
 ```
 
+## Federated peer servers
+
+`herdr --remote` replaces your session with someone else's. Peers are the other shape: your own Herdr server connects to another Herdr server and shows its workspaces beside your own, so one sidebar can hold work from several machines at once.
+
+Peers are configured per server and survive a restart. A peer is only a connection; it never moves a pane. Each machine keeps owning and running its own terminals.
+
+### Connect to another machine
+
+One command sets up SSH, adds the peer, waits for it to come up, and opens a workspace on it:
+
+```bash
+herdr peer connect you@workbox
+```
+
+The first time, it will offer to install an SSH key and, if the remote has no matching Herdr, to install that too. Both are questions, asked in your terminal, and both happen once. Everything after that is automatic.
+
+Add `--new` to always start a fresh workspace on the peer instead of attaching to the one it already has focused, `--name` to call the peer something other than its hostname, and `--peer-session` to pick a named session on it.
+
+You can also do it without leaving Herdr: open the menu in the sidebar footer and choose **add peer**, or right-click a peer header and choose **Add peer...**. Type the destination and Herdr opens a pane running `herdr peer connect` for you, so any password or approval it needs has somewhere to be typed. The pane closes itself once the connection is up; if the connect fails, it stays so you can read the error or retry.
+
+### Why an SSH key, and not a password
+
+Herdr's server dials peers with no terminal attached. SSH reads passwords from the terminal, not from a pipe, so a background server cannot answer a password prompt — not for the first connection, and not for the reconnects it makes on its own after a laptop lid closes or a network drops.
+
+So `herdr peer connect` and `herdr peer add` check first, from your terminal, where a prompt still works. If SSH cannot get in without asking for something, they offer to generate a key at `~/.config/herdr/peer_id_ed25519` and install it on the peer. That is the one time you type your password.
+
+The key has no passphrase, deliberately: a peer reconnects unattended, and a key that needs an agent unlocked would fail exactly when nobody is watching. It is created readable only by you.
+
+Installing it replaces whatever this machine put in the peer's `authorized_keys` last time rather than adding another line, so a key you regenerate — after clearing your config directory, say — does not leave its predecessor behind with nothing able to remove it. Keys installed from your other machines are left alone, as is any entry you have edited to carry SSH options.
+
+One key serves every peer, and it is kept: herdr does not rotate or delete it when a connection drops, a peer is removed, or the server stops. That is what lets a peer reconnect unattended, and what lets the next setup run recognise and replace its own entry on a target. Removing a peer therefore leaves its key on that machine — take it out of the peer's `authorized_keys` yourself if you want access revoked.
+
+To set a destination up without adding a peer yet, or to fix one after the fact:
+
+```bash
+herdr peer setup-ssh you@workbox
+```
+
+Pass `--yes` to skip the confirmations, or `--skip-ssh-check` to add a peer without any of this — useful when you have already arranged key access yourself.
+
+If a peer cannot authenticate, it reports `error` and stops retrying rather than looping forever on a credential that is never going to appear. `herdr peer list` shows the reason and the command that fixes it.
+
+### Add a peer manually
+
+A peer on the same machine is named by its API socket path:
+
+```bash
+herdr peer add beta --socket /home/you/.config/herdr/sessions/beta/herdr.sock
+```
+
+A peer on another host is named by an SSH destination, optionally with a named session on that host:
+
+```bash
+herdr peer add workbox --ssh workbox --peer-session agents
+```
+
+The flag is `--peer-session`, not `--session`: `--session` chooses which of *your* servers the command talks to, and every `herdr` command accepts it.
+
+The same two peers over the [socket API](/docs/socket-api/):
+
+```json
+{"id":"1","method":"peer.add","params":{"name":"beta","target":{"type":"socket_path","path":"/home/you/.config/herdr/sessions/beta/herdr.sock"}}}
+{"id":"2","method":"peer.add","params":{"name":"workbox","target":{"type":"ssh","destination":"workbox","session":"agents"}}}
+```
+
+The SSH destination uses your SSH config, exactly like `herdr --remote`. The peer name is optional for an SSH peer and defaults to the destination's host.
+
+The running *server* never installs or replaces Herdr on a remote host: it cannot ask you to approve writing to another machine. `herdr peer connect` and `herdr peer add` can, because they run in your terminal, so they offer to install a matching build before handing the peer over to the server. `--skip-ssh-check` opts out of that, and then the remote must already run a matching build — install one with `herdr --remote <destination>`.
+
+An SSH peer holds its connection for as long as the peer is configured, not just while you are looking at it. Removing the peer tears the connection down:
+
+```bash
+herdr peer remove workbox
+```
+
+`herdr peer list` prints every peer with its target, its connection state (`connecting`, `connected`, `reconnecting`, `error`), and how many workspaces it has reported. `reconnecting` and `error` mean different things and are worth distinguishing: `reconnecting` is still trying, `error` has given up, and a reconnecting peer shows its attempt count. Add `--json` for the full record, which also carries the peer's version, protocol, and the workspaces themselves. `add`, `remove`, and `list` all answer with the whole peer list, so any of them shows you where you ended up.
+
+### Open a peer's workspace
+
+Right-click a peer's header in the sidebar and choose **Open workspace...** to browse the workspaces that peer has reported. The header carries an `open/total` count, so you can see there is something to open before opening it.
+
+The header and the picker both name a peer by the name you gave it, not by its target — a socket peer's target is a full path, and a sidebar has no room for one. `herdr peer list` is where you check which machine a name points at. Entries already open are marked, and picking one switches to the view you have rather than opening a second.
+
+To start a *new* workspace on the peer rather than attach to one it already has:
+
+```bash
+herdr peer connect workbox --new
+```
+
+```json
+{"id":"3","method":"peer.workspace.create","params":{"name":"workbox","focus":true}}
+```
+
+`peer.workspace.create` asks the peer to make a workspace and opens a local view onto it in one step. It answers with the *local* workspace, since that is the one you can act on.
+
+The same thing for a workspace the peer already has, from the command line or the API, using an id from `peer list`:
+
+```bash
+herdr peer open <instance-id>:w1 --focus
+```
+
+```json
+{"id":"3","method":"peer.workspace.open","params":{"target":"<instance-id>:w1","focus":true}}
+```
+
+The target accepts a workspace id, a pane id, or a terminal id. Ids that came from the peer list are namespaced with the peer's instance id, which is enough to identify the peer; name the peer as well — `--peer` on the command line, `name` in the API — only when the target is a bare peer-local id.
+
+Opening a peer workspace creates a *local* workspace whose content comes from the peer. Its layout, focus, and size are yours: the peer renders its terminal at the size your layout gives it. Closing it leaves everything on the peer running.
+
+Splitting a peer-backed pane splits it **on the peer**, and opens a second view onto the new pane. A pane created that way is closed on the peer when you close your view, because you asked for it. A view onto a pane the peer already had is never closed on the peer.
+
+A tab created in a peer workspace is created on the peer too, and renaming it renames the peer's tab, since it is the same tab. The rename applies here first and travels afterwards, so an unreachable peer leaves the two names disagreeing until the next rename rather than refusing to rename anything. Focus stays yours: switching tabs here never moves the focus of whoever is using the peer.
+
+The reverse does not happen: a tab the peer opens on its own does not appear in your view. A peer workspace holds the tabs *you* opened in it, each one real on the peer, rather than mirroring the peer's window.
+
+Worktree actions in a peer workspace run **on the peer**, because that is where the repo is. `worktree list`, `worktree create`, `worktree open`, and `worktree remove` all take the local id of the peer workspace and are carried across:
+
+```bash
+herdr worktree create --workspace w2 --branch worktree/issue-84
+```
+
+The peer makes the checkout in *its* worktree directory — yours names a path on the wrong machine — and the new workspace comes back as a second peer view, the same shape `peer open` produces. `worktree remove` deletes the checkout on the peer and closes your view of it. Workspace ids in a `worktree list` answer are restated in yours: a checkout you already have a view onto is reported as that view, one the peer has open but you do not is reported as a peer id you can pass to `workspace focus`, and one nobody has open carries no id at all.
+
+The peer answers for its own repo, so its refusals are its own: a checkout with uncommitted files reports `dirty_worktree_requires_force` about files on that machine, and a workspace that is not inside a Git work tree reports `not_git_worktree` about a directory that does not exist here. The right-click menu on a peer workspace offers **New worktree** and **Open worktree…** the same way it does locally, and the dialogs fill in from the peer — so the list you pick from, and the repo the new checkout goes in, are the peer's.
+
+Passing `--cwd` instead of `--workspace` always means *this* machine's filesystem, even while a peer workspace is focused.
+
+If the connection drops, the pane keeps showing the peer's last screen, dimmed, with a line saying whether it is coming back — `reconnecting to <peer>… (attempt N)` or `disconnected from <peer>: <reason>`. It reconnects on its own as soon as the peer is reachable again. If the peer answers that the pane no longer exists — you typed `exit` in it, or closed it over there — the pane closes locally too, exactly as if its process had exited on this machine. The gray `disconnected` state remains for a peer that is unreachable or was replaced by a different server.
+
+### What a peer-backed pane can do
+
+A peer-backed pane holds no terminal state of its own. The peer owns the screen and streams the rendered cells, which decides what works:
+
+- **Typing, resizing, and the mouse wheel** work. The wheel scrolls the peer's scrollback, and the peer applies the running program's own wheel behavior.
+- **`pane.read` works**, answered by the peer. When the peer is unreachable the read fails with `unavailable` naming the peer's state, rather than returning an empty screen.
+- **There is no scrollbar**, because the scroll position lives on the peer.
+- **Copy mode does not open.** Selection and search read the local screen, which is not here; Herdr says so instead of opening a copy mode that would find nothing.
+- **`agent.read` works**, answered by the peer for the same reason `pane.read` is.
+- **`agent.explain` works**, answered by the peer that ran the rules. The explanation carries a `peer` field and the pane id on that peer, because the manifest source, version, and rule ids in it belong to the peer's install and not to yours. `herdr agent explain` prints that as a `peer:` line above the manifest line.
+
+### What the peer reports about its pane
+
+The pane's directory, terminal title, and agent cannot be read locally either, so they come from the peer along with the screen. They appear wherever a local pane's would — `pane.get`, `pane.list`, `agent.list`, `agent.wait`, the sidebar, and the workspace's own status — and a peer's agent going from working to idle reaches you the same way a local one does.
+
+They refresh within about a second and a half, so a peer's pane can read as briefly stale where a local one would not. A dropped connection keeps the last labels rather than blanking them, and they update again when the peer returns.
+
+`pane.get` and `pane.list` report `peer` on such a pane, so a client can tell the difference without discovering it one failure at a time.
+
 ## Direct terminal attach
 
 Full Herdr attach opens the whole workspace UI. Direct attach opens one server-owned terminal in your current terminal.

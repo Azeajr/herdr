@@ -65,7 +65,7 @@ impl App {
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| {
             self.resolve_new_terminal_cwd(self.focused_pane_cwd_in_workspace(ws_idx))
         });
-        let (rows, cols) = self.state.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.state.estimate_pane_size();
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
@@ -157,6 +157,12 @@ impl App {
         };
         tab.set_custom_name(params.label.clone());
         crate::logging::tab_renamed(&workspace_id, &tab_id);
+        // A tab inside a peer view names a tab the peer really owns — `tab.create`
+        // made it there — so the name follows it across. Local first and the
+        // forward best-effort, unlike the fully diverted peer requests: the label
+        // you typed must change here even when the peer is unreachable, and a
+        // rename must not block on another machine.
+        self.forward_tab_rename_to_peer(ws_idx, tab_idx, &params.label);
         if self.state.active == Some(ws_idx) {
             // Reflow the tab bar so the new label width takes effect immediately.
             // The tab bar renders into cached hit areas; without this refresh the

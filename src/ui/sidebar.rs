@@ -248,6 +248,24 @@ fn workspace_attention_priority(state: AgentState, seen: bool) -> u8 {
     }
 }
 
+/// Whether a workspace holds a pane created for another herdr server that is no
+/// longer connected to it.
+///
+/// The pane keeps running either way; this only says nobody is watching it from
+/// the side that asked for it.
+fn workspace_has_unattended_owner(app: &AppState, ws: &crate::workspace::Workspace) -> bool {
+    ws.tabs.iter().any(|tab| {
+        tab.panes.values().any(|pane| {
+            app.terminals
+                .get(&pane.attached_terminal_id)
+                .and_then(|terminal| terminal.owner_instance_id.as_deref())
+                .is_some_and(|owner| {
+                    !app.instance_attached_to_terminal(owner, &pane.attached_terminal_id)
+                })
+        })
+    })
+}
+
 fn space_aggregate_state(app: &AppState, key: &str) -> (AgentState, bool) {
     app.workspaces
         .iter()
@@ -300,7 +318,23 @@ pub(crate) fn grouped_child_display_label(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
-    Workspace { ws_idx: usize, indented: bool },
+    Workspace {
+        ws_idx: usize,
+        indented: bool,
+    },
+    /// Group header naming the peer that backs the workspaces below it.
+    PeerHeader {
+        peer: String,
+    },
+}
+
+/// Collapse key for a peer group.
+///
+/// Peer groups reuse `collapsed_space_keys` rather than adding a parallel set,
+/// so collapse state persists with the session for free. The prefix keeps peer
+/// keys from colliding with worktree space keys.
+pub(crate) fn peer_collapse_key(peer: &str) -> String {
+    format!("peer:{peer}")
 }
 
 pub(crate) fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
@@ -374,6 +408,10 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
     let mut emitted_groups = std::collections::HashSet::<String>::new();
     let mut entries = Vec::new();
     for (ws_idx, ws) in app.workspaces.iter().enumerate() {
+        // Peer-backed workspaces are emitted below, grouped under their peer.
+        if ws.peer.is_some() {
+            continue;
+        }
         let Some(space) = ws
             .worktree_space()
             .filter(|space| grouped_keys.contains(&space.key))
@@ -432,6 +470,66 @@ fn workspace_list_entries_inner(app: &AppState, force_expanded: bool) -> Vec<Wor
             }
         }
     }
+
+    // Peer groups come after local workspaces, each under a header naming the
+    // peer. Peer registry order is used so groups keep a stable position
+    // regardless of the order their workspaces were opened in.
+    for peer in app.peers.iter() {
+        let members: Vec<usize> = app
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(ws_idx, ws)| {
+                (ws.peer.as_deref() == Some(peer.handle.as_str())).then_some(ws_idx)
+            })
+            .collect();
+        // A peer that has reported workspaces gets a header even before any of
+        // them is open here: the header is how those unopened workspaces are
+        // reached, so requiring one to already be open would make the rest
+        // undiscoverable.
+        if members.is_empty() && peer.workspaces.is_empty() {
+            continue;
+        }
+
+        // A hidden peer stays out of the sidebar, but hiding never takes open
+        // workspaces with it — the same invariant the collapsed path keeps
+        // below. Config-sourced hides can outlive the workspaces they were
+        // declared against, so this is checked here and not only at menu time.
+        if members.is_empty()
+            && (app.hidden_peers.contains(peer.handle.as_str())
+                || app.hidden_peers_config.contains(peer.handle.as_str()))
+        {
+            continue;
+        }
+
+        entries.push(WorkspaceListEntry::PeerHeader {
+            peer: peer.handle.as_str().to_string(),
+        });
+
+        let collapsed = !force_expanded
+            && app
+                .collapsed_space_keys
+                .contains(&peer_collapse_key(peer.handle.as_str()));
+        if collapsed {
+            // A collapsed group still shows the workspace currently in view, so
+            // collapsing never hides where the user actually is.
+            if let Some(visible) = visible_group_idx.filter(|idx| members.contains(idx)) {
+                entries.push(WorkspaceListEntry::Workspace {
+                    ws_idx: visible,
+                    indented: true,
+                });
+            }
+            continue;
+        }
+
+        for ws_idx in members {
+            entries.push(WorkspaceListEntry::Workspace {
+                ws_idx,
+                indented: true,
+            });
+        }
+    }
+
     entries
 }
 
@@ -463,6 +561,8 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
     let entries = workspace_list_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
         let (row_height, gap) = match entry {
+            // A header is a single row and never carries a gap of its own.
+            WorkspaceListEntry::PeerHeader { .. } => (1, 0),
             WorkspaceListEntry::Workspace { ws_idx, indented } => {
                 let Some(ws) = app.workspaces.get(*ws_idx) else {
                     continue;
@@ -489,7 +589,18 @@ fn workspace_list_bottom_start(app: &AppState, area: Rect) -> usize {
     let mut used_rows = 0u16;
     let mut start = entries.len();
     for (entry_idx, entry) in entries.iter().enumerate().rev() {
-        let WorkspaceListEntry::Workspace { ws_idx, indented } = entry;
+        let (ws_idx, indented) = match entry {
+            WorkspaceListEntry::Workspace { ws_idx, indented } => (ws_idx, indented),
+            // A header occupies one row and anchors nothing.
+            WorkspaceListEntry::PeerHeader { .. } => {
+                if used_rows.saturating_add(1) > body.height {
+                    break;
+                }
+                used_rows = used_rows.saturating_add(1);
+                start = entry_idx;
+                continue;
+            }
+        };
         let Some(workspace) = app.workspaces.get(*ws_idx) else {
             continue;
         };
@@ -658,7 +769,10 @@ pub(crate) fn agent_panel_scrollbar_rect(app: &AppState, area: Rect) -> Option<R
 pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
-) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
+) -> (
+    Vec<crate::app::state::WorkspaceCardArea>,
+    Vec<crate::app::state::PeerHeaderArea>,
+) {
     let ws_area = workspace_list_rect(area, app.sidebar_section_split);
     if ws_area == Rect::default() {
         return (Vec::new(), Vec::new());
@@ -674,11 +788,21 @@ pub(crate) fn compute_workspace_list_areas(
     let mut row_y = body.y;
     let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
-    let headers = Vec::new();
+    let mut headers = Vec::new();
 
     let entries = workspace_list_entries(app);
     for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
         match entry {
+            WorkspaceListEntry::PeerHeader { peer } => {
+                if row_y.saturating_add(1) > body_bottom {
+                    break;
+                }
+                headers.push(crate::app::state::PeerHeaderArea {
+                    peer: peer.clone(),
+                    rect: Rect::new(body.x, row_y, body.width, 1),
+                });
+                row_y = row_y.saturating_add(1).min(body_bottom);
+            }
             WorkspaceListEntry::Workspace { ws_idx, indented } => {
                 let Some(ws) = app.workspaces.get(*ws_idx) else {
                     continue;
@@ -913,6 +1037,7 @@ pub(crate) fn workspace_drop_slots(
                     indented: false,
                 } => Some(*ws_idx),
                 WorkspaceListEntry::Workspace { .. } => None,
+                WorkspaceListEntry::PeerHeader { .. } => None,
             })
     };
 
@@ -954,7 +1079,11 @@ pub(crate) fn workspace_drop_slots(
         Some(WorkspaceListEntry::Workspace { ws_idx, .. }) => {
             crate::app::state::WorkspaceDropTarget::Before(*ws_idx)
         }
-        None => crate::app::state::WorkspaceDropTarget::End,
+        // Dropping onto a peer header means "after everything local", since a
+        // local workspace cannot be reordered into a peer group.
+        Some(WorkspaceListEntry::PeerHeader { .. }) | None => {
+            crate::app::state::WorkspaceDropTarget::End
+        }
     };
     let row = last.rect.y.saturating_add(last.rect.height);
     if row < list_bottom
@@ -1244,6 +1373,78 @@ fn render_workspace_list(
     let cards = &app.view.workspace_card_areas;
     let entries = workspace_list_entries(app);
 
+    for header in &app.view.peer_header_areas {
+        if header.rect.y >= list_bottom || header.rect.width == 0 {
+            continue;
+        }
+        let Some(peer) = app
+            .peers
+            .iter()
+            .find(|peer| peer.handle.as_str() == header.peer)
+        else {
+            continue;
+        };
+        let collapsed = app
+            .collapsed_space_keys
+            .contains(&peer_collapse_key(&header.peer));
+        // Connection state drives colour so a peer that is not currently
+        // usable reads differently at a glance from one that is.
+        let (dot, dot_color) = if peer.connection.is_connected() {
+            ("●", p.green)
+        } else if matches!(
+            peer.connection,
+            crate::app::peers::PeerConnectionState::Error { .. }
+        ) {
+            ("✖", p.red)
+        } else {
+            ("◌", p.yellow)
+        };
+        let chevron = if collapsed { "▸" } else { "▾" };
+        // Panes left running on the peer because a close never reached it. The
+        // count is the only local trace of them, so it stays visible rather than
+        // living in the log.
+        let uncleaned = peer.failed_pane_cleanups();
+        // How many of the peer's workspaces are open here, out of how many it
+        // reported. The unopened ones are reachable through the header's
+        // context menu, and this count is what says they exist.
+        let enumerated = peer.workspaces.len();
+        let opened = app
+            .workspaces
+            .iter()
+            .filter(|ws| ws.peer.as_deref() == Some(header.peer.as_str()))
+            .count();
+        let counts = (enumerated > 0).then(|| format!(" {opened}/{enumerated}"));
+        let label_width = header
+            .rect
+            .width
+            .saturating_sub(if uncleaned > 0 { 10 } else { 6 })
+            .saturating_sub(counts.as_deref().map_or(0, display_width_u16))
+            as usize;
+        // The handle, not the label. A socket peer's label is its full socket path,
+        // which truncates to something unidentifiable in a sidebar this narrow, while
+        // the handle is short, user-chosen and unique by construction. The full target
+        // stays available in `peer list` and the API.
+        let mut spans = vec![
+            Span::styled(format!(" {chevron} "), Style::default().fg(p.overlay0)),
+            Span::styled(
+                truncate_end(peer.handle.as_str(), label_width),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(counts) = counts {
+            spans.push(Span::styled(counts, Style::default().fg(p.overlay0)));
+        }
+        if uncleaned > 0 {
+            spans.push(Span::styled(
+                format!(" ⚠{uncleaned}"),
+                Style::default().fg(p.yellow),
+            ));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(dot, Style::default().fg(dot_color)));
+        frame.render_widget(Paragraph::new(Line::from(spans)), header.rect);
+    }
+
     for card in cards {
         let i = card.ws_idx;
         let ws = &app.workspaces[i];
@@ -1274,18 +1475,35 @@ fn render_workspace_list(
             }
         }
 
-        let name_style = if selected || is_active || is_dragged {
+        // A peer-backed workspace whose peer is not connected shows content the
+        // peer produced before it went away. Dim it so stale output is not
+        // mistaken for live output.
+        let peer_stale = ws.peer.as_deref().is_some_and(|handle| {
+            app.peers
+                .iter()
+                .find(|peer| peer.handle.as_str() == handle)
+                .is_none_or(|peer| peer.is_stale())
+        });
+        let name_style = if peer_stale {
+            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+        } else if selected || is_active || is_dragged {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.subtext0)
         };
 
         let label = ws.display_name_from(&app.terminals, terminal_runtimes);
-        let display_label = if card.indented {
+        let mut display_label = if card.indented {
             grouped_child_display_label(&label, ws.branch().as_deref(), ws.custom_name.is_some())
         } else {
             label
         };
+        // Panes another herdr server asked for and is no longer watching. They
+        // are ordinary panes here, so without a mark there is nothing to
+        // distinguish them from ones this machine's user opened.
+        if workspace_has_unattended_owner(app, ws) {
+            display_label.push_str(" ⚑");
+        }
         let parent_group = (!card.indented)
             .then(|| workspace_parent_group_state(app, i))
             .flatten();
@@ -1617,6 +1835,198 @@ mod tests {
                     row_text(buffer, row, width)
                 )
             })
+    }
+
+    fn peer_workspace(name: &str, peer: &str) -> Workspace {
+        let mut workspace = Workspace::test_new(name);
+        workspace.peer = Some(peer.to_string());
+        workspace
+    }
+
+    fn app_with_peer_group() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![
+            Workspace::test_new("local"),
+            peer_workspace("remote-a", "beta"),
+            peer_workspace("remote-b", "beta"),
+        ];
+        app.peers
+            .add(
+                crate::app::peers::PeerHandle::new("beta"),
+                crate::app::peers::PeerTarget::SocketPath("/tmp/b.sock".into()),
+            )
+            .expect("add peer");
+        app
+    }
+
+    #[test]
+    fn peer_workspaces_group_under_a_header_after_local_ones() {
+        let app = app_with_peer_group();
+        let entries = workspace_list_entries(&app);
+
+        assert!(
+            matches!(entries[0], WorkspaceListEntry::Workspace { ws_idx: 0, .. }),
+            "local workspaces come first"
+        );
+        assert!(
+            matches!(&entries[1], WorkspaceListEntry::PeerHeader { peer } if peer == "beta"),
+            "a header introduces the peer group"
+        );
+        assert!(matches!(
+            entries[2],
+            WorkspaceListEntry::Workspace {
+                ws_idx: 1,
+                indented: true
+            }
+        ));
+        assert!(matches!(
+            entries[3],
+            WorkspaceListEntry::Workspace {
+                ws_idx: 2,
+                indented: true
+            }
+        ));
+        assert_eq!(entries.len(), 4);
+    }
+
+    #[test]
+    fn collapsing_a_peer_group_hides_its_workspaces() {
+        let mut app = app_with_peer_group();
+        app.collapsed_space_keys.insert(peer_collapse_key("beta"));
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(entries.len(), 2, "only the local workspace and the header");
+        assert!(matches!(entries[1], WorkspaceListEntry::PeerHeader { .. }));
+    }
+
+    #[test]
+    fn a_collapsed_peer_group_still_shows_where_the_user_is() {
+        let mut app = app_with_peer_group();
+        app.collapsed_space_keys.insert(peer_collapse_key("beta"));
+        app.active = Some(2);
+        app.mode = Mode::Terminal;
+
+        let entries = workspace_list_entries(&app);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| matches!(entry, WorkspaceListEntry::Workspace { ws_idx: 2, .. })),
+            "collapsing must not hide the workspace in view"
+        );
+    }
+
+    #[test]
+    fn a_peer_with_no_open_workspaces_gets_no_header() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("local")];
+        app.peers
+            .add(
+                crate::app::peers::PeerHandle::new("beta"),
+                crate::app::peers::PeerTarget::SocketPath("/tmp/b.sock".into()),
+            )
+            .expect("add peer");
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry, WorkspaceListEntry::PeerHeader { .. })));
+    }
+
+    fn reported_workspace(id: &str, number: usize) -> crate::api::schema::WorkspaceInfo {
+        crate::api::schema::WorkspaceInfo {
+            workspace_id: id.into(),
+            number,
+            label: id.into(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: format!("{id}:t1"),
+            agent_status: crate::api::schema::AgentStatus::Unknown,
+            tokens: Default::default(),
+            worktree: None,
+        }
+    }
+
+    fn app_with_unopened_peer_workspaces() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("local")];
+        let handle = crate::app::peers::PeerHandle::new("beta");
+        app.peers
+            .add(
+                handle.clone(),
+                crate::app::peers::PeerTarget::SocketPath("/tmp/b.sock".into()),
+            )
+            .expect("add peer");
+        // Reported workspaces are only kept once the peer has identified
+        // itself, so the fixture identifies it first.
+        app.peers.set_identity(
+            &handle,
+            crate::app::peers::PeerIdentity {
+                instance_id: "0123456789abcdef0123456789abcdef".into(),
+                version: None,
+                protocol: None,
+            },
+        );
+        app.peers
+            .set_workspaces(&handle, vec![reported_workspace("w1", 1)]);
+        app
+    }
+
+    #[test]
+    fn a_session_hidden_peer_loses_its_header() {
+        let mut app = app_with_unopened_peer_workspaces();
+        assert_eq!(
+            workspace_list_entries(&app).len(),
+            2,
+            "header visible before"
+        );
+
+        app.hidden_peers.insert("beta".to_string());
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry, WorkspaceListEntry::PeerHeader { .. })));
+    }
+
+    #[test]
+    fn a_config_hidden_peer_loses_its_header() {
+        let mut app = app_with_unopened_peer_workspaces();
+        app.hidden_peers_config.insert("beta".to_string());
+
+        let entries = workspace_list_entries(&app);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries
+            .iter()
+            .any(|entry| matches!(entry, WorkspaceListEntry::PeerHeader { .. })));
+    }
+
+    #[test]
+    fn hiding_a_peer_never_hides_its_open_workspaces() {
+        let mut app = app_with_peer_group();
+        app.hidden_peers.insert("beta".to_string());
+        app.hidden_peers_config.insert("beta".to_string());
+
+        let entries = workspace_list_entries(&app);
+        assert!(
+            entries.iter().any(
+                |entry| matches!(&entry, WorkspaceListEntry::PeerHeader { peer } if peer == "beta")
+            ),
+            "a peer with open workspaces keeps its header even when hidden"
+        );
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(entry, WorkspaceListEntry::Workspace { ws_idx: 1, .. })));
+    }
+
+    #[test]
+    fn peer_collapse_keys_cannot_collide_with_worktree_space_keys() {
+        // Worktree space keys are filesystem-derived and never carry this
+        // prefix, so the two namespaces stay disjoint in one shared set.
+        assert_eq!(peer_collapse_key("beta"), "peer:beta");
+        assert_ne!(peer_collapse_key("beta"), "beta");
     }
 
     #[test]

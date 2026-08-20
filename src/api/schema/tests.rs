@@ -36,7 +36,7 @@ fn protocol_schema_document() -> serde_json::Value {
         "schema_version": 1,
         "protocol": crate::protocol::PROTOCOL_VERSION,
         "schemas": {
-            "request": protocol_schema_entry::<Request>("request"),
+            "request": protocol_schema_entry::<RequestEnvelope>("request"),
             "success_response": protocol_schema_entry::<SuccessResponse>("success_response"),
             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
             "event": protocol_schema_entry::<EventEnvelope>("event"),
@@ -59,6 +59,32 @@ fn request_uses_dot_method_names() {
 
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "workspace.create");
+}
+
+#[test]
+fn request_envelope_preserves_unguarded_requests_and_serializes_instance_preconditions() {
+    let request = Request {
+        id: "req_1".into(),
+        method: Method::Ping(PingParams::default()),
+    };
+    let plain = serde_json::to_value(RequestEnvelope::from(request.clone())).unwrap();
+    assert!(plain.get("if_instance_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<RequestEnvelope>(plain)
+            .unwrap()
+            .request,
+        request
+    );
+
+    let guarded = RequestEnvelope {
+        request,
+        if_instance_id: Some("0123456789abcdef0123456789abcdef".into()),
+    };
+    let guarded = serde_json::to_value(guarded).unwrap();
+    assert_eq!(
+        guarded["if_instance_id"],
+        "0123456789abcdef0123456789abcdef"
+    );
 }
 
 #[test]
@@ -641,12 +667,29 @@ fn success_response_round_trips() {
                 live_handoff: true,
                 detached_server_daemon: true,
             }),
+            instance_id: Some("0123456789abcdef0123456789abcdef".into()),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+}
+
+#[test]
+fn pong_without_instance_id_still_decodes() {
+    // Servers older than instance ids omit the field entirely.
+    let json = r#"{"id":"req_1","result":{"type":"pong","version":"0.1.2","protocol":6}}"#;
+    let restored: SuccessResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        restored.result,
+        ResponseResult::Pong {
+            version: "0.1.2".into(),
+            protocol: 6,
+            capabilities: None,
+            instance_id: None,
+        }
+    );
 }
 
 #[test]
@@ -743,11 +786,18 @@ fn worktree_request_and_response_round_trip() {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 display_agent: None,
+                agent_osc_title: None,
+                agent_osc_progress: None,
                 agent_status: AgentStatus::Unknown,
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
+                keyboard_protocol: None,
+                peer: None,
+                peer_view: None,
+                owner_instance_id: None,
+                owner_attached: None,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1171,11 +1221,18 @@ fn create_response_round_trips_with_root_pane() {
                 terminal_title: None,
                 terminal_title_stripped: None,
                 display_agent: None,
+                agent_osc_title: None,
+                agent_osc_progress: None,
                 agent_status: AgentStatus::Unknown,
                 state_labels: HashMap::new(),
                 tokens: HashMap::new(),
                 agent_session: None,
                 scroll: None,
+                keyboard_protocol: None,
+                peer: None,
+                peer_view: None,
+                owner_instance_id: None,
+                owner_attached: None,
                 revision: 0,
             },
         },
@@ -1317,4 +1374,42 @@ fn popup_close_request_round_trips() {
 
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
+}
+
+#[test]
+fn pane_text_query_request_and_response_round_trip() {
+    let request = Request {
+        id: "text-query".into(),
+        method: Method::PaneTextQuery(PaneTextQueryParams {
+            pane_id: "w1:p2".into(),
+            query: PaneTextQuery::Motion {
+                row: 41,
+                col: 7,
+                motion: PaneTextMotion::NextWordStart,
+            },
+        }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "pane.text_query");
+    assert_eq!(json["params"]["type"], "motion");
+    assert_eq!(serde_json::from_value::<Request>(json).unwrap(), request);
+
+    let response = SuccessResponse {
+        id: "text-query".into(),
+        result: ResponseResult::PaneTextQuery {
+            query: PaneTextQueryResult {
+                pane_id: "w1:p2".into(),
+                answer: PaneTextQueryAnswer::Motion {
+                    target: Some(PaneTextPoint { row: 42, col: 0 }),
+                },
+            },
+        },
+    };
+    let json = serde_json::to_value(&response).unwrap();
+    assert_eq!(json["result"]["type"], "pane_text_query");
+    assert_eq!(json["result"]["query"]["type"], "motion");
+    assert_eq!(
+        serde_json::from_value::<SuccessResponse>(json).unwrap(),
+        response
+    );
 }

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid, scrub_inherited_herdr_env,
     unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
 };
 
@@ -121,6 +121,11 @@ fn spawn_server(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -181,6 +186,7 @@ fn client_handshake(
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
+            &[0u8],                 // Option<instance_id>::None
         ],
     );
     let framed = frame_message(&hello_payload);
@@ -555,6 +561,11 @@ fn duplicate_server_start_fails_gracefully() {
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);

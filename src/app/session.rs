@@ -5,8 +5,10 @@ use super::{App, SESSION_SAVE_DEBOUNCE};
 enum SessionSaveJob {
     Clear,
     Save {
-        snapshot: crate::persist::SessionSnapshot,
-        history: Option<crate::persist::SessionHistorySnapshot>,
+        snapshot: Box<crate::persist::SessionSnapshot>,
+        /// Named on the loop, read on the save thread. See
+        /// [`crate::persist::SessionHistoryCapture`].
+        history: Option<crate::persist::SessionHistoryCapture>,
     },
 }
 
@@ -37,10 +39,12 @@ impl App {
     }
 
     fn capture_session_save_job(&self) -> SessionSaveJob {
-        if self.state.workspaces.is_empty() {
+        // Peers are session state too: clearing on an empty workspace list would
+        // silently drop every configured peer.
+        if self.state.workspaces.is_empty() && self.state.peers.iter().next().is_none() {
             SessionSaveJob::Clear
         } else {
-            let snapshot = crate::persist::capture(
+            let snapshot = Box::new(crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
                 &self.terminal_runtimes,
@@ -49,9 +53,22 @@ impl App {
                 self.state.sidebar_width,
                 self.state.sidebar_section_split,
                 self.state.collapsed_space_keys.clone(),
-            );
+                self.state.hidden_peers.clone(),
+                crate::persist::peer_snapshots(&self.state.peers),
+            ));
+            // Only the pane positions and a handle each, which is what has to
+            // agree with the structural snapshot above. Reading the history
+            // itself took 5-10 ms per populated pane when it happened here, on
+            // the loop, against a 16.7 ms frame; it now happens on the save
+            // thread.
             let history = self.persist_pane_history.then(|| {
-                crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
+                let started = crate::render_prof::timer();
+                let history = crate::persist::capture_history(
+                    &self.state.workspaces,
+                    &self.terminal_runtimes,
+                );
+                crate::render_prof::histogram_since("persist.capture_history", started);
+                history
             });
             SessionSaveJob::Save { snapshot, history }
         }
@@ -102,6 +119,10 @@ fn run_session_save_job(job: SessionSaveJob) {
     match job {
         SessionSaveJob::Clear => crate::persist::clear(),
         SessionSaveJob::Save { snapshot, history } => {
+            // Where the retained scrollback is actually materialized.
+            let started = crate::render_prof::timer();
+            let history = history.map(crate::persist::SessionHistoryCapture::resolve);
+            crate::render_prof::histogram_since("persist.resolve_history", started);
             crate::persist::save(&snapshot, history.as_ref());
         }
     }

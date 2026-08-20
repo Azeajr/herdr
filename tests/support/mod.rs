@@ -15,7 +15,48 @@ static INIT: Once = Once::new();
 static CLEANUP_GUARD: OnceLock<CleanupGuard> = OnceLock::new();
 const WATCHDOG_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 const RUNTIME_OWNER_MARKER: &str = ".herdr-test-owner-pid";
-pub const CURRENT_PROTOCOL: u32 = 20;
+pub const CURRENT_PROTOCOL: u32 = 22;
+
+/// Removes every inherited Herdr variable that would point a spawned test server
+/// at the session running the tests.
+///
+/// `HERDR_STARTUP_CWD` seeded a startup workspace in a server that was supposed
+/// to begin empty. `HERDR_SOCKET_PATH` and `HERDR_CLIENT_SOCKET_PATH` are the
+/// same hazard one step worse: a test server inheriting them talks to the
+/// *outer* Herdr instead of its own, so assertions read another process's state.
+/// Both are already handled by convention — CLAUDE.md tells agents to clear them
+/// by hand — which is exactly the kind of rule worth enforcing in the harness
+/// instead of remembering.
+pub fn scrub_inherited_herdr_env<C: ScrubbableCommand + ?Sized>(command: &mut C) {
+    for key in [
+        "HERDR_STARTUP_CWD",
+        "HERDR_SOCKET_PATH",
+        "HERDR_CLIENT_SOCKET_PATH",
+    ] {
+        command.remove_env_var(key);
+    }
+}
+
+/// A command a test is about to spawn a server with.
+///
+/// Two shapes reach [`scrub_inherited_herdr_env`] — a plain process and a pty —
+/// and both have to be scrubbed, so the helper takes either rather than existing
+/// twice.
+pub trait ScrubbableCommand {
+    fn remove_env_var(&mut self, key: &str);
+}
+
+impl ScrubbableCommand for std::process::Command {
+    fn remove_env_var(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
+
+impl ScrubbableCommand for portable_pty::CommandBuilder {
+    fn remove_env_var(&mut self, key: &str) {
+        self.env_remove(key);
+    }
+}
 
 pub fn register_spawned_herdr_pid(pid: Option<u32>) {
     let Some(pid) = pid else {
@@ -241,6 +282,7 @@ pub fn client_handshake(
             &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
             &encode_varint_u32(0),  // ClientKeybindings::Server
             &encode_varint_u32(0),  // ClientLaunchMode::App
+            &[0u8],                 // Option<instance_id>::None
         ],
     );
     let framed = frame_message(&hello_payload);

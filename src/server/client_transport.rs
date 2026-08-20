@@ -22,6 +22,7 @@ use crate::protocol::{
     ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
     MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
+use crate::queue_budget::QueueBudget;
 
 /// Minimum accepted attached client size.
 ///
@@ -36,6 +37,21 @@ const MIN_CLIENT_ROWS: u16 = 1;
 /// within the 5-second deadline, even with OS timer slack, thread scheduling,
 /// and cleanup overhead.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How much unwritten reliable traffic one client may accumulate.
+///
+/// Control messages are the only lane that cannot be dropped — render frames
+/// are single-slot and latest-wins — so a client that stays connected without
+/// reading would otherwise grow this queue without limit.
+///
+/// The byte limit has to clear the largest single legitimate message with room
+/// to spare: a clipboard write can carry [`MAX_CLIPBOARD_IMAGE_PAYLOAD`], and
+/// rejecting one because a bell was queued ahead of it would disconnect a
+/// perfectly healthy client. Four such payloads is generous enough that
+/// crossing it means the client has genuinely stopped draining. The item limit
+/// is what catches the more common fault, a flood of small messages.
+const CLIENT_CONTROL_QUEUE_LIMITS: crate::queue_budget::QueueLimits =
+    crate::queue_budget::QueueLimits::new(1024, 4 * MAX_CLIPBOARD_IMAGE_PAYLOAD);
 
 /// Maximum input payload size (bytes) for a single `ClientMessage::Input`.
 const MAX_INPUT_PAYLOAD: usize = 1024 * 1024; // 1 MB
@@ -178,13 +194,32 @@ struct ClientWriterQueue {
     ready: Condvar,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ClientWriterQueueState {
     control: VecDeque<Vec<u8>>,
+    control_budget: QueueBudget,
+    /// Set when the reliable backlog crossed its limit. The client is past
+    /// saving at that point, so the writer stops rather than holding the
+    /// backlog: the loop exits, reports the disconnect, and the queue is freed.
+    control_overflowed: bool,
     ordered: VecDeque<Vec<u8>>,
     render: Option<Vec<u8>>,
     senders: usize,
     writer_alive: bool,
+}
+
+impl Default for ClientWriterQueueState {
+    fn default() -> Self {
+        Self {
+            control: VecDeque::new(),
+            control_budget: QueueBudget::new(CLIENT_CONTROL_QUEUE_LIMITS),
+            control_overflowed: false,
+            ordered: VecDeque::new(),
+            render: None,
+            senders: 0,
+            writer_alive: false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -220,7 +255,31 @@ impl ClientWriterQueue {
         if !state.writer_alive {
             return Err(SendError(data));
         }
+        if let Err(overflow) = state.control_budget.admit(data.len()) {
+            warn!(
+                overflow = %overflow,
+                queued_items = state.control_budget.items(),
+                queued_bytes = state.control_budget.bytes(),
+                peak_bytes = state.control_budget.peak_bytes(),
+                rejected = state.control_budget.rejected(),
+                "client stopped draining its reliable queue, disconnecting it"
+            );
+            // Dropping the backlog here is the point: the client is being
+            // disconnected, so retaining megabytes it will never read only
+            // prolongs the leak this bound exists to stop.
+            state.control.clear();
+            state.control_budget.clear();
+            state.control_overflowed = true;
+            state.writer_alive = false;
+            state.render = None;
+            state.ordered.clear();
+            self.ready.notify_all();
+            return Err(SendError(data));
+        }
         state.control.push_back(data);
+        state
+            .control_budget
+            .record("queue.client_control.items", "queue.client_control.bytes");
         self.ready.notify_one();
         Ok(())
     }
@@ -259,6 +318,10 @@ impl ClientWriterQueue {
         state.render = None;
         state.ordered.clear();
         if state.writer_alive {
+            // Cleanup output is what the client needs in order to shut down
+            // cleanly, so it is admitted even against a full budget; the queue
+            // was just emptied of droppable work in any case.
+            state.control_budget.force_admit(data.len());
             state.control.push_back(data);
             self.ready.notify_one();
         }
@@ -267,7 +330,11 @@ impl ClientWriterQueue {
     fn recv(&self) -> Option<ClientWriteItem> {
         let mut state = self.lock_state();
         loop {
+            if state.control_overflowed {
+                return None;
+            }
             if let Some(data) = state.control.pop_front() {
+                state.control_budget.release(data.len());
                 return Some(ClientWriteItem::Control(data));
             }
             if let Some(data) = state.ordered.pop_front() {
@@ -292,7 +359,14 @@ impl ClientWriterQueue {
         state.writer_alive = false;
         state.render = None;
         state.ordered.clear();
+        state.control.clear();
+        state.control_budget.clear();
         self.ready.notify_all();
+    }
+
+    /// Whether the reliable queue was abandoned because it outgrew its limit.
+    fn control_overflowed(&self) -> bool {
+        self.lock_state().control_overflowed
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, ClientWriterQueueState> {
@@ -316,6 +390,9 @@ pub(crate) enum ServerEvent {
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
         direct_graphics: bool,
+        /// Set when the client is itself a herdr server, federating with this
+        /// one. A human's client leaves it unset.
+        instance_id: Option<String>,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -377,6 +454,15 @@ pub(crate) enum ServerEvent {
         lines: u16,
         column: Option<u16>,
         row: Option<u16>,
+        modifiers: u8,
+    },
+    /// A client reported a press, release, or drag on the terminal it attached
+    /// to, for this server to encode against that terminal's own VT state.
+    ClientAttachMouse {
+        client_id: u64,
+        kind: crate::protocol::ClientMouseKind,
+        column: u16,
+        row: u16,
         modifiers: u8,
     },
     /// A client sent a resize message.
@@ -563,6 +649,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         direct_graphics,
+        client_instance_id,
     ) = match hello {
         ClientMessage::Hello {
             version,
@@ -573,6 +660,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            instance_id,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -583,6 +671,7 @@ pub(crate) fn handle_client_handshake(
                         version: PROTOCOL_VERSION,
                         encoding: RenderEncoding::SemanticFrame,
                         error: Some(reason),
+                        instance_id: crate::instance_id::active(),
                     };
                     let _ = protocol::write_message(&mut stream, &welcome);
                     return Ok(());
@@ -596,6 +685,7 @@ pub(crate) fn handle_client_handshake(
                         version: PROTOCOL_VERSION,
                         encoding: RenderEncoding::SemanticFrame,
                         error: Some(error),
+                        instance_id: crate::instance_id::active(),
                     };
                     let _ = protocol::write_message(&mut stream, &welcome);
                     return Ok(());
@@ -613,6 +703,7 @@ pub(crate) fn handle_client_handshake(
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
                 launch_mode == ClientLaunchMode::AppDirectGraphics,
+                instance_id,
             )
         }
         _ => {
@@ -622,6 +713,7 @@ pub(crate) fn handle_client_handshake(
                 version: PROTOCOL_VERSION,
                 encoding: RenderEncoding::SemanticFrame,
                 error: Some("expected Hello as first message".to_owned()),
+                instance_id: crate::instance_id::active(),
             };
             let _ = protocol::write_message(&mut stream, &welcome);
             return Ok(());
@@ -633,10 +725,13 @@ pub(crate) fn handle_client_handshake(
     }
 
     // Send Welcome.
+    // Named so a federating client can tell, on reconnect, whether the server
+    // behind its target is still the one the view was opened against.
     let welcome = ServerMessage::Welcome {
         version: PROTOCOL_VERSION,
         encoding: render_encoding,
         error: None,
+        instance_id: crate::instance_id::active(),
     };
     protocol::write_message(&mut stream, &welcome).map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -656,6 +751,7 @@ pub(crate) fn handle_client_handshake(
 
     // Spawn a writer thread that forwards messages from the channels to the stream.
     let write_stream = stream.try_clone()?;
+    apply_client_write_deadline(&write_stream);
     let writer_event_tx = server_event_tx.clone();
     std::thread::spawn(move || {
         client_writer_loop(write_stream, client_id, writer_queue, writer_event_tx);
@@ -677,6 +773,7 @@ pub(crate) fn handle_client_handshake(
         keybindings,
         direct_attach_requested,
         direct_graphics,
+        instance_id: client_instance_id,
         writer,
     };
     if let Err(err) = server_event_tx.blocking_send(connected) {
@@ -695,11 +792,36 @@ fn send_shutdown_to_unregistered_client(writer: &ClientWriter) {
         &mut framed,
         &ServerMessage::ServerShutdown {
             reason: Some("server is shutting down".to_owned()),
+            code: crate::protocol::ShutdownCode::ServerStopping,
         },
     )
     .is_ok()
     {
         let _ = writer.control.send(framed);
+    }
+}
+
+/// Bounds a single blocking write to a client.
+///
+/// The queue limits how much a stalled client may accumulate, but that is a
+/// different failure: it disconnects the *client* while leaving the writer
+/// thread parked inside `write_all` on a socket whose buffer never drains, so
+/// the thread and its socket are never reclaimed. This is what ends that write,
+/// turning it into the ordinary write failure the loop already handles.
+///
+/// A liveness backstop rather than a latency target — a client merely slow to
+/// read must not be torn down — so it matches the other write bounds in the
+/// codebase rather than tracking any frame budget.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Applies [`CLIENT_WRITE_TIMEOUT`] to a client's write handle.
+///
+/// Best-effort: a platform that cannot bound a send still gets a working
+/// client, and the queue bound remains its protection.
+fn apply_client_write_deadline(stream: &LocalStream) {
+    if let Err(err) = crate::ipc::set_local_stream_send_timeout(stream, Some(CLIENT_WRITE_TIMEOUT))
+    {
+        debug!(err = %err, "client write deadline unavailable");
     }
 }
 
@@ -723,6 +845,12 @@ fn client_writer_loop(
             let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
             break;
         }
+    }
+    // A queue that overflowed ends the loop without any write having failed,
+    // so the disconnect has to be reported here or the server keeps treating
+    // the client as attached and rendering for it.
+    if writer_queue.control_overflowed() {
+        let _ = server_event_tx.blocking_send(ServerEvent::ClientDisconnected { client_id });
     }
     writer_queue.close_writer();
     debug!("client writer thread exiting");
@@ -970,6 +1098,18 @@ fn client_read_loop(
                 row,
                 modifiers,
             },
+            ClientMessage::AttachMouse {
+                kind,
+                column,
+                row,
+                modifiers,
+            } => ServerEvent::ClientAttachMouse {
+                client_id,
+                kind,
+                column,
+                row,
+                modifiers,
+            },
             ClientMessage::Hello { .. } => {
                 // Duplicate Hello — ignore.
                 continue;
@@ -1104,6 +1244,133 @@ mod tests {
             writer.render.send_ordered(b"closed".to_vec()),
             Err(TrySendError::Disconnected(_))
         ));
+    }
+
+    #[test]
+    fn a_write_to_a_client_that_never_reads_gives_up_instead_of_parking() {
+        // The queue bound disconnects the client, but the writer thread is
+        // somewhere else: parked inside write_all on a socket whose buffer
+        // never drains. Without a deadline that thread and its socket are
+        // never reclaimed.
+        let (_client, mut server, path) = local_stream_pair("client-write-deadline");
+        crate::ipc::set_local_stream_send_timeout(&server, Some(Duration::from_millis(100)))
+            .expect("a local socket can bound a send");
+
+        // Far more than any socket buffer, against a peer that never reads.
+        let payload = vec![0u8; 64 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let result = std::io::Write::write_all(&mut server, &payload);
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "the write must fail rather than block");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the write should end at its deadline, took {elapsed:?}"
+        );
+        drop(path);
+    }
+
+    #[test]
+    fn a_client_that_never_reads_cannot_grow_the_control_queue_without_limit() {
+        // The B4 failure: a client that stays connected but stops draining.
+        // Nothing pops, so every message accumulates.
+        let (writer, queue) = test_queue_writer();
+        let message = vec![0u8; 64 * 1024];
+
+        let mut accepted = 0;
+        let mut rejected_at = None;
+        for attempt in 0..100_000 {
+            if writer.control.send(message.clone()).is_err() {
+                rejected_at = Some(attempt);
+                break;
+            }
+            accepted += 1;
+        }
+
+        let stopped = rejected_at.expect("the queue must refuse a client that never reads");
+        assert_eq!(
+            stopped, accepted,
+            "it should accept until the limit, then stop"
+        );
+
+        let state = queue.lock_state();
+        assert!(
+            state.control_overflowed,
+            "crossing the limit must mark the client for disconnect"
+        );
+        assert!(
+            state.control.is_empty() && state.control_budget.items() == 0,
+            "the abandoned backlog must be released, not retained"
+        );
+        assert!(
+            state.control_budget.peak_bytes() <= CLIENT_CONTROL_QUEUE_LIMITS.max_bytes,
+            "peak {} exceeded the byte limit {}",
+            state.control_budget.peak_bytes(),
+            CLIENT_CONTROL_QUEUE_LIMITS.max_bytes,
+        );
+    }
+
+    #[test]
+    fn an_overflowing_queue_stops_the_writer_and_reports_the_disconnect() {
+        // Overflow ends the writer loop without any write having failed, so
+        // the disconnect must still reach the server or it keeps rendering
+        // for a client that is gone.
+        let (mut client_stream, server_stream, _path) = local_stream_pair("client-writer-overflow");
+        let (writer, queue) = test_queue_writer();
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+
+        {
+            let mut state = queue.lock_state();
+            state.control_overflowed = true;
+        }
+
+        let drain = queue.clone();
+        let handle = std::thread::spawn(move || {
+            client_writer_loop(server_stream, 7, drain, server_event_tx);
+        });
+        handle.join().expect("writer thread exits on overflow");
+
+        assert!(matches!(
+            server_event_rx.try_recv(),
+            Ok(ServerEvent::ClientDisconnected { client_id: 7 })
+        ));
+
+        drop(writer);
+        let _ = client_stream.flush();
+    }
+
+    #[test]
+    fn a_single_message_larger_than_the_whole_budget_is_still_delivered() {
+        // Refusing it would be a permanent stall rather than backpressure, and
+        // a clipboard write can legitimately be very large.
+        let (writer, queue) = test_queue_writer();
+        let oversized = vec![0u8; CLIENT_CONTROL_QUEUE_LIMITS.max_bytes + 1];
+
+        writer
+            .control
+            .send(oversized.clone())
+            .expect("an empty queue must accept an oversized message");
+
+        assert_eq!(queue.recv(), Some(ClientWriteItem::Control(oversized)));
+        assert_eq!(queue.lock_state().control_budget.bytes(), 0);
+    }
+
+    #[test]
+    fn draining_the_control_queue_returns_its_budget() {
+        let (writer, queue) = test_queue_writer();
+        for _ in 0..8 {
+            writer.control.send(vec![0u8; 1024]).expect("queue control");
+        }
+        assert_eq!(queue.lock_state().control_budget.bytes(), 8 * 1024);
+
+        for _ in 0..8 {
+            assert!(matches!(queue.recv(), Some(ClientWriteItem::Control(_))));
+        }
+
+        let state = queue.lock_state();
+        assert_eq!(state.control_budget.items(), 0);
+        assert_eq!(state.control_budget.bytes(), 0);
+        assert!(!state.control_overflowed, "a drained queue is healthy");
     }
 
     #[test]
@@ -1330,6 +1597,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                instance_id: None,
             },
         )
         .expect("write hello");
@@ -1341,6 +1609,7 @@ new_tab = "ctrl+notakey"
                 version,
                 encoding,
                 error,
+                ..
             } => {
                 assert_eq!(version, PROTOCOL_VERSION);
                 assert_eq!(encoding, RenderEncoding::TerminalAnsi);
@@ -1354,6 +1623,7 @@ new_tab = "ctrl+notakey"
             .expect("client connected event")
         {
             ServerEvent::ClientConnected {
+                instance_id: _,
                 client_id,
                 cols,
                 rows,
@@ -1407,6 +1677,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                instance_id: None,
             },
         )
         .expect("write hello");
@@ -1418,6 +1689,7 @@ new_tab = "ctrl+notakey"
                 version,
                 encoding,
                 error,
+                ..
             } => {
                 assert_eq!(version, PROTOCOL_VERSION);
                 assert_eq!(encoding, RenderEncoding::TerminalAnsi);

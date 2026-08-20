@@ -1,0 +1,67 @@
+# Two throwaway peer boxes for cross-machine herdr testing.
+#
+# Each is a genuinely separate machine as far as herdr can tell: its own
+# rootfs, hostname, $HOME, PATH and network namespace. That is what makes it
+# worth more than the same-box ssh lab -- `resolve_peer_remote_herdr` has to
+# find a binary on a filesystem this host does not share.
+#
+# The debug herdr binary is bind-mounted read-only from the host build. The
+# pytest fixture builds it automatically; for a manual session, run
+# `ZIG=/path/to/zig cargo build --locked` before `boxes.sh up`.
+#
+# Every box gets NET_ADMIN so `boxes.sh netem` can shape its own traffic with
+# `tc`. It is granted to all three rather than only to the peering pair, so that
+# which box a scenario degrades is never a question about the compose file.
+#
+services:
+  box1:
+    build:
+      context: .
+    image: herdr-peer-box
+    hostname: box1
+    container_name: herdr-box1
+    cap_add: [NET_ADMIN]
+    ports:
+      - "127.0.0.1:2201:22"
+    volumes:
+      - ../../target/debug/herdr:/usr/local/bin/herdr:ro
+      - ./.secrets/id_ed25519:/home/herdr/.ssh/id_ed25519:ro
+      - ./.secrets/box_ssh_config:/home/herdr/.ssh/config:ro
+    networks: [peers]
+
+  box2:
+    build:
+      context: .
+    image: herdr-peer-box
+    hostname: box2
+    container_name: herdr-box2
+    cap_add: [NET_ADMIN]
+    ports:
+      - "127.0.0.1:2202:22"
+    volumes:
+      - ../../target/debug/herdr:/usr/local/bin/herdr:ro
+      - ./.secrets/id_ed25519:/home/herdr/.ssh/id_ed25519:ro
+      - ./.secrets/box_ssh_config:/home/herdr/.ssh/config:ro
+    networks: [peers]
+
+  # Deliberately has no herdr binary: the negative case for peer discovery,
+  # which a real second box cannot give you without uninstalling something.
+  box3:
+    build:
+      context: .
+    image: herdr-peer-box
+    hostname: box3
+    container_name: herdr-box3
+    cap_add: [NET_ADMIN]
+    ports:
+      - "127.0.0.1:2203:22"
+    volumes:
+      - ./.secrets/id_ed25519:/home/herdr/.ssh/id_ed25519:ro
+      - ./.secrets/box_ssh_config:/home/herdr/.ssh/config:ro
+    networks: [peers]
+
+# A shared network so box1 can peer to box2 directly by hostname, without
+# hairpinning through the host.
+networks:
+  peers:
+    driver: bridge

@@ -19,6 +19,9 @@ const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// One read syscall's buffer.
+const PTY_READ_CHUNK: usize = 8192;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
     Running,
@@ -127,8 +130,26 @@ impl PtyIoActorHandle {
             return Err(mpsc::error::SendError(bytes));
         }
         permit.send(PtyIoDataCommand::WriteUserInput(bytes));
+        self.record_queue_depth();
         self.wake_actor();
         Ok(())
+    }
+
+    /// Samples how full the input queue is, in items.
+    ///
+    /// The channel reports remaining capacity rather than occupancy, so depth is the
+    /// difference. This is the only view of the queue a caller has: a full one is
+    /// reported to the caller as `Full` and, on at least one path, discarded there —
+    /// so without the gauge a session that silently drops typed input looks idle.
+    fn record_queue_depth(&self) {
+        if !crate::render_prof::enabled() {
+            return;
+        }
+        let depth = self
+            .data_tx
+            .max_capacity()
+            .saturating_sub(self.data_tx.capacity());
+        crate::render_prof::gauge("queue.pty_input.items", depth as u64);
     }
 
     pub(crate) fn try_write_user_input(
@@ -147,10 +168,13 @@ impl PtyIoActorHandle {
             .try_send(PtyIoDataCommand::WriteUserInput(bytes))
         {
             Ok(()) => {
+                self.record_queue_depth();
                 self.wake_actor();
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(PtyIoDataCommand::WriteUserInput(bytes))) => {
+                crate::render_prof::event("queue.pty_input.rejected");
+                self.record_queue_depth();
                 Err(mpsc::error::TrySendError::Full(bytes))
             }
             Err(mpsc::error::TrySendError::Closed(PtyIoDataCommand::WriteUserInput(bytes))) => {
@@ -545,6 +569,10 @@ impl PtyIoActorRunner {
         match command {
             PtyIoDataCommand::WriteUserInput(bytes) => {
                 if self.state == ActorState::Running {
+                    // One count per queued item, against `pty.write.bytes`: the size
+                    // of what callers submit is the difference between a client that
+                    // batches a burst and one that sends a message per keystroke.
+                    crate::render_prof::event("pty.input.items");
                     self.enqueue_write(bytes);
                 }
             }
@@ -673,8 +701,17 @@ impl PtyIoActorRunner {
         self.enqueue_terminal_responses(terminal_responses);
     }
 
+    /// Reads whatever the pty has ready and delivers it.
+    ///
+    /// Deliberately *not* a drain-until-`WouldBlock` loop. That was tried against the
+    /// stalled-pane freeze recorded as B6 in `ENGINEERING_PLAN.md` and moved nothing:
+    /// a pty echoing typed input hands back exactly one byte per read, so 800 KB of
+    /// input produced 817,594 reads before the change and 817,765 after. The
+    /// amplification is in the per-delivery cost and the terminal-core lock churn
+    /// around it, not in how many reads one poll performs, and a coalescing buffer
+    /// here only adds a copy to the path that already works.
     fn read_once(&mut self) -> bool {
-        let mut buf = [0u8; 8192];
+        let mut buf = [0u8; PTY_READ_CHUNK];
         match self.file.read(&mut buf) {
             Ok(0) => false,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => true,
@@ -684,28 +721,36 @@ impl PtyIoActorRunner {
                 false
             }
             Ok(n) => {
-                let response_order = Arc::clone(&self.response_order);
-                let _order = response_order
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let result = (self.on_read)(&buf[..n]);
-                self.controls
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .terminal_responses
-                    .extend(result.terminal_responses);
-                drop(_order);
-                let terminal_responses = std::mem::take(
-                    &mut self
-                        .controls
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .terminal_responses,
-                );
-                self.enqueue_terminal_responses(terminal_responses);
+                crate::render_prof::event("pty.read.syscall");
+                self.deliver_read(&buf[..n]);
                 true
             }
         }
+    }
+
+    fn deliver_read(&mut self, bytes: &[u8]) {
+        crate::render_prof::event("pty.read.delivery");
+        let response_order = Arc::clone(&self.response_order);
+        let _order = response_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let read_started = crate::render_prof::timer();
+        let result = (self.on_read)(bytes);
+        crate::render_prof::histogram_since("pty.read.on_read", read_started);
+        self.controls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .terminal_responses
+            .extend(result.terminal_responses);
+        drop(_order);
+        let terminal_responses = std::mem::take(
+            &mut self
+                .controls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .terminal_responses,
+        );
+        self.enqueue_terminal_responses(terminal_responses);
     }
 
     fn enqueue_terminal_responses(&mut self, terminal_responses: Vec<Bytes>) {
@@ -717,6 +762,13 @@ impl PtyIoActorRunner {
         }
     }
 
+    /// Writes queued items to the pty, one write per item.
+    ///
+    /// A vectored write across queued items was tried against B6 and reverted: the
+    /// items arrive one at a time because this thread is woken per item and outruns
+    /// its producer, so a `writev` covered exactly one entry and wrote one byte, the
+    /// same as this does. The fix that worked is upstream, in the client, which no
+    /// longer sends a message per typed character.
     fn flush_pending_writes_once(&mut self) {
         while let Some(bytes) = self.pending_writes.front() {
             let chunk = &bytes[self.current_write_offset..];
@@ -726,6 +778,11 @@ impl PtyIoActorRunner {
                     return;
                 }
                 Ok(written) => {
+                    // Counted per syscall and per byte: a child that has stopped
+                    // reading accepts a byte at a time, and the ratio between these
+                    // two is what says so.
+                    crate::render_prof::event("pty.write.syscall");
+                    crate::render_prof::counter("pty.write.bytes", written as u64);
                     self.current_write_offset += written;
                     if self.current_write_offset >= bytes.len() {
                         self.pending_writes.pop_front();

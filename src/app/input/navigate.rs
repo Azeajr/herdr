@@ -389,7 +389,9 @@ impl App {
                 }
             }
             NavigateAction::EditScrollback => {}
-            NavigateAction::CopyMode => self.state.enter_copy_mode(&self.terminal_runtimes),
+            NavigateAction::CopyMode => {
+                self.state.enter_copy_mode(&self.terminal_runtimes);
+            }
             NavigateAction::Zoom => {
                 self.zoom_focused_pane_via_api();
                 leave_navigate_mode(&mut self.state);
@@ -619,6 +621,8 @@ impl App {
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
+                // This server's own user asked, so the pane has no other owner.
+                owner_instance_id: None,
             },
         );
     }
@@ -959,6 +963,13 @@ impl App {
     }
 
     fn open_focused_scrollback_in_editor(&mut self) -> std::io::Result<()> {
+        // A remote pane's scrollback lives on the peer, and `recent_text`
+        // answers `""` for one rather than failing. Without this gate the
+        // keybind opened an editor on an empty file — a wrong answer rather than
+        // a missing one, which reads as "the scrollback really was empty".
+        if self.report_unavailable_on_a_peer_pane("opening the scrollback") {
+            return Ok(());
+        }
         let ws_idx = self
             .state
             .active
@@ -1023,7 +1034,7 @@ impl App {
             return Err(std::io::Error::other("no active workspace"));
         };
         let previous_focus_target = self.state.current_pane_focus_target();
-        let (rows, cols) = self.state.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.state.estimate_pane_size();
         let new_rows = rows.max(4);
         let new_cols = cols.max(10);
         let (env, _) = self.custom_command_env();
@@ -1102,7 +1113,7 @@ impl App {
             return Err(std::io::Error::other("no active workspace"));
         };
         let previous_focus_target = self.state.current_pane_focus_target();
-        let (rows, cols) = self.state.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.state.estimate_pane_size();
         let new_rows = rows.max(4);
         let new_cols = cols.max(10);
 
@@ -1804,7 +1815,11 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::EditScrollback => {}
-        NavigateAction::CopyMode => state.enter_copy_mode(terminal_runtimes),
+        // The refusal message needs the feedback deadline, which only `App`
+        // owns; this state-only path just does not open copy mode.
+        NavigateAction::CopyMode => {
+            state.enter_copy_mode(terminal_runtimes);
+        }
         NavigateAction::Zoom => {
             state.toggle_zoom();
             leave_navigate_mode(state);

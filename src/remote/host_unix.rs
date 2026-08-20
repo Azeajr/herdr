@@ -6,14 +6,23 @@ use std::thread;
 use std::time::Duration;
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
+    run_remote_bridge(super::attach::BridgeSocket::Client)
+}
+
+pub(crate) fn run_remote_api_bridge() -> io::Result<()> {
+    run_remote_bridge(super::attach::BridgeSocket::Api)
+}
+
+fn run_remote_bridge(socket: super::attach::BridgeSocket) -> io::Result<()> {
     ensure_remote_server_running()?;
 
-    let socket_path = crate::server::socket_paths::client_socket_path();
+    let socket_path = socket.local_path();
     let stream = UnixStream::connect(&socket_path).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
-                "failed to connect to remote Herdr client socket {}: {err}",
+                "failed to connect to remote Herdr {} socket {}: {err}",
+                socket.describe(),
                 socket_path.display()
             ),
         )

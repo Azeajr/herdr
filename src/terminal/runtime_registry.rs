@@ -21,6 +21,10 @@ impl TerminalRuntimeRegistry {
         self.runtimes.get(terminal_id)
     }
 
+    pub(crate) fn get_mut(&mut self, terminal_id: &TerminalId) -> Option<&mut TerminalRuntime> {
+        self.runtimes.get_mut(terminal_id)
+    }
+
     pub(crate) fn insert(
         &mut self,
         terminal_id: TerminalId,
@@ -37,9 +41,16 @@ impl TerminalRuntimeRegistry {
         self.runtimes.values()
     }
 
-    #[cfg(unix)]
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut TerminalRuntime> {
+        self.runtimes.values_mut()
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&TerminalId, &TerminalRuntime)> {
         self.runtimes.iter()
+    }
+
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&TerminalId, &mut TerminalRuntime)> {
+        self.runtimes.iter_mut()
     }
 
     #[cfg(unix)]

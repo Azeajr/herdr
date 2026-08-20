@@ -2,13 +2,18 @@ use std::path::{Path, PathBuf};
 
 use tracing::warn;
 
-use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
+use super::{
+    model::{LoadedConfig, PeerHistoryConfig, PeerHistoryEntry, DEFAULT_PEER_HISTORY_MAX_ENTRIES},
+    Config, CONFIG_PATH_ENV_VAR,
+};
 
 const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
     "keys",
     "onboarding",
+    "peer_hidden",
+    "peer_history",
     "remote",
     "server",
     "session",
@@ -22,6 +27,8 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
 pub fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
         "herdr-dev"
+    } else if crate::build_info::is_source_build() {
+        "herdr-source"
     } else {
         "herdr"
     }
@@ -349,6 +356,22 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.remote = section,
     );
+    load_live_section(
+        table,
+        "peer_history",
+        "peer history config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.peer_history = section,
+    );
+    load_live_section(
+        table,
+        "peer_hidden",
+        "peer hidden config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.peer_hidden = section,
+    );
 
     diagnostics.extend(config.theme.diagnostics());
 
@@ -607,6 +630,132 @@ pub fn remove_section_key(content: &str, section: &str, key: &str) -> String {
     }
 
     result.join("\n") + "\n"
+}
+
+/// Quote one string as a TOML basic string, delegating escaping to the toml
+/// crate so user input can never break the file.
+fn toml_basic_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+/// The `recent = [...]` value for `[peer_history]`, one inline table per
+/// entry on a single line so `upsert_section_value` can replace it atomically.
+fn peer_history_recent_value(entries: &[PeerHistoryEntry]) -> String {
+    let entries = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{ name = {}, target = {}, last_used = {} }}",
+                toml_basic_string(&entry.name),
+                toml_basic_string(&entry.target),
+                entry.last_used
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{entries}]")
+}
+
+/// Fold one successful peer add into the `[peer_history]` section of
+/// `content`, returning the updated file text. The entry moves to the front,
+/// duplicates are merged by target, and the list is trimmed to the section's
+/// own `max_entries` (default
+/// [`DEFAULT_PEER_HISTORY_MAX_ENTRIES`](super::model::DEFAULT_PEER_HISTORY_MAX_ENTRIES)).
+/// `max_entries = 0` records nothing, which is how history is turned off.
+pub fn upsert_peer_history_entry(content: &str, name: &str, target: &str, now_secs: u64) -> String {
+    let section = content
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|value| value.get("peer_history").cloned())
+        .and_then(|section| section.try_into::<PeerHistoryConfig>().ok());
+    let max_entries = section
+        .as_ref()
+        .map(|section| section.max_entries)
+        .unwrap_or(DEFAULT_PEER_HISTORY_MAX_ENTRIES);
+    let mut entries = section.map(|section| section.recent).unwrap_or_default();
+    entries.retain(|entry| entry.target != target);
+    // Prepending before the trim would keep one entry even at zero, which is
+    // the one setting that has to record nothing: these are ssh destinations,
+    // stored in plaintext, and turning history off has to actually turn it off.
+    if max_entries > 0 {
+        entries.insert(
+            0,
+            PeerHistoryEntry {
+                name: name.to_string(),
+                target: target.to_string(),
+                last_used: now_secs,
+            },
+        );
+    }
+    entries.truncate(max_entries);
+    upsert_section_value(
+        content,
+        "peer_history",
+        "recent",
+        &peer_history_recent_value(&entries),
+    )
+}
+
+/// Replace the `[peer_hidden] peers` list in `content`.
+pub fn upsert_peer_hidden_peers(content: &str, peers: &[String]) -> String {
+    let peers = peers
+        .iter()
+        .map(|peer| toml_basic_string(peer))
+        .collect::<Vec<_>>()
+        .join(", ");
+    upsert_section_value(content, "peer_hidden", "peers", &format!("[{peers}]"))
+}
+
+/// Record a successful peer add in the config file on disk. Returns the
+/// updated entries so the caller can refresh in-memory state without a
+/// reload. Textual upsert, same race profile as `herdr channel set`: user
+/// formatting and comments outside this one line survive.
+pub fn record_peer_history(name: &str, target: &str) -> Result<Vec<PeerHistoryEntry>, String> {
+    let path = config_path();
+    let content = read_optional_config(&path)
+        .map_err(|err| format!("config read error: {err}"))?
+        .unwrap_or_default();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let updated = upsert_peer_history_entry(&content, name, target, now_secs);
+    if let Err(err) = updated.parse::<toml::Value>() {
+        return Err(format!(
+            "recording peer history would make {} invalid TOML: {err}; leaving config unchanged",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("config dir error: {err}"))?;
+    }
+    std::fs::write(&path, &updated).map_err(|err| format!("config write error: {err}"))?;
+    Ok(updated
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|value| value.get("peer_history").cloned())
+        .and_then(|section| section.try_into::<PeerHistoryConfig>().ok())
+        .map(|section| section.recent)
+        .unwrap_or_default())
+}
+
+/// Persist the `[peer_hidden] peers` list to the config file on disk.
+pub fn write_peer_hidden_peers(peers: &[String]) -> Result<(), String> {
+    let path = config_path();
+    let content = read_optional_config(&path)
+        .map_err(|err| format!("config read error: {err}"))?
+        .unwrap_or_default();
+    let updated = upsert_peer_hidden_peers(&content, peers);
+    if let Err(err) = updated.parse::<toml::Value>() {
+        return Err(format!(
+            "updating hidden peers would make {} invalid TOML: {err}; leaving config unchanged",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("config dir error: {err}"))?;
+    }
+    std::fs::write(&path, &updated).map_err(|err| format!("config write error: {err}"))
 }
 
 pub fn remove_keybinding_config_sections(content: &str) -> (String, bool) {
@@ -1107,5 +1256,135 @@ mouse_capture = false
         let (updated, removed) = remove_keybinding_config_sections(content);
         assert!(!removed);
         assert_eq!(updated, content);
+    }
+
+    #[test]
+    fn peer_history_upsert_inserts_at_the_front() {
+        let updated = upsert_peer_history_entry("", "box", "ssh://me@box", 100);
+        let section: PeerHistoryConfig = toml::from_str::<toml::Value>(&updated)
+            .unwrap()
+            .get("peer_history")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(section.recent.len(), 1);
+        assert_eq!(section.recent[0].name, "box");
+        assert_eq!(section.recent[0].target, "ssh://me@box");
+        assert_eq!(section.recent[0].last_used, 100);
+
+        let updated = upsert_peer_history_entry(&updated, "other", "ssh://me@other", 200);
+        let section: PeerHistoryConfig = toml::from_str::<toml::Value>(&updated)
+            .unwrap()
+            .get("peer_history")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(section.recent.len(), 2);
+        assert_eq!(section.recent[0].target, "ssh://me@other");
+        assert_eq!(section.recent[1].target, "ssh://me@box");
+    }
+
+    #[test]
+    fn peer_history_upsert_dedupes_by_target_not_name() {
+        let content = upsert_peer_history_entry("", "box", "ssh://me@box", 100);
+        // The same host re-added under a different name replaces the entry
+        // instead of growing the list.
+        let updated = upsert_peer_history_entry(&content, "big-box", "ssh://me@box", 300);
+        let section: PeerHistoryConfig = toml::from_str::<toml::Value>(&updated)
+            .unwrap()
+            .get("peer_history")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(section.recent.len(), 1);
+        assert_eq!(section.recent[0].name, "big-box");
+        assert_eq!(section.recent[0].last_used, 300);
+    }
+
+    #[test]
+    fn peer_history_upsert_trims_to_the_configured_max() {
+        let mut content = "[peer_history]\nmax_entries = 2\n".to_string();
+        for idx in 0..4 {
+            content = upsert_peer_history_entry(
+                &content,
+                &format!("peer-{idx}"),
+                &format!("ssh://host-{idx}"),
+                idx,
+            );
+        }
+        let section: PeerHistoryConfig = toml::from_str::<toml::Value>(&content)
+            .unwrap()
+            .get("peer_history")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(section.recent.len(), 2);
+        assert_eq!(section.recent[0].target, "ssh://host-3");
+        assert_eq!(section.recent[1].target, "ssh://host-2");
+    }
+
+    #[test]
+    fn peer_history_upsert_records_nothing_at_zero_max_entries() {
+        let content = upsert_peer_history_entry(
+            "[peer_history]\nmax_entries = 0\n",
+            "peer",
+            "ssh://me@box",
+            1,
+        );
+        let section: PeerHistoryConfig = toml::from_str::<toml::Value>(&content)
+            .unwrap()
+            .get("peer_history")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        // Zero is the off switch: these are ssh destinations kept in plaintext,
+        // so it has to leave none behind rather than clamp to one.
+        assert!(section.recent.is_empty());
+    }
+
+    #[test]
+    fn peer_history_upsert_escapes_strings_and_preserves_other_sections() {
+        let content = "# a comment\n[ui]\nsidebar_width = 30\n";
+        let updated = upsert_peer_history_entry(content, "we\"ird", "ssh://me@box", 1);
+        assert!(updated.contains("# a comment"));
+        assert!(updated.contains("sidebar_width = 30"));
+        let parsed = updated.parse::<toml::Value>().unwrap();
+        let section: PeerHistoryConfig = parsed
+            .get("peer_history")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(section.recent[0].name, "we\"ird");
+    }
+
+    #[test]
+    fn peer_hidden_upsert_replaces_the_list() {
+        let updated = upsert_peer_hidden_peers("", &["work".to_string(), "laptop".to_string()]);
+        let parsed = updated.parse::<toml::Value>().unwrap();
+        let section: super::super::model::PeerHiddenConfig = parsed
+            .get("peer_hidden")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(section.peers, vec!["work", "laptop"]);
+
+        let emptied = upsert_peer_hidden_peers(&updated, &[]);
+        assert!(emptied.parse::<toml::Value>().is_ok());
+        let section: super::super::model::PeerHiddenConfig = emptied
+            .parse::<toml::Value>()
+            .unwrap()
+            .get("peer_hidden")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(section.peers.is_empty());
     }
 }

@@ -128,6 +128,30 @@ herdr workspace create --cwd ~/project --label api --no-focus
 
 ワークスペースは最上位のプロジェクトまたは作業コンテキストです。作成時に最初のタブとルートペインも作られます。JSON レスポンスの `.result.workspace.workspace_id`、`.result.tab.tab_id`、`.result.root_pane.pane_id` から各 ID を取得できます。
 
+## ピア
+
+```bash
+herdr peer list [--json]
+herdr peer add <name> (--socket PATH | --ssh DESTINATION) [--peer-session NAME] [--json]
+herdr peer remove <name> [--json]
+herdr peer open <target> [--peer NAME] [--label TEXT] [--focus] [--no-focus] [--takeover]
+```
+
+ピアとは、このサーバーが自分のワークスペースと並べて表示する別の Herdr サーバーです。このマシン上の API ソケットのパス、または SSH の宛先で指定します:
+
+```bash
+herdr peer add beta --socket ~/.config/herdr/sessions/beta/herdr.sock
+herdr peer add workbox --ssh workbox --peer-session agents
+```
+
+ピアのセッションを指定するフラグは `--peer-session` です。`--session` は、すべての `herdr` コマンドが自分のどのサーバーに対して話すかを選ぶために既に使われているためです。
+
+`add`、`remove`、`list` はいずれもピアの一覧全体を返し、表として出力します。`--json` を付けると生のレスポンスが得られ、各ピアのバージョン、プロトコル、報告されたワークスペースも含まれます。
+
+`peer open` は `peer list` から得たワークスペース id、ペイン id、ターミナル id を受け取り、それを表示するローカルのワークスペースを開きます。`peer list` の id はピアのインスタンス id で名前空間化されており、それだけでピアを特定できます。`--peer` を渡すのは、ピアローカルの素の id のときだけです。
+
+ピアが背後にあるペインで何ができて何ができないかは[永続化とリモートアクセス](/ja/docs/persistence-remote/)を参照してください。
+
 ## Worktree
 
 ```bash
@@ -295,7 +319,7 @@ herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 
 `agent send-keys` は `enter`、`up`、`esc`、`ctrl+c` などの論理キーを送ります。Herdr は 1 バイトも書き込む前に全キーを検証します。`agent read` は解決されたターミナルストリームを読み、`agent rename` は検出済みエージェントに名前を付けます。
 
-`agent explain` は、スクリーン検出が使うのと同じ下部バッファの検出スナップショットの分類を実行中のサーバーに依頼します。そのためライブの出力はサーバーのアクティブなマニフェストキャッシュを反映します。これは `agent.explain` ソケットメソッドを使うので、Herdr のアップグレード後にライブ explain を使う前に、サーバーを再起動するか更新済みサーバーへハンドオフしてください。保存済みフィクスチャをローカルで説明するには `--file PATH --agent LABEL` を使います。デフォルトの出力には、エージェント、最終状態、マニフェストのソースとバージョン、リージョンの証拠付きでマッチしたルール、そしてフォールバック・スキップ・警告の理由が表示されます。`--verbose` を付けると、可視の証拠フラグ、キャッシュされたリモートバージョン、ローカルオーバーライドのシャドーイング、リモート更新状況、マッチャーとリージョンの証拠付きの評価済みルール全リストが表示されます。issue の報告やテストには `--json` を付けてください。
+`agent explain` は、スクリーン検出が使うのと同じ下部バッファの検出スナップショットの分類を実行中のサーバーに依頼します。そのためライブの出力はサーバーのアクティブなマニフェストキャッシュを反映します。これは `agent.explain` ソケットメソッドを使うので、Herdr のアップグレード後にライブ explain を使う前に、サーバーを再起動するか更新済みサーバーへハンドオフしてください。保存済みフィクスチャをローカルで説明するには `--file PATH --agent LABEL` を使います。デフォルトの出力には、エージェント、最終状態、マニフェストのソースとバージョン、リージョンの証拠付きでマッチしたルール、そしてフォールバック・スキップ・警告の理由が表示されます。ピアが背後にあるペインでは、実際にルールを実行したピアが説明を返し、マニフェスト行の上の `peer:` 行がそれを示します。その下に並ぶ内容はすべてピア側のインストールの話です。`--verbose` を付けると、可視の証拠フラグ、キャッシュされたリモートバージョン、ローカルオーバーライドのシャドーイング、リモート更新状況、マッチャーとリージョンの証拠付きの評価済みルール全リストが表示されます。issue の報告やテストには `--json` を付けてください。
 
 通常のターミナル、サーバー、テスト、シェル、低レベルなターミナル制御には `pane send-text`、`pane send-keys`、`pane run`、`terminal attach` を使ってください。Enter 付きでコマンドを送信したいときは `pane run` を使います。
 

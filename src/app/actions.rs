@@ -1306,8 +1306,10 @@ impl AppState {
         };
         let order = entries
             .into_iter()
-            .map(|entry| match entry {
-                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => ws_idx,
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+                // Headers are display-only and carry no workspace order.
+                crate::ui::WorkspaceListEntry::PeerHeader { .. } => None,
             })
             .collect::<Vec<_>>();
         if order.is_empty() {
@@ -1629,6 +1631,38 @@ impl AppState {
             .get(ws_idx)?
             .pane_state(pane_id)
             .map(|pane| pane.attached_terminal_id.clone())
+    }
+
+    /// Whether `instance` currently holds a connection to `terminal_id`.
+    ///
+    /// Answers "is the server that asked for this terminal still watching it",
+    /// which is what separates a pane another instance is driving from one it
+    /// left behind.
+    pub(crate) fn instance_attached_to_terminal(
+        &self,
+        instance: &str,
+        terminal_id: &crate::terminal::TerminalId,
+    ) -> bool {
+        self.terminal_attached_instances
+            .get(terminal_id)
+            .is_some_and(|instances| instances.iter().any(|held| held == instance))
+    }
+
+    /// Republishes which instances hold a connection to which terminal.
+    ///
+    /// Recomputed wholesale from the live connections rather than tracked
+    /// incrementally: attach, takeover, detach, and disconnect would each have
+    /// to stay in sync, and a missed one would strand a pane reported as
+    /// attended forever.
+    pub(crate) fn set_terminal_attached_instances(
+        &mut self,
+        attached: std::collections::HashMap<crate::terminal::TerminalId, Vec<String>>,
+    ) -> bool {
+        if self.terminal_attached_instances == attached {
+            return false;
+        }
+        self.terminal_attached_instances = attached;
+        true
     }
 
     pub(crate) fn remove_unattached_terminal_ids(
@@ -2282,9 +2316,28 @@ impl AppState {
             _ => return,
         };
 
-        let text = self
-            .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-            .and_then(|rt| rt.extract_selection(&sel));
+        let runtime = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id);
+        if runtime.is_some_and(crate::terminal::TerminalRuntime::is_remote) {
+            // The screen is on another server, and only that server can produce
+            // the text its terminal would. Recorded for the App to ask; the
+            // write lands when the answer does. Copying nothing here is what
+            // made a drag over a peer-backed pane do nothing at all.
+            let (start, end) = sel.ordered_cells();
+            info!(
+                ?start,
+                ?end,
+                "selection copy deferred to the peer that owns the screen"
+            );
+            self.request_peer_selection_copy = Some(crate::app::state::PeerSelectionCopy {
+                pane_id: sel.pane_id,
+                start,
+                end,
+            });
+            self.clear_selection();
+            return;
+        }
+
+        let text = runtime.and_then(|rt| rt.extract_selection(&sel));
         if let Some(text) = text {
             if !text.is_empty() {
                 self.request_clipboard_write = Some(text.into_bytes());
@@ -2949,6 +3002,84 @@ impl AppState {
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::TabBarCommandFinished { .. } => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            AppEvent::PeerConnectionChanged {
+                handle,
+                connection,
+                identity,
+            } => {
+                // Identity first: a connected peer must always carry one.
+                let mut connection = connection;
+                if let Some(identity) = identity {
+                    if let crate::app::peers::SetIdentity::Duplicate { held_by } =
+                        self.peers.set_identity(&handle, identity)
+                    {
+                        // Two handles onto one server make every namespaced id
+                        // ambiguous, and it resolves to whichever was added
+                        // first. Stopping the second is better than running two
+                        // connections that quietly disagree.
+                        connection = crate::app::peers::PeerConnectionState::Error {
+                            message: format!(
+                                "the same server is already configured as peer '{held_by}'"
+                            ),
+                        };
+                    }
+                }
+                self.peers.set_connection(&handle, connection);
+                Vec::new()
+            }
+            AppEvent::PeerTransportReady { handle, api_socket } => {
+                self.peers.set_transport_socket(&handle, api_socket);
+                Vec::new()
+            }
+            AppEvent::PeerWorkspacesUpdated { handle, workspaces } => {
+                self.peers.set_workspaces(&handle, workspaces);
+                Vec::new()
+            }
+            // Handled by the app, which owns the terminal runtime map the peer's
+            // pane facts are cached on.
+            AppEvent::PeerPanesUpdated { .. } => Vec::new(),
+            // Handled by the app, which owns the layout the new pane lands in.
+            AppEvent::PeerPaneSplitFinished(_) => Vec::new(),
+            // Handled by the app, which owns the workspace the view opens into.
+            AppEvent::PeerWorkspaceCreateFinished(_) | AppEvent::PeerTabCreateFinished(_) => {
+                Vec::new()
+            }
+            // Handled by the app, which owns the terminal runtime map.
+            AppEvent::PeerViewOpenFinished(_)
+            | AppEvent::PeerViewReconnected(_)
+            | AppEvent::PeerCopyModeQueryFinished(_) => Vec::new(),
+            // Handled by the app: each one ends in a local workspace being
+            // created, closed, or listed in a dialog, none of which this layer
+            // owns.
+            AppEvent::PeerWorktreeViewFinished(_)
+            | AppEvent::PeerWorktreeRemoveFinished(_)
+            | AppEvent::PeerWorktreeListFinished { .. } => Vec::new(),
+            // Handled by the app, which owns the toast expiry deadline.
+            AppEvent::PeerForwardFailed { .. } => Vec::new(),
+            AppEvent::PeerPaneCleanupFailed {
+                handle,
+                peer_pane_id,
+                expected_instance,
+                reason,
+            } => {
+                tracing::warn!(
+                    peer = %handle,
+                    pane = %peer_pane_id,
+                    instance = expected_instance.as_deref().unwrap_or("unknown"),
+                    reason = %reason,
+                    "could not close a pane this server spawned on a peer; \
+                     retained for retry"
+                );
+                self.peers.record_failed_pane_cleanup(
+                    &handle,
+                    crate::app::peers::PendingPaneCleanup {
+                        peer_pane_id,
+                        expected_instance,
+                        reason,
+                    },
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -3328,7 +3459,13 @@ impl AppState {
         deliveries
     }
 
-    fn handle_pane_died(&mut self, pane_id: PaneId) {
+    /// Removes a dead pane, closing its tab — and the workspace, when it was
+    /// the last one — the way a local process exit does.
+    ///
+    /// `pub(crate)` for the peer-view sweep: a view the peer refuses as "not
+    /// found" is a pane that died on another machine, and retiring it must run
+    /// exactly this path so both deaths leave the same state behind.
+    pub(crate) fn handle_pane_died(&mut self, pane_id: PaneId) {
         self.pending_agent_notifications.remove(&pane_id);
         self.remove_plugin_pane_records([pane_id]);
         let ws_idx = self

@@ -26,10 +26,14 @@
 - Copy mode now supports `B`, `E`, and `W` motions over whitespace-delimited big words. (#2270, thanks @jplew)
 - The plugin marketplace now discovers valid manifests at repository roots and subdirectories, groups multiple plugins under each repository, and publishes their versions and exact default-branch commits.
 
+- Added federated peer servers: `herdr peer add/list/remove/open`, and the matching `peer.add`, `peer.remove`, `peer.list`, `peer.workspace.open`, and `peer.terminal.open` methods, connect one Herdr server to another over a socket path or SSH destination, grouping the peer's workspaces under a peer header in the sidebar. Right-click that header to browse and open the peer's workspaces. A peer-backed pane accepts input, resize, wheel scrolling, `pane.read`, `agent.read`, and `agent.explain`, reconnects on its own after a drop, and reports its peer on `pane.get` and `pane.list`. `agent.explain` is answered by the peer that ran the rules and names it, so the manifest and rule ids in the answer are not mistaken for this machine's. Its directory, terminal title, and agent come from the peer that owns the screen, so a peer's agent appears in `agent.list`, can be waited on with `agent.wait`, and reaches the sidebar and workspace status like a local one.
+
 ### Changed
 - Windows support is now generally available through stable releases and uses the stable update channel by default. Existing preview installs stay on preview until explicitly switched.
 - Headless servers now use a configurable 120×40 virtual terminal instead of 80×24 when no client is attached, giving newly created panes a practical default size. (#2828)
 - Desktop tab labels are now centered in their tabs, so the active-tab highlight has symmetric padding. (#2570, thanks @dhh)
+- Bumped the client/server protocol version to 20 for pane terminal bell forwarding.
+- Bumped the client/server protocol version to 22 for peer-instance validation and peer-backed terminal clipboard, scroll, and input-mode state.
 - Experimental pane graphics now support bounded named layers, acknowledged full-RGBA primary-layer direct file frames on audited local terminals, owned BGRA fallback, exact pixel mouse input, and placement-only resize replay.
 
 ### Fixed
@@ -125,6 +129,20 @@
 - Pane applications now receive semantic light/dark query responses and live Mode 2031 updates when the host appearance changes. (#714)
 - Remote attach now falls back to `sh` when the login shell cannot perform path discovery. (#1201)
 - PTY output continues to be read while pane input is temporarily blocked. (#1295)
+- A peer-backed pane whose process exits on the peer — typed `exit`, or closed over there — now closes locally instead of staying forever as a grayed, unresponsive view, and closing the last pane of a tab closes the tab like a local exit. The gray `disconnected` state remains for a peer that is unreachable or was replaced by a different server.
+- The `connect <destination>` workspace the add-peer dialog opens now closes itself after a successful connect instead of leaving an idle shell prompt behind; a failed connect still keeps the pane so the error stays readable.
+- Peer-backed views no longer freeze the server while a peer is unreachable. Opening one, and closing one, are both bounded now: the handshake has a timeout and the reader is interrupted rather than waited on, so an SSH peer whose link died silently can no longer hold every local workspace until TCP gives up.
+- `peer.workspace.open`, `peer.terminal.open`, and `workspace.focus` on a peer workspace id are handled off the event loop, matching `peer.workspace.create`.
+- A peer restarted with a fresh session is now recognised as a different server. Its views stop instead of silently re-attaching to an unrelated pane with the same id, and closing one no longer closes that pane on the replacement.
+- `peer.terminal.open` now returns a terminal id that can be attached to and released; added `peer.terminal.close` to release one. Previously the id was in no terminal list, so it could be neither attached to nor reaped, while its connection reconnected for the lifetime of the server.
+- Panes a peer created for a split or a tab are now closed on the peer when the view they were for cannot be opened, instead of accumulating there as orphan shells.
+- Local workspaces ordered after a peer-backed one no longer lose their restored scrollback: pane history is captured for exactly the workspaces the session snapshot keeps.
+- A peer-backed pane in a background workspace no longer forces a full render of the whole UI for output nobody can see.
+- Keys for a peer-backed pane are encoded with the protocol the peer reports for its own terminal, so Shift+Enter and other enhanced keys reach a remote agent instead of arriving as a plain Enter.
+- Two peers that reach the same server are now refused rather than both connecting and silently disagreeing about routing.
+- A peer refusing a rename, close, split, or tab create started from the UI now says so instead of failing invisibly.
+- Opening the scrollback in an editor, and dragging to select, now explain that they need the pane's screen when it lives on a peer, instead of opening an empty file or doing nothing.
+- A peer connection's retry counter resets once a session is proven, so a peer that flapped at startup and then ran healthily recovers promptly from its next blip instead of waiting the full backoff.
 - Worktree CLI help and docs no longer advertise the redundant `--json` flag; worktree commands remain JSON-only and continue accepting the flag for compatibility. (#2171)
 - OpenCode 2 preview panes now appear as OpenCode agents and use the existing OpenCode status detection. (#2169)
 - Pane text copied through VS Code Remote Tunnels now reaches the viewing machine's clipboard instead of overwriting the remote host clipboard. (#2015)

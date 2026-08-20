@@ -3,7 +3,7 @@
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
-    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
+    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_low_impact scripts.test_package_windows_conpty scripts.test_preview scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     just ui-hot-path-architecture-test
     just integration-assets-test
     just plugin-marketplace-test
@@ -16,11 +16,43 @@ test-one filter:
 ui-hot-path-architecture-test:
     python3 -m unittest scripts.test_ui_hot_path_architecture
 
+# Capped by default: this machine is shared and these suites are the heaviest thing on
+# it. `scripts/low_impact.py` explains what the limits do and do not cover. Set
+# HERDR_E2E_UNCAPPED=1 to run without them.
+
+# Run the peer/UI end-to-end scenarios, capped (real servers and TUI clients; needs tmux)
+[unix]
+test-e2e *args:
+    python3 scripts/low_impact.py -- sh -c 'cd peer-test && uv run pytest -m e2e {{args}}'
+
+# The load bounds from `peer-test/scripts/stress.py`: admission caps, resource recovery,
+# and a burst the server must absorb. Separate from `test-e2e` because it opens hundreds
+# of connections and pushes megabytes through a pty. The measurements themselves are not
+# here — run `uv run peer-test/scripts/stress.py run <workload>` for numbers.
+
+# Run the stress bounds, capped (needs tmux)
+[unix]
+test-stress *args:
+    python3 scripts/low_impact.py -- sh -c 'cd peer-test && uv run pytest -m stress {{args}}'
+
+# The cap reaches the test driver, not the containers: those are children of the docker
+# daemon and live in its cgroup, not ours. Capping still bounds pytest, ssh and the
+# build; container churn is bounded by not looping the suite.
+
+# Run the cross-machine scenarios on the Docker peer boxes, capped (needs Docker)
+[unix]
+test-boxes *args:
+    python3 scripts/low_impact.py -- sh -c 'cd peer-test && uv run pytest -m boxes {{args}}'
+
+# Capped, but `--never-refuse`: the pre-commit hook runs this, so a machine that cannot
+# cap must still be able to commit. Short but memory-hungry — `--all-targets` compiles the
+# tests and benches too, measured at 3.0G peak after a source edit, four times the whole
+# e2e suite. That peak is what the cap is here for; the 20s of CPU barely matters.
+
 # Run fast local lint checks
 [unix]
 lint:
-    cargo fmt --check
-    cargo clippy --all-targets --locked -- -D warnings
+    python3 scripts/low_impact.py --never-refuse -- sh -c 'cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings'
 
 [script("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")]
 [windows]
@@ -41,10 +73,21 @@ windows-lint:
     rustup target add x86_64-pc-windows-msvc
     LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
 
+# Capped like the scenario suites: this is the heaviest recipe in the repo — two clippy
+# passes, a Windows-target build and the whole nextest suite. One cgroup around the lot, so
+# the compile and the tests share a budget: `lint` is capped too and is a dependency, and
+# `systemd-run --user` makes siblings rather than children, so the wrapper skips itself
+# when already inside a unit instead of splitting the budget in two. Measured 4.1G peak.
+
 # Check formatting + run unit tests + Windows target lint + maintenance script tests
 [unix]
-check: ci windows-lint
-    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_package_windows_conpty scripts.test_preview scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
+check:
+    python3 scripts/low_impact.py -- just _check-inner
+
+# The real work, so `check` has something to wrap. Run `just check` instead.
+[unix,private]
+_check-inner: ci windows-lint
+    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_config_reference_check scripts.test_docs_translation_parity scripts.test_hermes_integration_asset scripts.test_low_impact scripts.test_package_windows_conpty scripts.test_preview scripts.test_unix_installer scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
 
 [script("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File")]
@@ -68,6 +111,24 @@ build:
 [windows]
 build:
     cargo build --release --locked
+
+# Build and atomically install this fork from source
+[unix]
+install:
+    #!/bin/sh
+    set -eu
+    export HERDR_BUILD_CHANNEL=source
+    cargo build --release --locked
+    install_dir="${HERDR_INSTALL_DIR:-$HOME/.local/bin}"
+    mkdir -p "$install_dir"
+    temp_path="$(mktemp "$install_dir/.herdr-install.XXXXXX")"
+    trap 'rm -f "$temp_path"' EXIT HUP INT TERM
+    cp target/release/herdr "$temp_path"
+    chmod 755 "$temp_path"
+    mv -f "$temp_path" "$install_dir/herdr"
+    trap - EXIT HUP INT TERM
+    printf 'installed source build to %s\n' "$install_dir/herdr"
+    "$install_dir/herdr" --version
 
 # Non-gating full-render scaling profile for background workspaces and active panes
 bench-render-scale:

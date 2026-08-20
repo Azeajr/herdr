@@ -39,6 +39,7 @@ pub(super) fn command() -> Command {
         .subcommand(notification_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
+        .subcommand(peer_command())
         .subcommand(terminal_command())
         .subcommand(session_command())
         .subcommand(integration_command())
@@ -269,6 +270,48 @@ fn worktree_command() -> Command {
                 .about("Remove a worktree checkout")
                 .arg(option("workspace", "ID"))
                 .arg(flag("force")),
+        )
+}
+
+fn peer_command() -> Command {
+    Command::new("peer")
+        .about("Manage federated peer servers")
+        .subcommand(
+            Command::new("list")
+                .about("List configured peers and their connection state")
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("add")
+                .about("Add a peer server")
+                .arg(required("name", "NAME"))
+                .arg(path_option("socket", "PATH").help("Peer API socket path on this machine"))
+                .arg(option("ssh", "DESTINATION").help("SSH destination running the peer server"))
+                // `--session` is reserved: herdr strips it from argv before a
+                // subcommand sees it, to choose which local server to talk to.
+                .arg(option("peer-session", "NAME").help("Named session on the SSH peer"))
+                .arg(json_flag())
+                .group(
+                    ArgGroup::new("peer_target")
+                        .args(["socket", "ssh"])
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            Command::new("remove")
+                .about("Remove a peer server")
+                .arg(required("name", "NAME"))
+                .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("open")
+                .about("Open a peer's workspace or pane as a local workspace")
+                .arg(required("target", "TARGET"))
+                .arg(option("peer", "NAME").help("Peer name, when TARGET is not namespaced"))
+                .arg(option("label", "TEXT"))
+                .arg(flag("focus"))
+                .arg(flag("no-focus"))
+                .arg(flag("takeover").help("Replace an existing writable controller on the peer")),
         )
 }
 
@@ -1211,6 +1254,50 @@ mod tests {
     }
 
     #[test]
+    fn peer_add_takes_exactly_one_transport() {
+        for invalid in [
+            &["herdr", "peer", "add", "beta"][..],
+            &[
+                "herdr",
+                "peer",
+                "add",
+                "beta",
+                "--socket",
+                "/tmp/b.sock",
+                "--ssh",
+                "box",
+            ][..],
+        ] {
+            assert!(super::command().try_get_matches_from(invalid).is_err());
+        }
+        for valid in [
+            &["herdr", "peer", "add", "beta", "--socket", "/tmp/b.sock"][..],
+            &[
+                "herdr",
+                "peer",
+                "add",
+                "beta",
+                "--ssh",
+                "box",
+                "--peer-session",
+                "work",
+            ][..],
+        ] {
+            assert!(super::command().try_get_matches_from(valid).is_ok());
+        }
+    }
+
+    /// `--session` picks the local server before any subcommand parses argv, so
+    /// a peer's own session must not reuse that name.
+    #[test]
+    fn peer_add_keeps_off_the_reserved_session_flag() {
+        let cmd = super::command();
+        let peer_add = command_path(&cmd, &["peer", "add"]);
+        assert!(!has_option(peer_add, "session"));
+        assert!(has_option(peer_add, "peer-session"));
+    }
+
+    #[test]
     fn worktree_json_compatibility_flag_stays_out_of_public_spec() {
         let cmd = super::command();
         for subcommand in ["list", "create", "open", "remove"] {
@@ -1218,6 +1305,27 @@ mod tests {
             assert!(
                 !has_option(worktree_command, "json"),
                 "herdr worktree {subcommand} should not advertise --json"
+            );
+        }
+    }
+
+    /// These already answer with JSON, but `peer list` needs `--json` to, so a
+    /// script that passed the flag to both used to fail on these with `unknown
+    /// option`. They accept and ignore it without offering it in help or
+    /// completions, the same bargain `worktree` makes above.
+    #[test]
+    fn always_json_list_commands_take_the_flag_without_advertising_it() {
+        let cmd = super::command();
+        for path in [
+            &["pane", "list"][..],
+            &["workspace", "list"][..],
+            &["tab", "list"][..],
+        ] {
+            let listed = command_path(&cmd, path);
+            assert!(
+                !has_option(listed, "json"),
+                "herdr {} should not advertise --json",
+                path.join(" ")
             );
         }
     }

@@ -5,7 +5,7 @@ use crate::app::state::{AppState, ViewLayout};
 use super::ScrollbarClickTarget;
 
 impl AppState {
-    pub(super) fn workspace_list_rect(&self) -> Rect {
+    pub(crate) fn workspace_list_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
@@ -13,7 +13,7 @@ impl AppState {
         crate::ui::workspace_list_rect(sidebar, self.sidebar_section_split)
     }
 
-    pub(super) fn agent_panel_rect(&self) -> Rect {
+    pub(crate) fn agent_panel_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
@@ -197,7 +197,12 @@ impl AppState {
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
-        let mut labels = vec!["settings", "keybinds", "reload config"];
+        let mut labels = vec!["settings", "keybinds", "reload config", "add peer"];
+        // Hidden peers need a way back even when every peer header is hidden
+        // and no sidebar header remains to right-click.
+        if !self.hidden_peers.is_empty() || !self.hidden_peers_config.is_empty() {
+            labels.push("unhide peers");
+        }
         if self.update_available.is_some() {
             labels.push("update ready");
         } else if self.latest_release_notes_available {
@@ -299,7 +304,7 @@ impl AppState {
         self.mark_session_dirty();
     }
 
-    pub(super) fn workspace_at_row(&self, row: u16) -> Option<usize> {
+    pub(crate) fn workspace_at_row(&self, row: u16) -> Option<usize> {
         let footer = self.sidebar_footer_rect();
         if footer == Rect::default() {
             return None;
@@ -401,6 +406,7 @@ impl AppState {
                     indented: false,
                 } => Some(ws_idx),
                 crate::ui::WorkspaceListEntry::Workspace { .. } => None,
+                crate::ui::WorkspaceListEntry::PeerHeader { .. } => None,
             })
             .collect::<Vec<_>>();
         let source_pos = roots.iter().position(|ws_idx| *ws_idx == source_ws_idx)?;
@@ -646,6 +652,7 @@ mod tests {
                 "settings",
                 "keybinds",
                 "reload config",
+                "add peer",
                 "update ready",
                 "detach"
             ]
@@ -667,14 +674,20 @@ mod tests {
 
         assert_eq!(
             app.state.global_menu_labels(),
-            vec!["settings", "keybinds", "reload config", "detach"]
+            vec![
+                "settings",
+                "keybinds",
+                "reload config",
+                "add peer",
+                "detach"
+            ]
         );
 
         let menu = app.state.global_menu_rect();
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             menu.x + 2,
-            menu.y + 4,
+            menu.y + 5,
         ));
 
         assert!(app.state.detach_requested);
@@ -693,6 +706,7 @@ mod tests {
                 "settings",
                 "keybinds",
                 "reload config",
+                "add peer",
                 "what's new",
                 "detach"
             ]

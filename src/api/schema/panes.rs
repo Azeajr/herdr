@@ -40,6 +40,14 @@ pub struct PaneSplitParams {
     pub right_click: PaneRightClickTarget,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Instance id of the server requesting the split, when it is not this one.
+    ///
+    /// Set by a federating server splitting a pane here to back a view of its
+    /// own, so this server can report the pane as unattended once that instance
+    /// stops attaching to it. Self-asserted, like every other field on this
+    /// socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -466,6 +474,12 @@ pub struct PaneInfo {
     pub terminal_title_stripped: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
+    /// Agent status title reported through the terminal's OSC channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_osc_title: Option<String>,
+    /// Agent progress reported through the terminal's OSC channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_osc_progress: Option<String>,
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
@@ -476,7 +490,93 @@ pub struct PaneInfo {
     pub agent_session: Option<AgentSessionInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll: Option<PaneScrollInfo>,
+    /// Keyboard protocol the program in this pane has enabled.
+    ///
+    /// Which encoding a keypress should take is VT state, so only the server
+    /// holding the terminal can read it. A federating server reports it here so
+    /// a view onto this pane encodes the way the program asked rather than
+    /// always falling back to the legacy encoding — which is what makes
+    /// Shift+Enter, Ctrl+Enter and key-release events reach a remote agent at
+    /// all.
+    ///
+    /// `None` from a server too old to report it; treat that as legacy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_protocol: Option<KeyboardProtocolInfo>,
+    /// Name of the peer whose terminal this pane is a view onto, when it is one.
+    ///
+    /// A peer-backed pane holds no local terminal state: the peer renders the
+    /// screen and streams cells. Reads are forwarded to it, but anything that
+    /// needs the grid itself — selection, search, scroll position — has no
+    /// answer here. Clients should present this as a view onto another server
+    /// rather than discovering each limit by calling into it.
+    ///
+    /// This is the local side of [`Self::owner_instance_id`], which is what the
+    /// peer reports about the same pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    /// Liveness of the connection carrying this view, when the pane is one.
+    ///
+    /// A peer-backed pane keeps its identity, title, and cwd after the
+    /// connection behind it drops, because they are the last thing the peer
+    /// reported rather than something read live. Without this a stale view and
+    /// a healthy one are indistinguishable to a client, which is how a pane the
+    /// peer already closed goes on being listed as if it were running.
+    ///
+    /// `None` for a local pane. Always present for a peer-backed one, including
+    /// while it is connected, so a client can tell "not a view" from "a view
+    /// that is fine".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_view: Option<PeerViewInfo>,
+    /// Instance id of another herdr server that had this pane created, when one
+    /// did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_instance_id: Option<String>,
+    /// Whether that owner currently holds a connection to this pane's terminal.
+    ///
+    /// `None` when the pane has no other owner. `false` means the instance that
+    /// asked for this pane is gone while the pane is still running here, which
+    /// is what makes it a candidate for cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_attached: Option<bool>,
     pub revision: u64,
+}
+
+/// What the connection behind a peer-backed pane is currently doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PeerViewInfo {
+    pub state: PeerViewState,
+    /// Why the view is not connected, when the reason is known.
+    ///
+    /// Carried for both non-connected states because the same failure reads
+    /// differently depending on which one it produced: as the last thing that
+    /// went wrong while retrying, or as the thing retrying could not get past.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// How a pane's program wants keypresses encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KeyboardProtocolInfo {
+    /// Classic terminal encodings.
+    Legacy,
+    /// The Kitty keyboard protocol, with the progressive-enhancement flags the
+    /// program asked for.
+    Kitty { flags: u16 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerViewState {
+    /// The peer is streaming this pane.
+    Connected,
+    /// The connection dropped and is being reopened. The pane still shows the
+    /// peer's last frame.
+    Reconnecting,
+    /// Reopening was given up on. Nothing will change without the pane being
+    /// closed and the view opened again, so anything this pane reports is a
+    /// snapshot of when the connection was last alive.
+    Disconnected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -669,6 +769,102 @@ pub struct PaneResizeResult {
 #[serde(rename_all = "snake_case")]
 pub enum PaneResizeReason {
     Unchanged,
+}
+
+/// Read a rectangle-free span of a pane's screen, by buffer coordinates.
+///
+/// `pane.read` answers in whole lines from the bottom, which cannot name the
+/// span a drag covers. The rows here are absolute rows in the terminal's own
+/// buffer — the same coordinates a scroll position is expressed in — so a
+/// caller holding a scroll offset can name a row on any server that owns the
+/// screen, including one reached through a peer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReadRangeParams {
+    pub pane_id: String,
+    /// First row of the span, as an absolute buffer row.
+    pub start_row: u32,
+    /// First column of the span.
+    pub start_col: u16,
+    /// Last row of the span, inclusive.
+    pub end_row: u32,
+    /// Last column of the span, inclusive.
+    pub end_col: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReadRangeResult {
+    pub pane_id: String,
+    /// The span's text, joined the way the terminal itself joins it: soft
+    /// wraps do not become newlines, and trailing blanks are dropped.
+    pub text: String,
+}
+
+/// A terminal text operation that must run beside the terminal buffer.
+///
+/// The streamed pane frame intentionally carries only visible cells. Search
+/// and text motion need scrollback, soft-wrap boundaries, and the terminal's
+/// word rules, so a federating server asks the server that owns the buffer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextQueryParams {
+    pub pane_id: String,
+    #[serde(flatten)]
+    pub query: PaneTextQuery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneTextQuery {
+    Search {
+        query: String,
+        #[serde(default)]
+        case_sensitive: bool,
+    },
+    Motion {
+        row: u32,
+        col: u16,
+        motion: PaneTextMotion,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneTextMotion {
+    NextWordStart,
+    PreviousWordStart,
+    NextWordEnd,
+    NextBigWordStart,
+    PreviousBigWordStart,
+    NextBigWordEnd,
+    LineEnd,
+    FirstNonBlank,
+    PreviousParagraph,
+    NextParagraph,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextPoint {
+    pub row: u32,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextMatch {
+    pub start: PaneTextPoint,
+    pub end: PaneTextPoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextQueryResult {
+    pub pane_id: String,
+    #[serde(flatten)]
+    pub answer: PaneTextQueryAnswer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PaneTextQueryAnswer {
+    Search { matches: Vec<PaneTextMatch> },
+    Motion { target: Option<PaneTextPoint> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

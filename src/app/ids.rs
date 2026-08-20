@@ -57,7 +57,16 @@ impl App {
         )
     }
 
+    /// Resolves a workspace id to a local index.
+    ///
+    /// Peer-namespaced ids deliberately resolve to `None`: they name a
+    /// workspace on another server, which has no local index. Callers that can
+    /// act on a peer workspace route through
+    /// [`crate::app::peers::PeerRegistryState::resolve_peer_id`] first.
     pub(super) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
+        if crate::app::peers::is_peer_id(id) {
+            return None;
+        }
         self.state
             .workspaces
             .iter()

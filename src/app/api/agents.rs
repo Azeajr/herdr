@@ -176,6 +176,20 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        // A peer-backed pane is forwarded to the peer that owns it by the gate
+        // in `request_targets_peer_pane`, because the rules ran there. Reaching
+        // here with one means a caller bypassed the gate: name the peer rather
+        // than replay local rules against a screen this server does not have.
+        if let Some((peer, _)) = self.peer_pane_source(resolved.ws_idx, resolved.pane_id) {
+            return encode_error(
+                id,
+                "agent_explain_unavailable",
+                format!(
+                    "agent target {} is backed by peer '{peer}', which holds its screen",
+                    target.target
+                ),
+            );
+        }
         let Some((pane, _workspace_id)) = self.lookup_runtime(resolved.ws_idx, resolved.pane_id)
         else {
             return agent_not_found(id, &target.target);
@@ -296,7 +310,7 @@ fn agent_not_ready(id: String, target: &str) -> String {
     )
 }
 
-fn agent_not_found(id: String, target: &str) -> String {
+pub(super) fn agent_not_found(id: String, target: &str) -> String {
     encode_error(
         id,
         "agent_not_found",

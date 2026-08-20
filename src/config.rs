@@ -11,19 +11,19 @@ mod window_title;
 
 pub use self::{
     io::{
-        config_diagnostic_summary, config_dir, config_path, load_live_config,
+        config_diagnostic_summary, config_dir, config_path, load_live_config, record_peer_history,
         remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
-        upsert_section_value,
+        upsert_section_value, write_peer_hidden_peers,
     },
     keybinds::{
-        format_key_combo, normalize_key_combo, terminal_key_matches_combo, ActionKeybinds,
-        BindingConfig, CommandKeybindConfig, CustomCommandAction, CustomCommandKeybind,
-        IndexedKeybind, Keybinds, LiveKeybindConfig,
+        format_key_combo, normalize_key_combo, terminal_key_is_bare_printable,
+        terminal_key_matches_combo, ActionKeybinds, BindingConfig, CommandKeybindConfig,
+        CustomCommandAction, CustomCommandKeybind, IndexedKeybind, Keybinds, LiveKeybindConfig,
     },
     model::{
         validated_sidebar_bounds, AgentPanelSortConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, ShellModeConfig,
-        SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
+        ConfigReloadStatus, HostCursorModeConfig, NewTerminalCwdConfig, PeerHistoryEntry,
+        ShellModeConfig, SidebarCollapsedModeConfig, StatusIndicatorStyle, TabBarPositionConfig,
         ToastClipboardPosition, ToastConfig, ToastDelivery, ToastHerdrPosition,
         UpdateChannelConfig, MAX_TOAST_DELAY_SECONDS,
     },
@@ -38,6 +38,9 @@ pub use self::{
 };
 
 pub(crate) use self::keybinds::parse_key_combo;
+/// Only tests build a binding by hand; config always goes through the parser.
+#[cfg(test)]
+pub(crate) use self::keybinds::ResolvedBinding;
 pub(crate) use self::{
     io::upsert_top_level_bool,
     tab_bar::{
@@ -56,7 +59,9 @@ pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
 
-#[cfg(test)]
+/// Unix needs this outside tests to name the client in a peer's
+/// `authorized_keys`; nothing on Windows reads it yet.
+#[cfg(any(test, unix))]
 pub(crate) fn app_dir_name() -> &'static str {
     io::app_dir_name()
 }

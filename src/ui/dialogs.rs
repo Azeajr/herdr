@@ -11,10 +11,15 @@ use super::widgets::{
     action_button_row_rects, centered_popup_rect, panel_contrast_fg, render_action_button,
     render_modal_header, render_modal_shell, render_panel_shell, ActionButtonSpec,
 };
-use crate::app::{state::WorktreeOpenState, AppState, Mode};
+use crate::app::{
+    state::{AddPeerField, PeerWorkspaceOpenState, WorktreeOpenState},
+    AppState, Mode,
+};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const NEW_LINKED_WORKTREE_POPUP_WIDTH: u16 = 68;
+const ADD_PEER_POPUP_WIDTH: u16 = 60;
+const ADD_PEER_POPUP_HEIGHT: u16 = 13;
 const NEW_LINKED_WORKTREE_POPUP_HEIGHT: u16 = 12;
 
 pub(crate) fn rename_button_rects(inner: Rect) -> (Rect, Rect, Rect) {
@@ -256,6 +261,67 @@ pub(crate) fn open_existing_worktree_button_rects(inner: Rect) -> (Rect, Rect) {
     (rects[0], rects[1])
 }
 
+const PEER_WORKSPACE_OPEN_POPUP_WIDTH: u16 = 76;
+
+pub(crate) fn peer_workspace_open_inner_rect(area: Rect, entry_count: usize) -> Option<Rect> {
+    centered_popup_rect(
+        area,
+        PEER_WORKSPACE_OPEN_POPUP_WIDTH,
+        peer_workspace_open_popup_height(entry_count),
+    )
+    .map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+fn peer_workspace_open_popup_height(entry_count: usize) -> u16 {
+    (entry_count as u16)
+        .saturating_mul(2)
+        .saturating_add(7)
+        .clamp(12, 26)
+}
+
+pub(crate) fn peer_workspace_open_max_visible_rows(inner: Rect) -> usize {
+    usize::from(inner.height.saturating_sub(5) / 2)
+}
+
+pub(crate) fn peer_workspace_open_visible_start(
+    open: &PeerWorkspaceOpenState,
+    max_rows: usize,
+) -> usize {
+    let filtered = open.filtered_indices();
+    let selected = open.selected_entry_index().unwrap_or(open.selected);
+    let selected_pos = filtered
+        .iter()
+        .position(|idx| *idx == selected)
+        .unwrap_or(0);
+    selected_pos.saturating_sub(max_rows.saturating_sub(1))
+}
+
+pub(crate) fn peer_workspace_open_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "open",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
 pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     let Some(create) = app.worktree_create.as_ref() else {
         return;
@@ -287,7 +353,11 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     ])
     .areas::<8>(inner);
 
-    render_modal_header(frame, rows[0], "new worktree", &app.palette);
+    let header = match create.peer.as_deref() {
+        Some(peer) => format!("new worktree on {peer}"),
+        None => "new worktree".to_string(),
+    };
+    render_modal_header(frame, rows[0], &header, &app.palette);
 
     frame.render_widget(
         Paragraph::new(" branch").style(Style::default().fg(app.palette.overlay0)),
@@ -296,9 +366,18 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     let input_rect = Rect::new(rows[2].x, rows[2].y, rows[2].width, 1);
     render_name_input_field(app, frame, input_rect);
 
-    let checkout = create.checkout_path.display().to_string();
+    // A peer chooses its own checkout directory, so there is no path to preview:
+    // showing one derived from this server's worktree directory would name a
+    // path on the wrong machine. The repo it will be made in is what can be
+    // said, and the answer reports where it landed.
+    // The repo name arrives from the peer, so it is empty until it answers.
+    let (checkout_label, checkout) = match create.peer.as_deref() {
+        Some(peer) if create.repo_name.is_empty() => (" repo", format!("on {peer}")),
+        Some(peer) => (" repo", format!("{} on {peer}", create.repo_name)),
+        None => (" checkout", create.checkout_path.display().to_string()),
+    };
     frame.render_widget(
-        Paragraph::new(" checkout").style(Style::default().fg(app.palette.overlay0)),
+        Paragraph::new(checkout_label).style(Style::default().fg(app.palette.overlay0)),
         rows[3],
     );
     frame.render_widget(
@@ -343,6 +422,271 @@ pub(super) fn render_new_linked_worktree_overlay(app: &AppState, frame: &mut Fra
     );
 }
 
+/// Recent-peer rows the dialog offers, capped so the popup stays small.
+pub(crate) const ADD_PEER_MAX_RECENT_ROWS: usize = 5;
+
+/// ssh-recappable history entries, in the order the dialog lists them.
+pub(crate) fn add_peer_recent_entries(app: &AppState) -> Vec<&crate::config::PeerHistoryEntry> {
+    app.peer_history
+        .iter()
+        .filter(|entry| entry.target.starts_with("ssh://"))
+        .take(ADD_PEER_MAX_RECENT_ROWS)
+        .collect()
+}
+
+/// Rows the recent list occupies: a label row plus one per entry, or none.
+pub(crate) fn add_peer_recent_rows(app: &AppState) -> u16 {
+    let count = add_peer_recent_entries(app).len();
+    if count == 0 {
+        0
+    } else {
+        1 + count as u16
+    }
+}
+
+pub(crate) fn add_peer_inner_rect(app: &AppState, area: Rect) -> Option<Rect> {
+    let height = ADD_PEER_POPUP_HEIGHT + add_peer_recent_rows(app);
+    centered_popup_rect(area, ADD_PEER_POPUP_WIDTH, height).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// The recent-list row rects, one per offered entry, below their label row.
+pub(crate) fn add_peer_recent_row_rects(app: &AppState, inner: Rect) -> Vec<Rect> {
+    let count = add_peer_recent_entries(app).len();
+    (0..count)
+        .map(|idx| {
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(2 + idx as u16),
+                inner.width,
+                1,
+            )
+        })
+        .collect()
+}
+
+/// The two input rows, so a click can move the caret between fields.
+pub(crate) fn add_peer_field_rects(app: &AppState, inner: Rect) -> (Rect, Rect) {
+    let recent_rows = add_peer_recent_rows(app);
+    let destination = Rect::new(
+        inner.x,
+        inner.y.saturating_add(2 + recent_rows),
+        inner.width,
+        1,
+    );
+    let name = Rect::new(
+        inner.x,
+        inner.y.saturating_add(4 + recent_rows),
+        inner.width,
+        1,
+    );
+    (destination, name)
+}
+
+pub(crate) fn add_peer_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "connect",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+pub(super) fn render_add_peer_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(add) = app.add_peer.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let recent_rows = add_peer_recent_rows(app);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        ADD_PEER_POPUP_WIDTH,
+        ADD_PEER_POPUP_HEIGHT + recent_rows,
+        &app.palette,
+    ) else {
+        return;
+    };
+    if inner.height < 10 + recent_rows {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "add peer",
+        &app.palette,
+    );
+
+    if recent_rows > 0 {
+        let entries = add_peer_recent_entries(app);
+        let label = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+        frame.render_widget(
+            Paragraph::new(" recent").style(Style::default().fg(app.palette.overlay0)),
+            label,
+        );
+        for (idx, (entry, row)) in entries
+            .iter()
+            .zip(add_peer_recent_row_rects(app, inner))
+            .enumerate()
+        {
+            let selected = add.field == AddPeerField::Recent && add.recent_selected == idx;
+            let style = if selected {
+                Style::default()
+                    .fg(panel_contrast_fg(&app.palette))
+                    .bg(app.palette.accent)
+            } else {
+                Style::default().fg(app.palette.text)
+            };
+            frame.render_widget(
+                Paragraph::new(format!(" {} — {}", entry.name, entry.target)).style(style),
+                row,
+            );
+        }
+    }
+
+    let fields_y = inner.y.saturating_add(recent_rows);
+    let field_rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas::<9>(Rect::new(
+        inner.x,
+        fields_y,
+        inner.width,
+        inner.height.saturating_sub(recent_rows),
+    ));
+
+    render_add_peer_field(
+        app,
+        frame,
+        field_rows[1],
+        field_rows[2],
+        " ssh destination",
+        &add.destination,
+        add.field == AddPeerField::Destination,
+    );
+    render_add_peer_field(
+        app,
+        frame,
+        field_rows[3],
+        field_rows[4],
+        " name (optional)",
+        &add.name,
+        add.field == AddPeerField::Name,
+    );
+
+    // Said here rather than discovered by surprise: submitting hands off to a
+    // pane, and the user may have to answer something in it.
+    let note = match &add.error {
+        Some(error) => Paragraph::new(format!(" {error}"))
+            .style(Style::default().fg(app.palette.red))
+            .wrap(Wrap { trim: false }),
+        None => Paragraph::new(
+            " opens a pane running `herdr peer connect`, so ssh can ask\n for a password the first time",
+        )
+        .style(Style::default().fg(app.palette.overlay0))
+        .wrap(Wrap { trim: false }),
+    };
+    frame.render_widget(note, field_rows[6]);
+
+    let (connect_rect, cancel_rect) = add_peer_button_rects(inner);
+    render_action_button(
+        frame,
+        connect_rect,
+        Some("↵"),
+        "connect",
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+/// Only the focused field carries the host cursor, so which one a keystroke
+/// lands in is visible rather than remembered.
+///
+/// The cursor is the terminal's own rather than a drawn glyph, for the reason
+/// [`render_name_input_field`] gives: an IME composes at the host cursor, and a
+/// frame that carries none leaves composition behind the dialog.
+fn render_add_peer_field(
+    app: &AppState,
+    frame: &mut Frame,
+    label_row: Rect,
+    input_row: Rect,
+    label: &str,
+    value: &str,
+    focused: bool,
+) {
+    frame.render_widget(
+        Paragraph::new(label).style(Style::default().fg(app.palette.overlay0)),
+        label_row,
+    );
+    let input_rect = Rect::new(input_row.x, input_row.y, input_row.width, 1);
+    frame.render_widget(Clear, input_rect);
+    let background = if focused {
+        app.palette.surface1
+    } else {
+        app.palette.surface0
+    };
+    let style = Style::default().fg(app.palette.text).bg(background);
+    // Paint the field, then lay the text over all but its last column: a
+    // clamped caret then always lands on a blank cell, which is the cell the
+    // host terminal inverts, without leaving the field a column short.
+    frame.render_widget(Paragraph::new("").style(style), input_rect);
+    frame.render_widget(
+        Paragraph::new(format!(" {value}")).style(style),
+        Rect {
+            width: input_rect.width.saturating_sub(1),
+            ..input_rect
+        },
+    );
+
+    if !focused || input_rect.width == 0 {
+        return;
+    }
+    let caret_x = input_rect
+        .x
+        .saturating_add(1)
+        .saturating_add(display_width_u16(value))
+        .min(input_rect.right().saturating_sub(1));
+    frame.set_cursor_position((caret_x, input_rect.y));
+}
+
 pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
     let Some(remove) = app.worktree_remove.as_ref() else {
         return;
@@ -378,9 +722,12 @@ pub(super) fn render_remove_worktree_overlay(app: &AppState, frame: &mut Frame, 
         )])),
         rows[0],
     );
+    let removes_label = match remove.peer.as_deref() {
+        Some(peer) => format!(" This removes the checkout folder on '{peer}':"),
+        None => " This removes the checkout folder:".to_string(),
+    };
     frame.render_widget(
-        Paragraph::new(" This removes the checkout folder:")
-            .style(Style::default().fg(app.palette.overlay0)),
+        Paragraph::new(removes_label).style(Style::default().fg(app.palette.overlay0)),
         rows[1],
     );
     frame.render_widget(
@@ -457,10 +804,14 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
         return;
     }
 
+    let header = match open.peer.as_deref() {
+        Some(peer) => format!("open worktree on {peer}"),
+        None => "open worktree".to_string(),
+    };
     render_modal_header(
         frame,
         Rect::new(inner.x, inner.y, inner.width, 1),
-        "open worktree",
+        &header,
         &app.palette,
     );
     render_open_worktree_search(
@@ -533,9 +884,16 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
     }
 
     if filtered.is_empty() {
+        // A peer's list is a round trip, so an empty dialog is "not answered
+        // yet" until it says otherwise. Saying "no matching worktrees" while
+        // the peer is still being asked would report a result nobody has.
+        let empty = if open.loading {
+            " asking the peer…"
+        } else {
+            " no matching worktrees"
+        };
         frame.render_widget(
-            Paragraph::new(" no matching worktrees")
-                .style(Style::default().fg(app.palette.overlay0)),
+            Paragraph::new(empty).style(Style::default().fg(app.palette.overlay0)),
             Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
         );
     }
@@ -573,6 +931,223 @@ pub(super) fn render_open_existing_worktree_overlay(app: &AppState, frame: &mut 
             .bg(app.palette.surface0)
             .add_modifier(Modifier::BOLD),
     );
+}
+
+/// Picker over one peer's enumerated workspaces.
+///
+/// Mirrors [`render_open_existing_worktree_overlay`] row for row, because it is
+/// the same job: choose one candidate to open, with the ones already open
+/// marked rather than hidden.
+pub(super) fn render_open_peer_workspace_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(open) = app.peer_workspace_open.as_ref() else {
+        return;
+    };
+
+    // The peer's connection state is read live rather than snapshotted with the
+    // entries, so a peer that reconnects while the picker is open stops reading
+    // as stale without the list being rebuilt.
+    let unavailable = app
+        .peers
+        .get(&crate::app::peers::PeerHandle::new(open.peer.as_str()))
+        .and_then(|peer| crate::app::peer_unavailable_reason(&peer.connection));
+
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        PEER_WORKSPACE_OPEN_POPUP_WIDTH,
+        peer_workspace_open_popup_height(open.entries.len()),
+        &app.palette,
+    ) else {
+        return;
+    };
+    if inner.height < 8 {
+        return;
+    }
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        &format!(
+            "open workspace on {}",
+            // The peer's handle, matching the sidebar header and the unhide picker.
+            // Truncated anyway: a handle is user-chosen and nothing bounds its length.
+            truncate_end(&open.peer, inner.width.saturating_sub(20).max(8) as usize)
+        ),
+        &app.palette,
+    );
+    render_peer_workspace_search(
+        app,
+        frame,
+        Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        open,
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize))
+            .style(Style::default().fg(app.palette.surface1)),
+        Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+    );
+
+    let filtered = open.filtered_indices();
+    let max_rows = peer_workspace_open_max_visible_rows(inner);
+    let start = peer_workspace_open_visible_start(open, max_rows);
+    for (visible_idx, entry_idx) in filtered.iter().skip(start).take(max_rows).enumerate() {
+        let Some(entry) = open.entries.get(*entry_idx) else {
+            continue;
+        };
+        let selected = Some(*entry_idx) == open.selected_entry_index();
+        let y = inner.y.saturating_add(3 + (visible_idx as u16 * 2));
+        let marker = if selected { "›" } else { " " };
+        // Entries from a peer that is not up are last-known rather than live,
+        // so they render dim the same way stale peer content does.
+        let stale = unavailable.is_some();
+        let row_style = if selected {
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else if stale {
+            Style::default().fg(app.palette.overlay0)
+        } else {
+            Style::default().fg(app.palette.subtext0)
+        };
+        let detail_style = if selected {
+            Style::default()
+                .fg(app.palette.subtext0)
+                .bg(app.palette.surface0)
+        } else {
+            Style::default().fg(app.palette.overlay0)
+        };
+        let status = entry.status_label();
+        let title_width = inner
+            .width
+            .saturating_sub(display_width_u16(status))
+            .saturating_sub(4) as usize;
+        let mut title = format!(
+            "{marker} {}. {}",
+            entry.number,
+            truncate_end(&entry.label, title_width)
+        );
+        if !status.is_empty() {
+            let pad = inner
+                .width
+                .saturating_sub(display_width_u16(&title))
+                .saturating_sub(display_width_u16(status))
+                .max(1);
+            title.push_str(&" ".repeat(pad as usize));
+            title.push_str(status);
+        }
+        frame.render_widget(
+            Paragraph::new(truncate_end(&title, inner.width as usize)).style(row_style),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+        frame.render_widget(
+            Paragraph::new(truncate_end(
+                &format!("  {}", entry.detail()),
+                inner.width as usize,
+            ))
+            .style(detail_style),
+            Rect::new(inner.x, y.saturating_add(1), inner.width, 1),
+        );
+    }
+
+    if filtered.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" no matching workspaces")
+                .style(Style::default().fg(app.palette.overlay0)),
+            Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
+        );
+    }
+
+    // A failed open is an error; a peer that is merely not up yet is not, so
+    // the two share the line but not the colour.
+    let notice = open
+        .error
+        .as_ref()
+        .map(|error| (error.clone(), app.palette.red))
+        .or_else(|| {
+            unavailable.as_ref().map(|reason| {
+                (
+                    format!("{reason} — showing last known list"),
+                    app.palette.yellow,
+                )
+            })
+        });
+    if let Some((text, color)) = notice {
+        frame.render_widget(
+            Paragraph::new(truncate_end(&format!(" {text}"), inner.width as usize))
+                .style(Style::default().fg(color)),
+            Rect::new(
+                inner.x,
+                inner.y + inner.height.saturating_sub(2),
+                inner.width,
+                1,
+            ),
+        );
+    }
+
+    let (open_rect, cancel_rect) = peer_workspace_open_button_rects(inner);
+    render_action_button(
+        frame,
+        open_rect,
+        Some("↵"),
+        "open",
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
+fn render_peer_workspace_search(
+    app: &AppState,
+    frame: &mut Frame,
+    area: Rect,
+    open: &PeerWorkspaceOpenState,
+) {
+    let focus_style = if open.search_focused {
+        Style::default()
+            .fg(app.palette.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.palette.overlay0)
+    };
+    let filtered_count = open.filtered_indices().len();
+    let count = if open.query.trim().is_empty() {
+        format!("{} workspaces", open.entries.len())
+    } else {
+        format!("{filtered_count}/{} workspaces", open.entries.len())
+    };
+    let mut spans = vec![Span::styled(" / ", focus_style)];
+    if open.query.trim().is_empty() {
+        spans.push(Span::styled(
+            "filter workspaces",
+            Style::default().fg(app.palette.overlay0),
+        ));
+    } else {
+        spans.push(Span::styled(
+            open.query.clone(),
+            Style::default().fg(app.palette.text),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(
+            "{count:>width$}",
+            width = area.width.saturating_sub(20) as usize
+        ),
+        Style::default().fg(app.palette.overlay0),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_open_worktree_search(
@@ -760,6 +1335,123 @@ pub(super) fn render_confirm_close_overlay(
     }
 }
 
+const HIDDEN_PEERS_POPUP_WIDTH: u16 = 44;
+
+fn hidden_peers_popup_height(entry_count: usize) -> u16 {
+    // header + divider + rows + hint + borders
+    6 + entry_count.max(1) as u16
+}
+
+pub(crate) fn hidden_peers_inner_rect(app: &AppState, area: Rect) -> Option<Rect> {
+    let entries = app
+        .hidden_peers_picker
+        .as_ref()
+        .map(|picker| picker.entries.len())
+        .unwrap_or(0);
+    centered_popup_rect(
+        area,
+        HIDDEN_PEERS_POPUP_WIDTH,
+        hidden_peers_popup_height(entries),
+    )
+    .map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+/// One rect per listed hidden peer, so a click can unhide it directly.
+pub(crate) fn hidden_peers_row_rects(app: &AppState, inner: Rect) -> Vec<Rect> {
+    let count = app
+        .hidden_peers_picker
+        .as_ref()
+        .map(|picker| picker.entries.len())
+        .unwrap_or(0);
+    (0..count)
+        .map(|idx| {
+            Rect::new(
+                inner.x,
+                inner.y.saturating_add(2 + idx as u16),
+                inner.width,
+                1,
+            )
+        })
+        .collect()
+}
+
+pub(super) fn render_hidden_peers_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(picker) = app.hidden_peers_picker.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(
+        frame,
+        area,
+        HIDDEN_PEERS_POPUP_WIDTH,
+        hidden_peers_popup_height(picker.entries.len()),
+        &app.palette,
+    ) else {
+        return;
+    };
+
+    render_modal_header(
+        frame,
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        "hidden peers",
+        &app.palette,
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize))
+            .style(Style::default().fg(app.palette.surface1)),
+        Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1),
+    );
+
+    for (idx, (entry, row)) in picker
+        .entries
+        .iter()
+        .zip(hidden_peers_row_rects(app, inner))
+        .enumerate()
+    {
+        let selected = picker.selected == idx;
+        let marker = if selected { "›" } else { " " };
+        let scope = if entry.permanent {
+            "permanent"
+        } else {
+            "session"
+        };
+        let style = if selected {
+            Style::default()
+                .fg(app.palette.text)
+                .bg(app.palette.surface0)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.palette.subtext0)
+        };
+        frame.render_widget(
+            Paragraph::new(truncate_end(
+                &format!("{marker} {} ({scope})", entry.peer),
+                inner.width as usize,
+            ))
+            .style(style),
+            row,
+        );
+    }
+
+    let footer_y = inner.y + inner.height.saturating_sub(1);
+    let (text, color) = match &picker.error {
+        Some(error) => (format!(" {error}"), app.palette.red),
+        None => (" ↵ unhide   esc close".to_string(), app.palette.overlay0),
+    };
+    frame.render_widget(
+        Paragraph::new(truncate_end(&text, inner.width as usize)).style(Style::default().fg(color)),
+        Rect::new(inner.x, footer_y, inner.width, 1),
+    );
+}
+
 pub(crate) fn confirm_close_popup_rect(area: Rect) -> Option<Rect> {
     centered_popup_rect(area, 64, 6)
 }
@@ -931,6 +1623,7 @@ mod tests {
             source_checkout_path: "/repo/herdr".into(),
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
+            peer: None,
             repo_key: "repo-key".into(),
             repo_name: "herdr".into(),
             branch: "foo".into(),
@@ -1018,6 +1711,7 @@ mod tests {
             source_checkout_path: "/repo/herdr".into(),
             source_existing_membership: None,
             source_repo_root: "/repo/herdr".into(),
+            peer: None,
             repo_key: "repo-key".into(),
             repo_name: "herdr".into(),
             branch: branch.into(),

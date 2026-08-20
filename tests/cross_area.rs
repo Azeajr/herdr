@@ -14,7 +14,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::Deserialize;
 use serde_json::{json, Value};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
+    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid, scrub_inherited_herdr_env,
     unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
 };
 
@@ -115,6 +115,11 @@ fn spawn_server_with_path(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -152,6 +157,11 @@ fn spawn_client_process(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("client");
     cmd.env("HERDR_DISABLE_SOUND", "1");
     cmd.env("XDG_CONFIG_HOME", config_home);
@@ -429,6 +439,7 @@ fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16)
     payload.extend_from_slice(&encode_varint_u32(0)); // RenderEncoding::SemanticFrame
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientKeybindings::Server
     payload.extend_from_slice(&encode_varint_u32(0)); // ClientLaunchMode::App
+    payload.push(0); // Option<instance_id>::None
 
     stream
         .write_all(&frame_message(&payload))
@@ -509,6 +520,17 @@ struct FrameWire {
     cursor: Option<CursorWire>,
     hyperlinks: Vec<String>,
     graphics: Vec<u8>,
+    scroll: Option<ScrollWire>,
+}
+
+/// Mirror of `FrameScroll`, kept independent of the crate's own type so the
+/// wire layout is checked rather than assumed.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct ScrollWire {
+    offset_from_bottom: u32,
+    max_offset_from_bottom: u32,
+    viewport_rows: u32,
 }
 
 #[allow(dead_code)]

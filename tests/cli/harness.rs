@@ -12,6 +12,8 @@ pub(super) use crate::support::{
 };
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 
+pub(super) use crate::support::scrub_inherited_herdr_env;
+
 pub(super) const WORKTREE_BOOTSTRAP_MANAGED_COMPONENT: &str =
     "example.worktree-bootstrap-ef876653ffc3";
 
@@ -175,12 +177,15 @@ pub(super) fn spawn_named_server(
     .unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set, for the reason the helper spells out:
+    // this server is asserted against as if it began empty, and a suite run
+    // from inside a herdr pane inherits `HERDR_STARTUP_CWD`, which seeds it a
+    // startup workspace nobody asked for.
+    scrub_inherited_herdr_env(&mut command);
     command
         .args(["--session", session, "server"])
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env_remove("HERDR_SOCKET_PATH")
-        .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_ENV")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -225,11 +230,13 @@ pub(super) fn run_named_cli_with_env_and_socket_override(
     socket_override: Option<&Path>,
 ) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed first so the explicit sets below still win: the socket override
+    // is the whole point of this call, and the inherited value is never it.
+    scrub_inherited_herdr_env(&mut command);
     command
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_ENV");
     for (key, value) in envs {
         command.env(key, value);
@@ -300,6 +307,11 @@ pub(super) fn spawn_herdr_with_config(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    // Scrubbed before anything is set: running the suite from inside a
+    // herdr session leaks HERDR_STARTUP_CWD, which seeds a startup
+    // workspace, and the socket paths, which point a spawned server at
+    // the outer instance instead of its own.
+    scrub_inherited_herdr_env(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);

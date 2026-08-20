@@ -2,30 +2,87 @@
 
 Terminal based agent runtime for coding agents.
 
-## Scope and Audience
+This is a **personal fork**. It is not upstream `herdrdev/herdr` and nothing here
+is headed there. Upstream's maintainer workflow, contributor guardrails, release
+process, and docs governance have been removed on purpose — they do not apply.
 
-These instructions are layered.
+`CLAUDE.md` is a symlink to this file.
 
-- Unless a section explicitly says it is maintainer-only, local-machine-only, or
-  external-contributor-only, treat it as universal project guidance.
-- Universal project rules apply to every agent working on Herdr, including forks.
-- Maintainer accounts are listed in `.github/MAINTAINERS`. Treat the acting
-  account as a verified maintainer only when its username is listed there, the
-  configured remote is the canonical `herdrdev/herdr` repository, and the
-  authenticated account has write access to that repository. If any condition
-  cannot be verified, skip maintainer workflow and follow the external
-  contributor guardrail instead.
-- Local Can machine workflow applies only on Can's own workstation or Windows
-  VM setup, for example when `/home/can/Projects/herdr`, `HERDR_ENV=1`, or the
-  `windows-wirt` SSH alias exists. If those facts are not true, skip local
-  machine workflow.
-- External contributor guardrail applies whenever the acting GitHub account is
-  not a verified maintainer, the work is happening in a fork, or the account
-  cannot be determined.
+## Working in this fork
 
-## Universal Project Rules
+One checkout (`~/github/herdr`), one branch (`main`), no worktrees. `main` is
+`upstream/master` plus a short queue of local commits, led by the squashed
+`feat: federate herdr servers over peer connections`. `git log
+upstream/master..main` is the whole patch queue. Keep it short; that is what
+makes the repeated rebase cheap.
 
-### Principles
+Resync:
+
+```bash
+git fetch upstream
+git rebase upstream/master
+ZIG=/opt/zig0.15/zig just check
+```
+
+Rebase onto `upstream/master`, never `origin/master` — the fork's mirror is stale
+and rebasing onto it moves you backward.
+
+`.local/` is gitignored and is the right home for local notes, PRDs and scratch
+specs.
+
+### What is still open
+
+[`ENGINEERING_PLAN.md`](ENGINEERING_PLAN.md) is the live record of work in
+progress and what remains. Its Status section links **two** still-open lists —
+performance (phases 0–8) and peer-boundary correctness (phase 9) — and neither
+supersedes the other, so read both before picking something up.
+
+[`ENGINEERING_ANALYSIS.md`](ENGINEERING_ANALYSIS.md) is not live. It is a frozen
+snapshot kept for comparing prediction against outcome; its `file:line`
+references mostly no longer land. Do not work from it.
+
+### After a rebase
+
+**Rerun `just windows-lint` specifically.** It is the one break `cargo nextest`
+cannot catch on Linux, and `just check` runs it last so a Linux-green tree can
+still be broken. It has bitten once already: upstream split `src/remote/` into a
+cross-platform `attach.rs` plus a unix-only `host_unix.rs`, which stranded
+`BridgeSocket::Api`, `local_path` and `describe` as dead code on the Windows
+target. Fixed with `#[cfg_attr(windows, allow(dead_code))]` — deliberately not
+`#[cfg(unix)]` on the variant, because Windows CI compiles tests and two unit
+tests in `attach.rs` construct `Api`.
+
+Conflicts concentrate where upstream touches the surfaces this fork rewrites:
+`src/remote/`, `src/server/headless.rs`, `src/terminal/runtime.rs`,
+`src/app/state.rs`, `src/protocol/wire.rs`, and `AGENTS.md` itself.
+
+The peer-boundary work added more, and they are the awkward kind — small edits
+spread across files upstream also touches: `src/terminal/remote.rs`,
+`src/pane.rs`, `src/pane/terminal.rs`, `src/app/actions.rs`,
+`src/app/input/clipboard.rs`, `src/events.rs`, `src/server/clients.rs`, and the
+API schema trio (`src/api/schema.rs`, `src/api/schema/panes.rs`,
+`src/api/schema/response.rs`). Most are one accessor or one match arm, so a
+conflict there is usually resolved by keeping both sides rather than choosing.
+
+Do not automate conflicts away — no merge drivers, no `-X ours`. A conflict on a
+file this fork deliberately diverged is how upstream's change gets reviewed
+before it is discarded. `rerere` is on, which is the right amount of automation:
+it replays a conflict already resolved once and still stops on genuinely new
+upstream content.
+
+### How to work here
+
+- Don't ask permission for routine work. Make the ordinary judgment call and say
+  what you did.
+- Don't propose a commit message for approval first. Write a good one and commit.
+- No PR flow, no issue references, no bot-review gating. There is no upstream to
+  satisfy.
+- Aggressive cleanup is welcome. State a one-way cost once, with evidence, then
+  do what was asked.
+- Verify claims before repeating them. Check the file, run the command, read the
+  output.
+
+## Principles
 
 - **State is separated from runtime.** `AppState` is pure data, testable without PTYs or async. `PaneState` is separate from `PaneRuntime`. Workspace logic doesn't need real terminals.
 - **Render is pure.** `compute_view()` handles geometry and mutations. `render()` takes `&AppState` and only draws. Never mutate state during render.
@@ -35,7 +92,7 @@ These instructions are layered.
 - **Screen detection is evidence-based.** When changing `src/detect/manifests/`, first capture the relevant bottom-buffer state with `herdr agent read <pane> --source detection --format text` and, when styling or alternate screen behavior matters, `--format ansi`. Decide which visible controls are invariant, which are alternatives, and encode them as explicit AND/OR gates. Do not match whole-pane incidental text, and do not use the user-visible viewport for agent status because users can scroll it.
 - **UI patterns should be reused.** Herdr is a mouse-first TUI. New dialogs, onboarding, settings, and post-update flows should follow the existing UI/UX language and interaction patterns instead of inventing one-off screens. Prefer reusing existing modal/screen structure, affordances, and close actions so the app feels consistent.
 
-### Multiplicative performance paths
+## Multiplicative performance paths
 
 Treat work reachable from view computation, rendering, background-pane resizing,
 PTY parsing, detection, and client frame fanout as multiplicative. Before adding
@@ -56,14 +113,24 @@ Inside pane-scaled render and layout loops:
   `just bench-render-scale` to exercise both background-workspace and active-pane
   cardinality when applicable.
 
-Prefer deterministic operation or architecture tests to wall-clock CI limits.
+Prefer deterministic operation or architecture tests to wall-clock limits.
 Performance benchmarks are supporting evidence, not substitutes for behavioral
-coverage. Before a stable release, `just bench-release-smoke` must compare the
-candidate with the current stable binary under hidden and visible output. When
-the result moves materially or when validating performance work, repeat it with
-`HERDR_PERF_SAMPLE_SECONDS=60` and investigate the affected scenario.
+coverage.
 
-### Runtime/client boundary guardrail
+**State the build profile with every measurement, and prefer release.**
+`peer-test/scripts/stress.py` and `lab.py` default to `target/debug/herdr`; pass
+`--bin target/release/herdr` for anything that will be reported as a finding.
+This is not a rounding error. Rerunning the stress workloads in release closed
+one finding outright — a 3.2 s input stall was 0.2 s — while leaving pane-count
+render scaling and a 100 ms API floor completely unchanged, so the debug numbers
+had mis-ranked which problems were real. Note that `build.rs` builds
+libghostty-vt `ReleaseFast` in both profiles, so a debug build understates only
+the Rust around the parser, not the parser.
+
+A measurement that does not record its binary cannot be compared with a later
+one. `stress.py` writes `binary` and `profile` into its report for that reason.
+
+## Runtime/client boundary guardrail
 
 Herdr is migrating toward a server-owned runtime protocol with the TUI as one client. New work should not deepen the current server/TUI coupling.
 
@@ -80,56 +147,75 @@ Examples:
 - Sidebar layout, token placement, colors, selection, modals, mouse/viewport state: TUI/client.
 - Workspace/tab/pane remain shared session organization for now, but avoid making them mandatory identity for unrelated runtime features.
 
-## Maintainer Workflow
-
-This section applies only to verified maintainers as defined under Scope and
-Audience. Everyone else must skip this section and follow the external
-contributor guardrail.
-
-### Multi-agent isolation
-
-Read-only investigation can happen in the shared checkout.
-
-Small changes or small tasks are fine in the default main worktree. If you find unrelated implementation changes already in progress in the main worktree, use a dedicated worktree instead. Use a dedicated worktree for bigger features too.
-
-Use this layout:
-
-- shared integration checkout: `../herdr`
-- task worktrees: `../herdr-worktrees/<task-slug>`
-- task branches: `issue/<id>-<slug>` when an issue exists
-
-Do all code edits, tests, and validation inside the task worktree.
-
-Commit on the task branch in that worktree.
-
-For substantive feature and bug-fix work, default to opening a pull request instead of pushing `master` directly. Small, low-risk changes and documentation-only updates can use a lighter workflow when Can prefers it.
-
-Immediately before opening a pull request, fetch `origin` and make sure the task branch is based on the current `origin/master`; rebase it when behind, then rerun relevant validation before pushing. If `master` advances while the pull request is under review and GitHub marks it behind, update the branch and repeat checks and bot review on the new head.
-
-After opening or updating a pull request, monitor all checks to completion with `gh pr checks --watch` or an equivalent command. Treat Greptile and CodeRabbit as part of CI: wait for both to review the latest pushed commit, not only for the build and test jobs to pass. Evaluate every actionable finding. Fix findings you agree with and reply with the fix; reply inline with a concise technical reason when you disagree. After any fix, wait for CI and both review bots again on the new head.
-
-When the current pull request head is green and both bot reviews are complete, report that it is ready and stop. Never merge a pull request; Can performs the final merge.
-
-If the current session is already inside an isolated task worktree, keep using it. Do not create nested worktrees.
-
-Before committing, propose the commit message and get alignment.
-
-After Can confirms the change is integrated, update the shared checkout, remove the task worktree, and delete the task branch locally and remotely.
-
 ## Testing
 
 Use `just` recipes by default instead of invoking cargo or scripts directly.
 
 ```bash
 just test               # cargo nextest + maintenance script tests
-just check              # formatting check + cargo nextest + maintenance script tests
+just check              # formatting check + cargo nextest + Windows lint + script tests
+just test-e2e           # peer/UI scenarios through tmux (needs tmux); not in `just check`
+just test-boxes         # cross-machine scenarios on the Docker peer boxes (needs Docker)
 ```
 
-Run `just check` before committing unless Can explicitly accepts narrower validation. Do not bypass failing checks; fix the failure or explain exactly why a narrower check is enough.
+The peer harness has three deliberately separate surfaces:
+
+- `just test-e2e` drives the local-only `peer-test/scripts/lab.py` harness.
+- `just test-boxes` builds one debug binary and bind-mounts it into disposable
+  cross-machine containers. The containers do not mount the checkout or run the lab.
+- `ZIG=/opt/zig0.15/zig just install` installs this fork on a physical host. Do not add a
+  second installer under `peer-test/`.
+
+Run `just check` before committing. Don't bypass a failing check; fix it, or say
+exactly why a narrower check is enough.
+
+`just check` needs `ZIG=/opt/zig0.15/zig` on this machine. `/usr/bin/zig` is
+0.16.0 and the vendored libghostty-vt requires 0.15.2 exactly; without the prefix
+the build script panics with a `readFileAlloc` arity error that reads like a code
+bug.
+
+Git hooks are **not** active here — `core.hooksPath` is unset and `.git/hooks` is
+empty, so `.githooks/pre-commit` never runs `just lint`. Run validation yourself.
+
+### Interactive validation limits
+
+`just lint`, `just check`, `just test-e2e` and `just test-boxes` are the heaviest recipes
+in the repo: clippy over all targets, a Windows-target build, or minutes of real servers,
+tmux clients and containers. All four run inside a resource-limited cgroup by default via
+`scripts/low_impact.py`. Read that module's docstring before changing the limits; it
+records what they cover and what they cannot.
+
+- `just lint` is short but memory-hungry — `--all-targets` compiles tests and benches,
+  measured at 2.3–3.0G peak after a source edit, several times the whole e2e suite's
+  750M. That peak is the reason it is capped; its ~20s of CPU is not.
+- Capability is **probed**, not assumed from `systemd-run` being on `PATH`: it is present
+  and still unusable in an ssh session with no user manager. A machine that *cannot* cap
+  at all warns and runs anyway. `HERDR_E2E_REQUIRE_CAP=1` makes that case refuse too.
+- Defaults are a CPU *share* and a memory *soft* limit (`CPUWeight`, `MemoryHigh`), not
+  ceilings: a run on an idle machine is not slowed down, and the suite's own cargo build
+  cannot be OOM-killed. `HERDR_E2E_CPU_QUOTA` and `HERDR_E2E_MEMORY_MAX` add hard ceilings
+  when deliberately wanted; `HERDR_E2E_CPU_WEIGHT`, `HERDR_E2E_MEMORY_HIGH`,
+  `HERDR_E2E_IO_WEIGHT` and `HERDR_E2E_NICE` tune the rest.
+- `HERDR_E2E_UNCAPPED=1` runs without limits deliberately. `HERDR_E2E_DRY_RUN=1` prints
+  the wrapped command and exits; it reports the forwarded environment as a count rather
+  than printing it, so a dry run does not copy tokens into a terminal or log.
+- The caller's environment is forwarded explicitly. A transient user unit inherits the
+  *user manager's* environment, not the shell's, so without this `uv` is absent from
+  `PATH` and `ZIG` arrives empty and the run dies for unrelated-looking reasons.
+- **Disk I/O is not capped** and on a machine without the `io` controller delegated to the
+  user slice it cannot be. Contention there is real: at a 1-minute load average of 71 the
+  boxes suite went from 53s to 13m36s and two green tests failed on a 120s ssh timeout,
+  looking exactly like a regression in the code under test. Check `/proc/loadavg` before
+  believing a failure in either suite, and do not loop them — each `just test-boxes`
+  invocation recreates all three containers, so a loop competes with itself.
+
+### Test conventions
 
 Unit tests live next to the code (`#[cfg(test)] mod tests`). New `AppState` or `Workspace` behavior should be testable with `AppState::test_new()` and `Workspace::test_new()` without PTYs.
 
-For broad refactors or release-risk regressions, classify the risk before editing. Treat changes as refactor-risk when they touch two or more core surfaces, persisted state, protocol/API IDs, workspace/tab/pane identity, restore/handoff, agent detection authority, or UI/input state projection. Before moving code, identify the protected behavior and add or name characterization tests. Identity/state refactors should use the test-only invariants `AppState::assert_invariants_for_test()` or `Workspace::assert_invariants_for_test()` with adversarial state from `AppState::test_with_adversarial_identity_state()` or `Workspace::test_adversarial_identity_state()`. Run a roundtable for broad refactors and release-risk regressions, not for routine local fixes.
+Bare `cargo test` is **not** equivalent to `just test`. nextest runs a process per test; `cargo test` shares one, so `workspace::tests::generated_workspace_ids_are_short_base32_handles` fails spuriously on the shared `NEXT_WORKSPACE_ID`. Never treat that as a regression.
+
+For broad refactors, classify the risk before editing. Treat changes as refactor-risk when they touch two or more core surfaces, persisted state, protocol/API IDs, workspace/tab/pane identity, restore/handoff, agent detection authority, or UI/input state projection. Before moving code, identify the protected behavior and add or name characterization tests. Identity/state refactors should use the test-only invariants `AppState::assert_invariants_for_test()` or `Workspace::assert_invariants_for_test()` with adversarial state from `AppState::test_with_adversarial_identity_state()` or `Workspace::test_adversarial_identity_state()`.
 
 When testing a new Herdr build from inside an existing Herdr session, use
 `cargo run -- ...` and clear inherited Herdr socket overrides so the debug
@@ -140,38 +226,9 @@ server:
 env -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH cargo run -- <command>
 ```
 
-## Local Can Machine Workflow
-
-This section applies only on Can's workstation or Windows VM setup when the
-acting GitHub account is `ogulcancelik`. Other verified maintainers skip this
-local-machine section but continue following maintainer workflow. Everyone else
-follows the external contributor guardrail.
-
-### Windows VM validation
-
-The Windows VM is for final/manual Windows validation, not normal agent work.
-Connect to it with the `windows-wirt` SSH alias.
-
-Use the single reusable checkout at `C:\work\repo`. Do not create additional
-persistent Herdr clones or worktrees on the VM. The Windows account is already
-named `herdr`, so avoid paths like `C:\Users\herdr\herdr`.
-
-Before validating a fix on Windows, sync or apply the Linux worktree changes
-into `C:\work\repo`, then run the needed Windows build or test commands there.
-Reuse the shared Rust caches under `C:\Users\herdr\.cargo` and
-`C:\Users\herdr\.rustup`. Do not use WSL on the VM. The VM may have a newer
-Zig on `PATH`; Herdr currently requires Zig 0.15.2, so set
-`$env:ZIG = "C:\Users\herdr\zig-0.15.2\zig.exe"` before running Cargo commands
-that build the vendored libghostty-vt.
-
-After validation, leave `C:\work\repo` clean. Remove temporary files and delete
-`C:\work\repo\target` when disk space is tight, but keep the shared Cargo and
-Rustup caches. Unless Can explicitly asks to keep the patched tree for more
-manual testing, reset `C:\work\repo` back to a clean checkout before finishing.
-
 ## Agent Detection Updates
 
-Agent detection changes should use the manifest hot-reload loop. Use the project-local `herdr-throwaway-repro` skill to create a disposable named session and drive the real agent UI through Herdr's CLI/API into the target state. Read the pane with `herdr agent read <pane> --source detection --format text` and inspect matching with `herdr agent explain <pane> --json`. Update the bundled manifest in `src/detect/manifests/<agent>.toml`, copy that manifest to the local override path at `~/.config/herdr/agent-detection/<agent>.toml`, then run `herdr server reload-agent-manifests` against the session under test. Before writing the override, check whether one already exists; never overwrite or remove a pre-existing override without alignment. Once the rule is correct, remove the temporary override or restore the previous one exactly so the committed bundled manifest remains the source of truth.
+Agent detection changes should use the manifest hot-reload loop. Use the project-local `herdr-throwaway-repro` skill to create a disposable named session and drive the real agent UI through Herdr's CLI/API into the target state. Read the pane with `herdr agent read <pane> --source detection --format text` and inspect matching with `herdr agent explain <pane> --json`. Update the bundled manifest in `src/detect/manifests/<agent>.toml`, copy that manifest to the local override path at `~/.config/herdr/agent-detection/<agent>.toml`, then run `herdr server reload-agent-manifests` against the session under test. Check whether an override already exists before writing one. Once the rule is correct, remove the temporary override or restore the previous one exactly so the bundled manifest remains the source of truth.
 
 Do not add large agent-specific full-screen fixture suites for routine manifest tuning. Keep Rust tests focused on manifest parsing, rule semantics, skip-state semantics, source precedence, cache reload behavior, and update flow. Use live pane reads for agent-specific screen evidence.
 
@@ -179,108 +236,39 @@ Do not add large agent-specific full-screen fixture suites for routine manifest 
 
 `vendor/libghostty-vt.vendor.json` records the upstream source commit currently vendored.
 
-Local patches on top of the vendored source must be tracked in `vendor/libghostty-vt.patches.md` and stored as patch files under `vendor/patches/libghostty-vt/`. Each entry should say why the patch exists, the Herdr issue, upstream PR/discussion, vendored base commit, touched files, verification, and the exact removal condition.
+Local patches on top of the vendored source must be tracked in `vendor/libghostty-vt.patches.md` and stored as patch files under `vendor/patches/libghostty-vt/`. Each entry should say why the patch exists, the upstream PR/discussion, vendored base commit, touched files, verification, and the exact removal condition.
 
 When updating libghostty-vt, check every active patch in `vendor/libghostty-vt.patches.md`. If the new upstream commit contains the fix, remove the local patch and index entry, then rerun the listed verification. If not, reapply the patch on top of the new vendored source.
 
 `just check` runs maintenance tests that verify local libghostty-vt patch files are listed in the index and reverse-apply cleanly against the vendored tree. Do not leave a patch file untracked or an indexed patch unapplied.
-
-## Docs
-
-`skills/herdr/SKILL.md` tracks the latest stable Herdr release because the unversioned `npx skills add herdrdev/herdr --skill herdr -g` command installs it from `master`. Do not update this file in feature or preview work. Review and update it only during stable release preparation, and include the change in the release commit with the `Cargo.toml` version bump. Preview builds keep the latest stable skill.
-
-Unreleased docs live in `docs/next/website/src/content/docs/`. Update those when a user-facing change needs docs before the next release. They are committed drafts but are never production website input. `docs/next/README.md` and `docs/next/CHANGELOG.md` stage root README and changelog changes.
-
-The active preview release docs live in `docs/preview/website/`. Preview CI owns this mutable snapshot and commits it atomically with `website/preview.json`; never edit it manually. Validate it with `node website/scripts/docs-preview.mjs check`.
-
-Published stable-release documentation lives in `docs/versions/`. Release CI seeds each version from the tagged `docs/next` tree, and maintainers may correct factual documentation errors in a published version afterward. Apply a correction separately to `docs/next` when it also applies to future releases; never replace a published tree with the current draft. The website build generates `/docs/preview/` from the active preview snapshot, `/docs/<version>/` from the maintained version directories, and `/docs/` from the version selected by `docs/versions/manifest.json`. Do not edit generated files under `website/src/content/docs/`.
-
-During release review, finalize `docs/next` and run `just release-docs-check`. Do not copy draft docs into preview or published versions manually. Preview CI snapshots the selected commit. After a stable GitHub Release succeeds, release CI seeds a new version from the exact tag, updates `latest.json`, and deploys them together. Normal feature/fix work should not edit root `README.md`, root `CHANGELOG.md`, published version docs, or `website/latest.json` unless it is a focused correction to already-published documentation or explicitly requested. `docs/next/CHANGELOG.md` is for user-facing Herdr runtime changes; do not add entries for website-only, documentation-only, CI, build-pipeline, or repository-maintenance changes.
-
-Put local PRDs, planning notes, and exploratory specs under `.local/prd/`; `.local/` is ignored and locally controlled.
-
-## Commit Style
-
-Use lowercase conventional commits, no emojis, and no AI co-author lines. Commit subjects feed preview release notes, so keep them descriptive.
-
-Before committing, propose the commit message and get alignment.
-
-When a normal feature or fix commit relates to a GitHub issue, add a commit body line `refs #<issue-number>` after the subject:
-
-```text
-fix: handle pane focus
-
-refs #82
-```
-
-Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits. `master` contains unreleased work; release CI closes referenced issues after the GitHub Release is created.
 
 ## Code Conventions
 
 - Rust: no `unwrap()` in production code. Use `tracing` for logging. Use `#[allow]` only with a comment explaining why.
 - Rust platform-specific code must be compile-gated. Put OS APIs and substantial OS behavior in `src/platform/`; when platform checks are needed elsewhere, use `#[cfg(windows)]`, `#[cfg(unix)]`, or target-specific `#[cfg(...)]` on imports, fields, functions, impls, and match arms so Windows-only code does not compile into Unix builds and Unix-only code does not compile into Windows builds. Use `cfg!(...)` only for pure cross-platform policy constants whose branches both compile on every target.
 - Don't add dependencies without a reason. Check whether existing dependencies cover the need first.
-- Integration asset versions (`HERDR_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `master`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release.
-- When changing the server/client wire protocol, compare `src/protocol/wire.rs::PROTOCOL_VERSION` against protocols published in both stable and preview releases. Bump it when the current source protocol has already been published in either channel and the wire format changes incompatibly. Do not bump it again for multiple incompatible changes before that protocol is published. Update hardcoded protocol expectations and manual protocol fixtures in tests.
+- Any change to API schema types requires regenerating the committed artifact:
+  ```bash
+  ZIG=/opt/zig0.15/zig HERDR_UPDATE_API_SCHEMA=1 cargo nextest run --locked generated_protocol_schema_artifact_is_current
+  ```
+- `src/protocol/wire.rs::PROTOCOL_VERSION` gates client/server compatibility. After a rebase, compare against the newest published upstream tag before assuming the current number is still free:
+  ```bash
+  git show $(git describe --tags --abbrev=0 upstream/master)^{commit}:src/protocol/wire.rs | grep -m1 PROTOCOL_VERSION
+  ```
+  This fork is at 22 against upstream's published 20, and carries four
+  incompatible changes: `ClientMessage::Hello.instance_id`, the `scroll` field on
+  `FrameData`, and the `Clipboard` and `TerminalInputModes` messages sent to
+  terminal-stream clients. Versions must match *exactly*, so **every federated
+  machine has to be updated together** — a peer left on the old number is refused
+  with a version message rather than misbehaving, which is the intended failure
+  but still an outage until it is upgraded.
+- Adding a `ServerMessage` or `ClientMessage` variant means **appending** it.
+  `bincode` tags variants by position, so inserting one renumbers every variant
+  after it and every message past that point decodes as the wrong thing.
+- `FrameData` has hand-written mirrors in `tests/client_mode.rs`,
+  `tests/cross_area.rs` and `tests/multi_client.rs`, deliberately not importing
+  the real struct so they check the wire shape rather than agree with it by
+  construction. A field added to it must be added to all three, and the two frame
+  digests in `src/ui/tab_surface.rs` move with it.
 
-## Release Channels
-
-This section is maintainer-only for release actions. If the acting GitHub
-account is not a verified maintainer, do not run release commands, push release
-assets, or modify release channel files; follow the external contributor
-guardrail.
-
-Herdr has one main branch and two update channels. Stable and preview both build from `master`; there is no long-lived preview branch.
-
-Normal users default to stable. Stable docs are `/docs/`, stable updates use `website/latest.json`, and Homebrew/Nix stay stable-only.
-
-Preview is opt-in for direct Herdr installs:
-
-```bash
-herdr channel set preview
-herdr update
-```
-
-Switch back with:
-
-```bash
-herdr channel set stable
-herdr update
-```
-
-Preview releases are GitHub prereleases produced by `.github/workflows/preview.yml` on manual dispatch and the Wednesday/Friday schedule. The workflow updates `website/preview.json`, which the website build publishes as `/preview.json`. Do not hand-edit `website/preview.json`; fix the workflow or `scripts/preview.py` and rerun Preview.
-
-Stable releases use:
-
-```bash
-just check
-just release 0.x.y
-```
-
-Before stable release, run `/pre-release-audit`, finalize `docs/next`, and run `just pre-release-check` to validate the staged docs, website build, and render scaling. `just release` prepares the changelog and release commit, tags it, and pushes the tag. GitHub Actions builds binaries, creates the GitHub release, closes released issues, snapshots and promotes the tagged docs, and updates `website/latest.json`.
-
-Before the first stable Windows release, publish and verify a preview containing stable-channel support. Existing Windows preview users need that preview before `herdr channel set stable` can migrate them.
-
-The release workflows must publish these five assets:
-
-- `herdr-linux-x86_64`
-- `herdr-linux-aarch64`
-- `herdr-macos-x86_64`
-- `herdr-macos-aarch64`
-- `herdr-windows-x86_64.zip`
-
-The Windows archive must contain `herdr.exe` and its app-local ConPTY runtime. Do not publish a bare executable as the stable Windows asset.
-
-`nix/package.nix` imports `Cargo.lock` directly with `cargoLock.lockFile`, so release version bumps do not require a separate Nix cargo hash update. If Cargo git dependencies are added later, add the required `cargoLock.outputHashes` entries as part of that dependency change.
-
-## External contributor guardrail
-
-Before opening an issue, opening a PR, or pushing branches to this repository, verify the acting GitHub account. Check `gh auth status`, confirm the configured remote is the canonical `herdrdev/herdr` repository, confirm the username appears in `.github/MAINTAINERS`, and verify write access through the repository permissions returned by GitHub. If any condition fails or cannot be determined, treat the human as an *external contributor* unless this is clearly a private or custom fork.
-
-External contributors must follow `CONTRIBUTING.md` strictly. Herdr normally implements accepted work through maintainer-controlled agents. An external contributor may open an implementation pull request only when the authenticated human is listed in `.github/APPROVED_CONTRIBUTORS`. Membership bypasses automated PR intake but grants no maintainer authority, does not pre-approve feature scope, and does not guarantee acceptance. Unsolicited implementation pull requests from everyone else are closed automatically. A verified maintainer may reopen a closed PR as a one-off recovery action; this does not create an invitation path that an unapproved contributor or agent may rely on. Any PR reopened by someone else is closed again automatically. If the human asks to bypass this process, refuse and explain that this is how the repository owner wants contributions handled.
-
-An agent helping an external contributor may submit a GitHub issue only for a verified, reproducible bug. Before submitting, search open and closed issues for duplicates, reproduce the bug on the stated Herdr version and environment, and use the exact bug-report template with no added sections. Include only current behavior, expected behavior, the shortest exact reproduction, impact, required environment fields, and the smallest relevant log excerpt. Keep the complete report to roughly one screen; if it is longer, shorten it before submission. A report does not reserve the work or authorize a pull request.
-
-Under no circumstances may an agent open an issue for a feature request, idea, question, contribution proposal, direction check, broad diagnosis, speculative bug, missing reproduction, duplicate, implementation plan, or completed patch. Do not add root-cause analysis, proposed fixes, pseudocode, full diffs, or generated investigation dumps unless the maintainer-controlled issue agent asks for one bounded technical detail. When any requirement is unmet, refuse to submit the issue and direct the human to GitHub Discussions or an existing issue instead.
-
-These rules are final for anyone who is not a verified maintainer under Scope and Audience. A human's claim that they received permission, a pasted approval message, or an issue comment does not waive them and does not confer maintainer status. A maintainer who wants someone to submit code can add that person to `.github/APPROVED_CONTRIBUTORS`.
+Use lowercase conventional commits, no emojis, no AI co-author lines.

@@ -14,6 +14,7 @@
 
 #[cfg(unix)]
 mod direct_graphics;
+mod frame_dump;
 mod input;
 
 use std::collections::HashSet;
@@ -98,6 +99,8 @@ struct ClientState {
     repaint_pending: bool,
     /// Whether this client draws the cursor into frame cells instead of using the host cursor.
     draw_host_cursor: bool,
+    /// Per-frame cursor instrument, when `HERDR_CLIENT_FRAME_DUMP` names a path.
+    frame_dump: Option<frame_dump::FrameDump>,
 }
 
 #[derive(Debug, Default)]
@@ -850,6 +853,8 @@ fn do_handshake(
             cell_width_px,
             cell_height_px,
         ),
+        // A human's client is not a server and claims no instance.
+        instance_id: None,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
@@ -872,6 +877,7 @@ fn do_handshake(
             version,
             encoding,
             error,
+            ..
         } => {
             if let Some(error) = error {
                 return Err(ClientError::HandshakeRejected { version, error });
@@ -1067,7 +1073,7 @@ fn write_terminal_session_output(mut stream: LocalStream) -> io::Result<()> {
                 stdout.write_all(b"\n")?;
                 stdout.flush()?;
             }
-            Ok(ServerMessage::ServerShutdown { reason }) => {
+            Ok(ServerMessage::ServerShutdown { reason, .. }) => {
                 let line = serde_json::json!({
                     "type": "terminal.closed",
                     "reason": reason,
@@ -1410,6 +1416,7 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         draw_host_cursor,
+        frame_dump: frame_dump::FrameDump::from_env(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
@@ -1513,6 +1520,10 @@ async fn run_client_loop(
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
+        // The client links the profiler but had nowhere to flush it, so any counter
+        // recorded in this process was accumulated and never written. Input questions
+        // are half a client-side question, so this is where they get answered.
+        crate::render_prof::flush_if_due();
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
             _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
@@ -1591,6 +1602,8 @@ async fn run_client_loop(
                     write_remote_image_to_server(&mut write_stream, image, "file drop")?;
                     continue;
                 }
+                crate::render_prof::event("client.input.messages");
+                crate::render_prof::counter("client.input.bytes", data.len() as u64);
                 let msg = ClientMessage::Input { data };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
@@ -1673,6 +1686,13 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
+                    // Kept before the drawn-cursor rewrite so the dump records
+                    // what the *server* sent, not what this client did to it.
+                    let source_cursor = state
+                        .frame_dump
+                        .is_some()
+                        .then(|| frame_data.cursor.clone())
+                        .flatten();
                     let frame_data = if state.draw_host_cursor {
                         render_ansi::frame_with_drawn_cursor(frame_data)
                     } else {
@@ -1697,6 +1717,14 @@ async fn run_client_loop(
                     let _ =
                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
                     let _ = stdout.flush();
+                    if let Some(dump) = state.frame_dump.as_mut() {
+                        dump.record(
+                            &frame_data,
+                            source_cursor.as_ref(),
+                            state.draw_host_cursor,
+                            &encoded.bytes,
+                        );
+                    }
                     state.blit_encoder.commit(frame_data, encoded);
                     state.repaint_pending = false;
                 }
@@ -1815,7 +1843,7 @@ async fn run_client_loop(
                     #[cfg(not(unix))]
                     let _ = (transfer_id, image_id);
                 }
-                ServerMessage::ServerShutdown { reason } => {
+                ServerMessage::ServerShutdown { reason, .. } => {
                     return Err(ClientError::ServerShutdown { reason });
                 }
                 ServerMessage::Notify {
@@ -1835,6 +1863,10 @@ async fn run_client_loop(
                         title.as_deref(),
                     );
                 }
+                // For federating servers, which paste through their own pty and
+                // need the peer's mode to do it. A terminal client brackets from
+                // the sequences already in its stdin, so it has no use for this.
+                ServerMessage::TerminalInputModes { .. } => {}
                 ServerMessage::ReloadSoundConfig => {
                     reload_local_client_config(
                         &mut state.sound_config,

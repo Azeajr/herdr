@@ -91,6 +91,86 @@ HERDR_REMOTE_BINARY=target/release/herdr herdr --remote workbox
 herdr --remote workbox --session agents
 ```
 
+## 联邦对等服务器
+
+`herdr --remote` 用别人的会话替换你的会话。对等（peer）是另一种形态：你自己的 Herdr 服务器连接到另一台 Herdr 服务器，把它的工作区显示在你自己的工作区旁边，让一个侧边栏同时容纳多台机器上的工作。
+
+对等按服务器配置，并在重启后保留。对等只是一条连接，它从不搬动任何面板。每台机器仍然拥有并运行自己的终端。
+
+### 添加对等
+
+同一台机器上的对等用它的 API 套接字路径指定：
+
+```bash
+herdr peer add beta --socket /home/you/.config/herdr/sessions/beta/herdr.sock
+```
+
+另一台主机上的对等用 SSH 目标指定，也可以附带该主机上的命名会话：
+
+```bash
+herdr peer add workbox --ssh workbox --peer-session agents
+```
+
+这个参数是 `--peer-session` 而不是 `--session`：`--session` 用来选择命令发往*你自己的*哪台服务器，每个 `herdr` 命令都接受它。
+
+用[套接字 API](/zh-cn/docs/socket-api/) 添加同样这两个对等：
+
+```json
+{"id":"1","method":"peer.add","params":{"name":"beta","target":{"type":"socket_path","path":"/home/you/.config/herdr/sessions/beta/herdr.sock"}}}
+{"id":"2","method":"peer.add","params":{"name":"workbox","target":{"type":"ssh","destination":"workbox","session":"agents"}}}
+```
+
+SSH 目标使用你的 SSH 配置，与 `herdr --remote` 完全一致。但与 `herdr --remote` 不同，对等永远不会在远程主机上安装或替换 Herdr：后台服务器无法请你批准向另一台机器写入。远程端必须已经运行版本匹配的 Herdr。先用会提示确认的 `herdr --remote <destination>` 安装一次，然后再添加对等。
+
+SSH 对等的连接在对等处于配置状态期间一直保持，而不只是在你查看时。移除对等会同时拆除连接：
+
+```bash
+herdr peer remove workbox
+```
+
+`herdr peer list` 以表格打印每个对等及其目标、连接状态（`connecting`、`connected`、`reconnecting`、`error`），以及它报告了多少个工作区。`reconnecting` 和 `error` 含义不同，值得区分：`reconnecting` 仍在重试，`error` 已经放弃，重试中的对等还会显示重试次数。加上 `--json` 可得到完整记录，其中还包含对等的版本、协议和工作区本身。`add`、`remove`、`list` 都会返回完整的对等列表，因此用其中任何一个都能看到最终状态。
+
+### 打开对等的工作区
+
+在侧边栏右键点击对等的标题行，选择 **Open workspace...**，即可浏览该对等报告的工作区。标题行带有 `已打开/总数` 计数，因此你在打开之前就能看出有没有可打开的内容。已打开的条目会被标记，选中它会切换到你已有的视图，而不是再开一个。
+
+用 `peer list` 返回的 id，从命令行或 API 做同样的事：
+
+```bash
+herdr peer open <instance-id>:w1 --focus
+```
+
+```json
+{"id":"3","method":"peer.workspace.open","params":{"target":"<instance-id>:w1","focus":true}}
+```
+
+目标接受工作区 id、面板 id 或终端 id。来自对等列表的 id 已用对等的实例 id 加了命名空间，足以标识对等；只有当目标是对等本地的裸 id 时，才需要额外指明对等名 —— 命令行用 `--peer`，API 用 `name`。
+
+打开对等的工作区会创建一个内容来自对等的*本地*工作区。它的布局、焦点和尺寸都属于你：对等会按你的布局给出的尺寸渲染它的终端。关闭它不会影响对等上仍在运行的一切。
+
+拆分一个由对等支撑的面板，拆分发生在**对等那一侧**，并会打开指向新面板的第二个视图。这样创建的面板在你关闭视图时也会在对等上关闭，因为它是你要求创建的。而指向对等原本就有的面板的视图，永远不会在对等上被关闭。
+
+如果连接断开，面板会继续以变暗的方式显示对等的最后一屏，并用一行说明它是否会回来 —— `reconnecting to <peer>… (attempt N)` 或 `disconnected from <peer>: <reason>`。一旦对等重新可达，它会自行重连。如果对等回答该面板已不存在 —— 你在其中输入了 `exit`，或在那一侧关闭了它 —— 面板在本地也会随之关闭，就像进程在本机退出一样。灰色的 `disconnected` 状态仍保留给对等不可达、或对等已被另一台服务器替换的情况。
+
+### 由对等支撑的面板能做什么
+
+由对等支撑的面板不持有自己的终端状态。屏幕由对等拥有，并以渲染好的单元格流式传来，这决定了哪些功能可用：
+
+- **输入、调整尺寸和鼠标滚轮**可用。滚轮滚动对等的回滚缓冲，并由对等应用运行中程序自身的滚轮行为。
+- **`pane.read` 可用**，由对等作答。当对等不可达时，读取会以标明对等状态的 `unavailable` 失败，而不是返回一屏空白。
+- **没有滚动条**，因为滚动位置在对等那一侧。
+- **复制模式不会打开。** 选择和搜索读取本地屏幕，而它并不在这里；Herdr 会直接说明，而不是打开一个什么也找不到的复制模式。
+- **`agent.read` 可用**，与 `pane.read` 同理，由对等作答。
+- **`agent.explain` 可用**，由真正跑过这些规则的对等作答。返回的解释带有 `peer` 字段以及该面板在对等上的 id，因为其中的清单来源、版本和规则 id 都属于对等那一侧的安装，而不是你这边的。`herdr agent explain` 会把它打印为清单行上方的 `peer:` 一行。
+
+### 对等会报告面板的哪些信息
+
+面板的工作目录、终端标题和智能体同样无法在本地读取，因此它们会随屏幕一起从对等传来。它们出现在本地面板信息出现的所有地方 —— `pane.get`、`pane.list`、`agent.list`、`agent.wait`、侧边栏，以及工作区自身的状态 —— 对等上的智能体从 working 变为 idle，也会像本地智能体一样传达给你。
+
+它们大约在 1.5 秒内刷新，因此对等的面板可能会短暂地显示得比本地面板旧一些。连接断开时会保留最后的标签而不是清空，等对等回来后再次更新。
+
+`pane.get` 和 `pane.list` 会在这类面板上报告 `peer`，这样客户端无需逐个踩坑就能分辨差异。
+
 ## 直接终端附加
 
 完整的 Herdr 连接会打开整个工作区 UI。直接附加则在你当前的终端中打开一个由服务器拥有的终端。

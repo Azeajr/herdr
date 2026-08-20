@@ -1190,6 +1190,30 @@
       ]
     },
     {
+      "id": "peer_history",
+      "title": "Peer history",
+      "keys": [
+        {
+          "key": "peer_history.max_entries",
+          "type": "integer",
+          "default": "10",
+          "description": "How many recently added peers the add-peer dialog offers for one-click re-add. Entries live in peer_history.recent as inline tables ({ name, target, last_used }) -- name is the peer handle, target is ssh://destination (with an optional #session suffix) or socket://path, last_used is epoch seconds. The list is managed by Herdr: every successful peer add moves the target to the front, deduplicates by target, and trims to this many entries."
+        }
+      ]
+    },
+    {
+      "id": "peer_hidden",
+      "title": "Hidden peers",
+      "keys": [
+        {
+          "key": "peer_hidden.peers",
+          "type": "array of strings",
+          "default": "[]",
+          "description": "Peer names hidden from the sidebar permanently. Managed from the peer header context menu (Hide permanently / Unhide peer...); hiding is refused while the peer has open workspaces. Session-scoped hiding exists too but is stored in the session snapshot, not here."
+        }
+      ]
+    },
+    {
       "id": "advanced",
       "title": "Advanced",
       "keys": [

@@ -59,6 +59,7 @@ pub(crate) use self::{
         terminal_direct_indexed_navigation_action, terminal_direct_non_indexed_navigation_action,
     },
     settings::open_settings_at,
+    terminal::PendingPaneInput,
 };
 use self::{
     modal::{
@@ -105,6 +106,9 @@ impl App {
                 }
                 Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
                 Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
+                Mode::OpenPeerWorkspace => self.handle_peer_workspace_open_key(key_event),
+                Mode::AddPeer => self.handle_add_peer_key(key_event),
+                Mode::UnhidePeers => self.handle_hidden_peers_key(key_event),
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
@@ -227,6 +231,22 @@ impl App {
                     return false;
                 }
                 self.insert_worktree_open_search_text(text);
+                true
+            }
+            Mode::OpenPeerWorkspace => {
+                if !self
+                    .state
+                    .peer_workspace_open
+                    .as_ref()
+                    .is_some_and(|open| open.search_focused)
+                {
+                    return false;
+                }
+                self.insert_peer_workspace_open_search_text(text);
+                true
+            }
+            Mode::AddPeer => {
+                self.insert_add_peer_text(text);
                 true
             }
             Mode::Navigator => {
@@ -468,6 +488,7 @@ impl App {
         }
 
         self.dispatch_pending_clipboard_write();
+        self.dispatch_pending_peer_selection_copy();
 
         // Sync autoscroll deadline with state (mouse handler may have
         // set or cleared selection_autoscroll during handle_mouse).
@@ -522,7 +543,10 @@ impl App {
                 }
             },
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
-                rt.encode_mouse_button(mouse.kind, position, mouse.modifiers)
+                // Handles its own send, so a peer-backed popup pane forwards the
+                // click instead of encoding it against VT state it does not have.
+                rt.try_send_mouse_button(mouse.kind, position, mouse.modifiers);
+                return;
             }
             MouseEventKind::Moved => rt.encode_mouse_motion(mouse.kind, position, mouse.modifiers),
         };
@@ -726,11 +750,17 @@ pub(crate) fn is_modal_paste_shortcut(key: &KeyEvent) -> bool {
 
 pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
     match state.mode {
-        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane | Mode::NewLinkedWorktree => {
-            true
-        }
+        Mode::RenameWorkspace
+        | Mode::RenameTab
+        | Mode::RenamePane
+        | Mode::NewLinkedWorktree
+        | Mode::AddPeer => true,
         Mode::OpenExistingWorktree => state
             .worktree_open
+            .as_ref()
+            .is_some_and(|open| open.search_focused),
+        Mode::OpenPeerWorkspace => state
+            .peer_workspace_open
             .as_ref()
             .is_some_and(|open| open.search_focused),
         Mode::Navigator => state.navigator.search_focused,
@@ -758,7 +788,7 @@ impl AppState {
         // Actual PTY spawning happens in Workspace::split_focused
         // which needs events channel — this is called from navigate_key
         // where we don't have async context, so the workspace handles it
-        let (rows, cols) = self.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.estimate_pane_size();
         let new_rows = (rows / 2).max(4);
         let new_cols = (cols / 2).max(10);
 
@@ -875,6 +905,8 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         state.sidebar_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
+        state.hidden_peers.clone(),
+        crate::persist::peer_snapshots(&state.peers),
     )
 }
 
@@ -984,6 +1016,7 @@ mod tests {
             checkout_path: "/repo/herdr-generated-branch".into(),
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.handle_paste("feature/linear-302".into()).await;

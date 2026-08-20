@@ -14,6 +14,23 @@ struct PreparedPaneInput {
     bytes: Bytes,
 }
 
+/// Keystrokes for one pane, joined until the end of the routing batch that produced
+/// them.
+///
+/// A client sends one message per stdin read, and the server turns it into one event
+/// per character — so a 4 KB burst arrives as thousands of consecutive keys for the
+/// same pane, each of which used to be its own pty queue item and its own write. The
+/// pty then echoed each one separately, and every echoed byte cost a read and a parse.
+///
+/// This never outlives one call to `route_client_events_from`, which is what makes it
+/// safe: nothing outside that call can observe input that has been accepted but not
+/// yet handed to the pty.
+pub(crate) struct PendingPaneInput {
+    ws_idx: usize,
+    pane_id: crate::layout::PaneId,
+    bytes: Vec<u8>,
+}
+
 enum PreparedPopupInput {
     NotOpen,
     Consumed,
@@ -45,6 +62,9 @@ impl App {
             PreparedPopupInput::NotOpen => {}
             PreparedPopupInput::Consumed => return None,
             PreparedPopupInput::Bytes { target, bytes } => {
+                // A popup is a different terminal, so anything already batched for a
+                // pane goes first.
+                self.flush_pending_pane_input();
                 let Some(runtime) = self.popup_runtime() else {
                     self.close_popup_pane();
                     return None;
@@ -54,10 +74,118 @@ impl App {
         }
 
         let input = self.prepare_terminal_key_forward(source_id, key)?;
-        let sent = self
+        let target = input.target.clone();
+        self.queue_pane_input(input).then_some(target)
+    }
+
+    /// Adds one key's bytes to the pending batch, flushing first if it is for a
+    /// different pane.
+    ///
+    /// Reports whether the bytes are accounted for, which is what the caller's lease
+    /// bookkeeping asks. A queued batch can still fail at flush time if the pty input
+    /// queue is full by then — the same outcome as before, one batch later.
+    fn queue_pane_input(&mut self, input: PreparedPaneInput) -> bool {
+        // Only a routing batch joins keys. Every other caller — the API, tests, any
+        // path that forwards a single key — still delivers immediately, so holding
+        // input can never depend on someone remembering to flush.
+        if !self.input_batch_active {
+            return self
+                .lookup_runtime_sender(input.ws_idx, input.pane_id)
+                .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
+        }
+        if let Some(pending) = &mut self.pending_pane_input {
+            if pending.ws_idx == input.ws_idx && pending.pane_id == input.pane_id {
+                pending.bytes.extend_from_slice(&input.bytes);
+                return true;
+            }
+        }
+        self.flush_pending_pane_input();
+        if self
             .lookup_runtime_sender(input.ws_idx, input.pane_id)
-            .is_some_and(|runtime| runtime.try_send_bytes(input.bytes).is_ok());
-        sent.then_some(input.target)
+            .is_none()
+        {
+            return false;
+        }
+        self.pending_pane_input = Some(PendingPaneInput {
+            ws_idx: input.ws_idx,
+            pane_id: input.pane_id,
+            bytes: input.bytes.to_vec(),
+        });
+        true
+    }
+
+    /// Hands the pending batch to its pane. Safe to call when there is nothing pending.
+    ///
+    /// Every path that sends bytes to a pane by another route calls this first, so the
+    /// order the pty sees is the order the keys arrived in.
+    pub(crate) fn flush_pending_pane_input(&mut self) {
+        let Some(pending) = self.pending_pane_input.take() else {
+            return;
+        };
+        if pending.bytes.is_empty() {
+            return;
+        }
+        crate::render_prof::event("input.pane_batch.flushes");
+        crate::render_prof::counter("input.pane_batch.bytes", pending.bytes.len() as u64);
+        if let Some(runtime) = self.lookup_runtime_sender(pending.ws_idx, pending.pane_id) {
+            let _ = runtime.try_send_bytes(Bytes::from(pending.bytes));
+        }
+    }
+
+    /// Runs the three direct-binding lookups, reporting whether one of them claimed
+    /// the key.
+    ///
+    /// Split out of [`Self::prepare_terminal_key_forward`] so the whole group can be
+    /// skipped by a single guard when no direct binding could possibly match.
+    fn intercept_terminal_direct_binding(&mut self, key: &TerminalKey) -> bool {
+        let key_event = key.as_key_event();
+
+        if let Some(action) = super::terminal_direct_non_indexed_navigation_action(&self.state, key)
+        {
+            debug!(
+                code = ?key_event.code,
+                modifiers = ?key_event.modifiers,
+                kind = ?key_event.kind,
+                action = ?action,
+                "intercepted terminal direct keybinding before forwarding to pane"
+            );
+            if action == super::navigate::NavigateAction::EditScrollback {
+                self.launch_focused_scrollback_editor();
+            } else {
+                self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
+            }
+            return true;
+        }
+
+        if let Some(binding) = super::navigate::command_for_key(
+            &self.state,
+            key,
+            super::navigate::BindingDispatch::Direct,
+        ) {
+            debug!(
+                code = ?key_event.code,
+                modifiers = ?key_event.modifiers,
+                kind = ?key_event.kind,
+                command = %binding.label,
+                "intercepted terminal direct custom command before forwarding to pane"
+            );
+            self.launch_custom_command(binding, super::navigate::ActionContext::Direct);
+            return true;
+        }
+
+        if let Some(action) = super::terminal_direct_indexed_navigation_action(&self.state, key) {
+            debug!(
+                code = ?key_event.code,
+                modifiers = ?key_event.modifiers,
+                kind = ?key_event.kind,
+                action = ?action,
+                "intercepted terminal direct indexed keybinding before forwarding to pane"
+            );
+            self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
+            return true;
+        }
+
+        false
     }
 
     fn prepare_terminal_key_forward(
@@ -74,49 +202,15 @@ impl App {
         self.selection_autoscroll_deadline = None;
         self.state.update_dismissed = true;
 
-        if let Some(action) =
-            super::terminal_direct_non_indexed_navigation_action(&self.state, &key)
-        {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                action = ?action,
-                "intercepted terminal direct keybinding before forwarding to pane"
-            );
-            if action == super::navigate::NavigateAction::EditScrollback {
-                self.launch_focused_scrollback_editor();
-            } else {
-                self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
-            }
-            return None;
-        }
-
-        if let Some(binding) = super::navigate::command_for_key(
-            &self.state,
-            &key,
-            super::navigate::BindingDispatch::Direct,
-        ) {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                command = %binding.label,
-                "intercepted terminal direct custom command before forwarding to pane"
-            );
-            self.launch_custom_command(binding, super::navigate::ActionContext::Direct);
-            return None;
-        }
-
-        if let Some(action) = super::terminal_direct_indexed_navigation_action(&self.state, &key) {
-            debug!(
-                code = ?key_event.code,
-                modifiers = ?key_event.modifiers,
-                kind = ?key_event.kind,
-                action = ?action,
-                "intercepted terminal direct indexed keybinding before forwarding to pane"
-            );
-            self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
+        // Typed text asks the same question of the same tables for every character,
+        // and when no direct binding can fire on an unmodified printable key the
+        // answer is provably "no match" for all three scans. Skipping them is a
+        // third of the per-key cost under a large typed burst, at no change in
+        // behaviour: see `terminal_key_is_bare_printable` for why the pair of
+        // predicates is exact rather than a heuristic.
+        let scannable = !crate::config::terminal_key_is_bare_printable(&key)
+            || self.state.keybinds.has_direct_bare_printable_binding();
+        if scannable && self.intercept_terminal_direct_binding(&key) {
             return None;
         }
 
@@ -136,12 +230,9 @@ impl App {
         }
 
         let ws_idx = self.state.active?;
-        let ws = self.state.workspaces.get(ws_idx)?;
-        let pane_id = ws.focused_pane_id()?;
-        let terminal_id = ws.terminal_id(pane_id)?.clone();
-        let rt =
-            self.state
-                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)?;
+        let (pane_id, terminal_id, rt) = self
+            .state
+            .focused_pane_runtime_in_workspace(&self.terminal_runtimes, ws_idx)?;
 
         // Intercept plain PageUp/PageDown presses for pane scrollback only
         // when the focused pane looks like a shell transcript. Normal-screen
@@ -188,8 +279,12 @@ impl App {
             }
         }
 
+        // Each of these takes the terminal core lock, and `encode_terminal_key`
+        // reads the protocol itself. Reading it separately here doubled that for
+        // every key, to fill in a log field the branch below almost never wants —
+        // `debug!` evaluates its fields only when the callsite is enabled, so
+        // asking for it there costs nothing when it is not.
         rt.scroll_reset();
-        let protocol = rt.keyboard_protocol();
         let bytes = rt.encode_terminal_key(key.clone());
 
         if matches!(key_event.code, KeyCode::Esc)
@@ -201,7 +296,7 @@ impl App {
                 code = ?key_event.code,
                 modifiers = ?key_event.modifiers,
                 kind = ?key_event.kind,
-                protocol = ?protocol,
+                protocol = ?rt.keyboard_protocol(),
                 encoded = ?bytes,
                 "forwarding potentially-ambiguous terminal key to pane"
             );
@@ -230,7 +325,11 @@ impl App {
         Some(PreparedPaneInput {
             ws_idx,
             pane_id,
-            target: TerminalInputTarget { terminal_id },
+            // Cloned here rather than at resolution, so a key intercepted above
+            // never pays for it.
+            target: TerminalInputTarget {
+                terminal_id: terminal_id.clone(),
+            },
             bytes: Bytes::from(bytes),
         })
     }
@@ -309,11 +408,17 @@ impl App {
         None
     }
 
+    /// Sends one key straight to a terminal, bypassing the pane batch.
+    ///
+    /// Used by key repeat and by lease release, both of which address a target rather
+    /// than a pane. It flushes first so a repeat or a release cannot overtake the keys
+    /// batched before it.
     pub(crate) fn forward_terminal_key_to_target_headless(
-        &self,
+        &mut self,
         target: &TerminalInputTarget,
         key: TerminalKey,
     ) -> bool {
+        self.flush_pending_pane_input();
         let Some(runtime) = self.terminal_input_runtime(target) else {
             return false;
         };
@@ -475,6 +580,139 @@ mod tests {
         (app, info)
     }
 
+    fn app_with_input_channel() -> (App, tokio::sync::mpsc::Receiver<Bytes>) {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let (runtime, input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 18);
+        ws.insert_test_runtime(pane_id, runtime);
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        (app, input_rx)
+    }
+
+    fn printable(character: char) -> crate::raw_input::RawInputEvent {
+        crate::raw_input::RawInputEvent::Key(
+            TerminalKey::new(KeyCode::Char(character), KeyModifiers::empty()).with_text_commit(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_routed_run_of_keys_reaches_the_pane_as_one_write() {
+        // The shape B6 is about: a client burst arrives as one event per character.
+        // Sending each one separately cost a pty write, an echo read and a parse each.
+        let (mut app, mut input_rx) = app_with_input_channel();
+
+        app.route_client_events("hello".chars().map(printable).collect(), false);
+
+        assert_eq!(
+            input_rx.try_recv().expect("one joined write").as_ref(),
+            b"hello"
+        );
+        assert!(input_rx.try_recv().is_err(), "and nothing else");
+    }
+
+    #[tokio::test]
+    async fn typed_text_reaches_the_pane_with_the_binding_scans_skipped() {
+        // The fast path's precondition, asserted rather than assumed: the default
+        // config has no direct binding an ordinary character could trigger, so
+        // `prepare_terminal_key_forward` skips all three scans for this run.
+        let (mut app, mut input_rx) = app_with_input_channel();
+        assert!(!app.state.keybinds.has_direct_bare_printable_binding());
+
+        app.route_client_events("hi".chars().map(printable).collect(), false);
+
+        assert_eq!(input_rx.try_recv().expect("typed bytes").as_ref(), b"hi");
+    }
+
+    #[tokio::test]
+    async fn a_direct_binding_on_a_bare_printable_still_intercepts_that_key() {
+        // The guard must not swallow a live binding. Config validation rejects this
+        // binding today, so it is installed directly — the point is that the fast
+        // path defers to the flag rather than to that validation holding forever.
+        let (mut app, mut input_rx) = app_with_input_channel();
+        app.state
+            .keybinds
+            .toggle_sidebar
+            .bindings
+            .push(crate::config::ResolvedBinding::direct_for_test('z'));
+        app.state.keybinds.refresh_direct_bare_printable();
+        assert!(app.state.keybinds.has_direct_bare_printable_binding());
+
+        app.route_client_events(vec![printable('z')], false);
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "the bound key was forwarded to the pane instead of being intercepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn anything_that_is_not_a_key_flushes_what_was_batched_before_it() {
+        // Ordering is the invariant. A paste sends its own bytes, so the keys typed
+        // before it must already be at the pane.
+        let (mut app, mut input_rx) = app_with_input_channel();
+
+        app.route_client_events(
+            vec![
+                printable('a'),
+                printable('b'),
+                crate::raw_input::RawInputEvent::Paste("PASTE".into()),
+                printable('c'),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            input_rx.try_recv().expect("keys before the paste").as_ref(),
+            b"ab"
+        );
+        let pasted = input_rx.try_recv().expect("the paste itself");
+        assert!(
+            pasted.as_ref().windows(5).any(|window| window == b"PASTE"),
+            "expected the pasted text, got {pasted:?}"
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("keys after the paste").as_ref(),
+            b"c"
+        );
+    }
+
+    #[tokio::test]
+    async fn nothing_is_held_after_the_routing_call_returns() {
+        // The safety argument for holding keys at all: no other code path can observe
+        // input that has been accepted but not yet handed to the pty.
+        let (mut app, _input_rx) = app_with_input_channel();
+
+        app.route_client_events(vec![printable('x')], false);
+
+        assert!(app.pending_pane_input.is_none());
+        assert!(!app.input_batch_active);
+    }
+
+    #[tokio::test]
+    async fn a_key_forwarded_outside_a_routing_batch_is_delivered_immediately() {
+        // Batching is scoped to routing precisely so that every other caller — the
+        // API, a single forwarded key, a test — keeps the old contract and cannot
+        // leave input sitting in a buffer nobody flushes.
+        let (mut app, mut input_rx) = app_with_input_channel();
+
+        app.handle_terminal_key_headless(
+            TerminalKey::new(KeyCode::Char('z'), KeyModifiers::empty()).with_text_commit(),
+        );
+
+        assert_eq!(
+            input_rx.try_recv().expect("delivered at once").as_ref(),
+            b"z"
+        );
+        assert!(app.pending_pane_input.is_none());
+    }
+
     fn double_click(app: &mut App, col: u16, row: u16) {
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
@@ -497,7 +735,7 @@ mod tests {
 
     fn clipboard_write_content(app: &mut App) -> Vec<u8> {
         match app.event_rx.try_recv().expect("clipboard write event") {
-            AppEvent::ClipboardWrite { content } => content,
+            AppEvent::ClipboardWrite { content, .. } => content,
             event => panic!("unexpected event: {event:?}"),
         }
     }
@@ -1559,6 +1797,8 @@ mod tests {
             app.state.sidebar_width,
             app.state.sidebar_section_split,
             app.state.collapsed_space_keys.clone(),
+            app.state.hidden_peers.clone(),
+            crate::persist::peer_snapshots(&app.state.peers),
         );
         assert_eq!(snapshot.workspaces[0].tabs[0].panes.len(), 1);
         assert!(matches!(

@@ -372,6 +372,14 @@ pub enum SubscriptionEventKind {
     PaneAgentStatusChanged,
     #[serde(rename = "pane.scroll_changed")]
     ScrollChanged,
+    /// Events matching this subscription were dropped before it read them.
+    ///
+    /// Sent instead of quietly delivering a shorter history, which a client
+    /// cannot tell apart from a quiet period. A client that is building a
+    /// record of what happened should treat this as a break in it and resync
+    /// from current state rather than assume continuity.
+    #[serde(rename = "subscription.overflow")]
+    SubscriptionOverflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -386,6 +394,19 @@ pub enum SubscriptionEventData {
     PaneOutputMatched(PaneOutputMatchedEvent),
     PaneAgentStatusChanged(PaneAgentStatusChangedEvent),
     ScrollChanged(PaneScrollChangedEvent),
+    SubscriptionOverflow(SubscriptionOverflowEvent),
+}
+
+/// Reports that the server could not deliver everything this subscription
+/// matched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionOverflowEvent {
+    /// The oldest event sequence the server still holds. Everything between
+    /// the subscription's position and this was dropped.
+    pub oldest_retained_sequence: u64,
+    /// The sequence the subscription resumed from. Delivery continues normally
+    /// after this point.
+    pub resumed_at_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

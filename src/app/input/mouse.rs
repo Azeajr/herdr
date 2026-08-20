@@ -213,9 +213,31 @@ impl AppState {
             }
         }
 
+        if self.mode == Mode::OpenPeerWorkspace {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if let Some(open) = &mut self.peer_workspace_open {
+                        open.select_previous_filtered();
+                    }
+                    return None;
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(open) = &mut self.peer_workspace_open {
+                        open.select_next_filtered();
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         if matches!(
             self.mode,
-            Mode::NewLinkedWorktree | Mode::OpenExistingWorktree | Mode::ConfirmRemoveWorktree
+            Mode::NewLinkedWorktree
+                | Mode::OpenExistingWorktree
+                | Mode::OpenPeerWorkspace
+                | Mode::AddPeer
+                | Mode::ConfirmRemoveWorktree
         ) && !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
             return None;
@@ -344,6 +366,140 @@ impl AppState {
                                 }
                                 _ => {}
                             }
+                        }
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::OpenPeerWorkspace {
+                    if let Some(open) = self.peer_workspace_open.as_ref() {
+                        if let Some(inner) = crate::ui::peer_workspace_open_inner_rect(
+                            self.screen_rect(),
+                            open.entries.len(),
+                        ) {
+                            let filtered = open.filtered_indices();
+                            let max_rows = crate::ui::peer_workspace_open_max_visible_rows(inner);
+                            let start =
+                                crate::ui::peer_workspace_open_visible_start(open, max_rows);
+                            if mouse.row == inner.y.saturating_add(1)
+                                && mouse.column >= inner.x
+                                && mouse.column < inner.x.saturating_add(inner.width)
+                            {
+                                if let Some(open) = &mut self.peer_workspace_open {
+                                    open.search_focused = true;
+                                }
+                                return None;
+                            }
+                            let row_idx = if rect_contains(inner, mouse.column, mouse.row) {
+                                mouse
+                                    .row
+                                    .checked_sub(inner.y.saturating_add(3))
+                                    .map(usize::from)
+                                    .map(|row| row / 2)
+                                    .filter(|row| *row < max_rows)
+                                    .and_then(|row| filtered.get(start + row).copied())
+                            } else {
+                                None
+                            };
+                            if let Some(entry_idx) = row_idx {
+                                if let Some(open) = &mut self.peer_workspace_open {
+                                    open.selected = entry_idx;
+                                }
+                                self.request_submit_peer_workspace_open = true;
+                                return None;
+                            }
+
+                            let (open_button, cancel) =
+                                crate::ui::peer_workspace_open_button_rects(inner);
+                            match modal_action_from_buttons(
+                                mouse.column,
+                                mouse.row,
+                                &[
+                                    (open_button, ModalAction::Confirm),
+                                    (cancel, ModalAction::Cancel),
+                                ],
+                            ) {
+                                Some(ModalAction::Confirm) => {
+                                    self.request_submit_peer_workspace_open = true;
+                                }
+                                Some(ModalAction::Cancel) => {
+                                    self.peer_workspace_open = None;
+                                    leave_modal(self);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::UnhidePeers {
+                    if let Some(inner) =
+                        crate::ui::hidden_peers_inner_rect(self, self.screen_rect())
+                    {
+                        for (idx, row) in crate::ui::hidden_peers_row_rects(self, inner)
+                            .iter()
+                            .enumerate()
+                        {
+                            if rect_contains(*row, mouse.column, mouse.row) {
+                                if let Some(picker) = &mut self.hidden_peers_picker {
+                                    picker.selected = idx;
+                                }
+                                self.request_unhide_peer = true;
+                                return None;
+                            }
+                        }
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::AddPeer {
+                    if let Some(inner) = crate::ui::add_peer_inner_rect(self, self.screen_rect()) {
+                        for (idx, row) in crate::ui::add_peer_recent_row_rects(self, inner)
+                            .iter()
+                            .enumerate()
+                        {
+                            if rect_contains(*row, mouse.column, mouse.row) {
+                                let entry = crate::ui::add_peer_recent_entries(self)
+                                    .get(idx)
+                                    .map(|entry| (*entry).clone());
+                                if let (Some(add), Some(entry)) = (&mut self.add_peer, entry) {
+                                    add.fill_from_history(&entry);
+                                }
+                                return None;
+                            }
+                        }
+                        let (destination, name) = crate::ui::add_peer_field_rects(self, inner);
+                        if rect_contains(destination, mouse.column, mouse.row) {
+                            if let Some(add) = &mut self.add_peer {
+                                add.field = crate::app::state::AddPeerField::Destination;
+                            }
+                            return None;
+                        }
+                        if rect_contains(name, mouse.column, mouse.row) {
+                            if let Some(add) = &mut self.add_peer {
+                                add.field = crate::app::state::AddPeerField::Name;
+                            }
+                            return None;
+                        }
+
+                        let (connect, cancel) = crate::ui::add_peer_button_rects(inner);
+                        match modal_action_from_buttons(
+                            mouse.column,
+                            mouse.row,
+                            &[
+                                (connect, ModalAction::Confirm),
+                                (cancel, ModalAction::Cancel),
+                            ],
+                        ) {
+                            Some(ModalAction::Confirm) => {
+                                self.request_submit_add_peer = true;
+                            }
+                            Some(ModalAction::Cancel) => {
+                                self.add_peer = None;
+                                leave_modal(self);
+                            }
+                            _ => {}
                         }
                     }
                     return None;
@@ -563,6 +719,25 @@ impl AppState {
                                 self.set_workspace_list_offset_from_bottom(offset_from_bottom);
                             }
                         }
+                        return None;
+                    }
+
+                    // A click anywhere on a peer header opens that peer's
+                    // workspace picker. Headers name a peer, not a workspace, so
+                    // they are matched before the workspace rows below. Collapse
+                    // stays on the header's right-click menu.
+                    if let Some(header) = self
+                        .view
+                        .peer_header_areas
+                        .iter()
+                        .find(|header| {
+                            mouse.row == header.rect.y
+                                && mouse.column >= header.rect.x
+                                && mouse.column < header.rect.x + header.rect.width
+                        })
+                        .cloned()
+                    {
+                        self.request_open_peer_workspace = Some(header.peer);
                         return None;
                     }
 
@@ -1043,6 +1218,38 @@ impl AppState {
                 {
                     return None;
                 }
+                // A peer header names a peer, not a workspace, so it is matched
+                // before the workspace rows the same way the left-click path
+                // does.
+                if let Some(header) = self
+                    .view
+                    .peer_header_areas
+                    .iter()
+                    .find(|header| {
+                        mouse.row == header.rect.y
+                            && mouse.column >= header.rect.x
+                            && mouse.column < header.rect.x + header.rect.width
+                    })
+                    .cloned()
+                {
+                    let collapsed = self
+                        .collapsed_space_keys
+                        .contains(&crate::ui::peer_collapse_key(&header.peer));
+                    let has_hidden =
+                        !self.hidden_peers.is_empty() || !self.hidden_peers_config.is_empty();
+                    self.context_menu = Some(ContextMenuState {
+                        kind: ContextMenuKind::Peer {
+                            peer: header.peer,
+                            collapsed,
+                            has_hidden,
+                        },
+                        x: mouse.column,
+                        y: mouse.row,
+                        list: MenuListState::new(0),
+                    });
+                    self.mode = Mode::ContextMenu;
+                    return None;
+                }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
                     let kind = self
@@ -1055,18 +1262,46 @@ impl AppState {
                                     .as_deref()
                                     .and_then(crate::workspace::git_space_metadata)
                             });
-                            let is_linked_worktree = ws.worktree_space().map_or_else(
-                                || {
-                                    git_space
+                            // A peer-backed workspace's cwd is a path on the
+                            // other machine, so nothing here can stat it and
+                            // every action behind this menu is routed to the
+                            // peer that owns the checkout.
+                            //
+                            // Which means the two questions split. "Is this a
+                            // linked checkout" is answered from the peer's
+                            // enumeration, which knows it for any checkout a
+                            // worktree action has touched — the only way this
+                            // entry is ever reached. "Is there a repo at all"
+                            // is *not* answered here: a peer no client is
+                            // attached to never refreshes its cached git space,
+                            // so withholding the menu on that would hide it
+                            // exactly when the peer is headless. The menu is
+                            // offered, and the peer's own refusal lands in the
+                            // dialog.
+                            let is_linked_worktree = if ws.peer.is_some() {
+                                self.peer_view_worktree_space(idx)
+                                    .is_some_and(|space| space.is_linked_worktree)
+                            } else {
+                                ws.worktree_space().map_or_else(
+                                    || {
+                                        git_space
+                                            .as_ref()
+                                            .is_some_and(|space| space.is_linked_worktree)
+                                    },
+                                    |space| space.is_linked_worktree,
+                                )
+                            };
+                            let show_git_menu = if ws.peer.is_some() {
+                                // A view onto a bare pane never learned which
+                                // workspace holds it, so there is nothing on the
+                                // peer to start a worktree action from.
+                                ws.peer_workspace.is_some()
+                            } else {
+                                ws.worktree_space().is_some()
+                                    || git_space
                                         .as_ref()
-                                        .is_some_and(|space| space.is_linked_worktree)
-                                },
-                                |space| space.is_linked_worktree,
-                            );
-                            let show_git_menu = ws.worktree_space().is_some()
-                                || git_space
-                                    .as_ref()
-                                    .is_some_and(|space| !space.is_linked_worktree);
+                                        .is_some_and(|space| !space.is_linked_worktree)
+                            };
                             show_git_menu.then_some(ContextMenuKind::GitWorkspace {
                                 ws_idx: idx,
                                 is_linked_worktree,
@@ -1235,7 +1470,7 @@ impl AppState {
         );
     }
 
-    pub(super) fn screen_rect(&self) -> Rect {
+    pub(crate) fn screen_rect(&self) -> Rect {
         let sidebar = self.view.sidebar_rect;
         let terminal = self.view.terminal_area;
         let x = sidebar.x.min(terminal.x);
@@ -1265,29 +1500,32 @@ impl AppState {
         crate::ui::confirm_close_popup_rect(self.view.terminal_area).unwrap_or_default()
     }
 
-    fn context_menu_item_at(&self, col: u16, row: u16) -> Option<usize> {
+    /// Rect of one context-menu row, or `None` when that row has no room on
+    /// screen.
+    ///
+    /// The hit test below is defined in terms of this, so the hitbox dump can
+    /// read the same rects the mouse resolves against instead of recomputing
+    /// them: a dump that disagreed with the hit test would be worse than no
+    /// dump at all.
+    pub(crate) fn context_menu_item_rect(&self, idx: usize) -> Option<Rect> {
         let menu_rect = self.context_menu_rect()?;
-        let inner_x = menu_rect.x + 1;
-        let inner_y = menu_rect.y + 1;
+        let item_count = self.context_menu.as_ref()?.items().len() as u16;
         let inner_w = menu_rect.width.saturating_sub(2);
-        let inner_h = menu_rect.height.saturating_sub(2);
-        let item_count = self
-            .context_menu
-            .as_ref()
-            .map(|menu| menu.items().len() as u16)
-            .unwrap_or(0);
-        if col >= inner_x
-            && col < inner_x + inner_w
-            && row >= inner_y
-            && row < inner_y + inner_h.min(item_count)
-        {
-            Some((row - inner_y) as usize)
-        } else {
-            None
-        }
+        let rows = menu_rect.height.saturating_sub(2).min(item_count);
+        let idx = u16::try_from(idx).ok()?;
+        (idx < rows && inner_w > 0)
+            .then(|| Rect::new(menu_rect.x + 1, menu_rect.y + 1 + idx, inner_w, 1))
     }
 
-    pub(super) fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
+    pub(crate) fn context_menu_item_at(&self, col: u16, row: u16) -> Option<usize> {
+        let item_count = self.context_menu.as_ref()?.items().len();
+        (0..item_count).find(|idx| {
+            self.context_menu_item_rect(*idx)
+                .is_some_and(|rect| rect_contains(rect, col, row))
+        })
+    }
+
+    pub(crate) fn tab_at(&self, col: u16, row: u16) -> Option<usize> {
         self.view
             .tab_hit_areas
             .iter()
@@ -1790,14 +2028,9 @@ impl AppState {
         let Some(position) = self.pane_mouse_position(rt, info.inner_rect, mouse) else {
             return false;
         };
-        let Some(bytes) = rt.encode_mouse_button(mouse.kind, position, mouse.modifiers) else {
-            return false;
-        };
-        rt.scroll_reset();
-        if let Err(err) = rt.try_send_bytes(Bytes::from(bytes)) {
-            warn!(pane = info.id.raw(), err = %err, kind = ?mouse.kind, "failed to forward mouse button event");
-        }
-        true
+        // A peer-backed pane cannot answer whether its program wants the click,
+        // so the runtime forwards it and reports that it was taken.
+        rt.try_send_mouse_button(mouse.kind, position, mouse.modifiers)
     }
 
     pub(super) fn forward_pane_mouse_motion(
@@ -3273,6 +3506,8 @@ mod tests {
             query: String::new(),
             search_focused: false,
             error: None,
+            peer: None,
+            loading: false,
         }
     }
 
@@ -3517,6 +3752,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            peer: None,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(
@@ -3545,6 +3781,7 @@ mod tests {
             error: None,
             removing: false,
             force_confirmation: false,
+            peer: None,
         });
         let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
         let inner = Rect::new(
@@ -4774,5 +5011,165 @@ mod tests {
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::HostScroll);
+    }
+
+    fn app_with_peer_header() -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.view.peer_header_areas = vec![crate::app::state::PeerHeaderArea {
+            peer: "beta".into(),
+            rect: Rect::new(0, 4, 26, 1),
+        }];
+        app
+    }
+
+    #[test]
+    fn right_clicking_a_peer_header_opens_the_peer_menu() {
+        let mut app = app_with_peer_header();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 3, 4));
+
+        let menu = app.state.context_menu.as_ref().expect("peer menu opened");
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        assert_eq!(
+            menu.kind,
+            ContextMenuKind::Peer {
+                peer: "beta".into(),
+                collapsed: false,
+                has_hidden: false,
+            }
+        );
+        assert_eq!(
+            menu.items(),
+            &[
+                "Open workspace...",
+                "Add peer...",
+                "Collapse",
+                "Hide for session",
+                "Hide permanently"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_peer_header_right_click_does_not_fall_through_to_a_workspace_menu() {
+        let mut app = app_with_peer_header();
+        // A workspace card occupying the same row must not win: the header is
+        // matched first, the same way the left-click picker path does it.
+        app.state.view.workspace_card_areas = vec![crate::app::state::WorkspaceCardArea {
+            ws_idx: 0,
+            rect: Rect::new(0, 4, 26, 1),
+            indented: true,
+        }];
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 3, 4));
+
+        let menu = app.state.context_menu.as_ref().expect("peer menu opened");
+        assert!(matches!(menu.kind, ContextMenuKind::Peer { .. }));
+    }
+
+    #[test]
+    fn left_clicking_a_peer_header_requests_its_workspace_picker() {
+        let mut app = app_with_peer_header();
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 3, 4));
+
+        assert_eq!(
+            app.state.request_open_peer_workspace.as_deref(),
+            Some("beta")
+        );
+        assert!(app.state.context_menu.is_none());
+        // Collapse moved to the right-click menu, so a left click must not
+        // touch the group key.
+        let key = crate::ui::peer_collapse_key("beta");
+        assert!(!app.state.collapsed_space_keys.contains(&key));
+    }
+
+    #[test]
+    fn choosing_open_workspace_requests_the_picker_for_that_peer() {
+        let mut app = app_with_peer_header();
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 3, 4));
+        let menu = app.state.context_menu.take().expect("peer menu opened");
+
+        app.apply_context_menu_action_via_api(menu, 0);
+
+        assert_eq!(
+            app.state.request_open_peer_workspace.as_deref(),
+            Some("beta")
+        );
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn the_peer_menu_collapse_action_toggles_the_group_key() {
+        let mut app = app_with_peer_header();
+        let key = crate::ui::peer_collapse_key("beta");
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 3, 4));
+        let menu = app.state.context_menu.take().expect("peer menu opened");
+
+        app.apply_context_menu_action_via_api(menu, 2);
+        assert!(app.state.collapsed_space_keys.contains(&key));
+
+        app.state.view.peer_header_areas = vec![crate::app::state::PeerHeaderArea {
+            peer: "beta".into(),
+            rect: Rect::new(0, 4, 26, 1),
+        }];
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 3, 4));
+        let menu = app.state.context_menu.take().expect("peer menu opened");
+        assert_eq!(
+            menu.items(),
+            &[
+                "Open workspace...",
+                "Add peer...",
+                "Expand",
+                "Hide for session",
+                "Hide permanently"
+            ]
+        );
+        app.apply_context_menu_action_via_api(menu, 2);
+        assert!(!app.state.collapsed_space_keys.contains(&key));
+    }
+
+    #[test]
+    fn peer_workspace_context_menu_withholds_git_actions() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("main");
+        mark_worktree_space_member(&mut ws, 0, "repo-key");
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let row = (0..20)
+            .find(|row| app.state.workspace_at_row(*row) == Some(0))
+            .expect("the workspace occupies a sidebar row");
+
+        // A local git workspace still offers the worktree actions.
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 1, row));
+        assert!(
+            matches!(
+                app.state.context_menu.as_ref().map(|menu| &menu.kind),
+                Some(ContextMenuKind::GitWorkspace { .. })
+            ),
+            "a local git workspace keeps its git menu"
+        );
+
+        app.state.context_menu = None;
+        app.state.mode = Mode::Terminal;
+        // The same workspace viewed on a peer: the cwd describes the peer's
+        // filesystem, so a git action here would run against this machine's
+        // repo at that path instead.
+        app.state.workspaces[0].peer = Some("beta".into());
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Right), 1, row));
+        assert!(
+            matches!(
+                app.state.context_menu.as_ref().map(|menu| &menu.kind),
+                Some(ContextMenuKind::Workspace { .. })
+            ),
+            "a peer-backed workspace must not offer worktree actions"
+        );
     }
 }

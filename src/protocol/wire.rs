@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -41,6 +41,34 @@ pub enum RenderEncoding {
     SemanticFrame,
     /// Send already-diffed terminal ANSI byte streams.
     TerminalAnsi,
+}
+
+/// Why a server ended a client connection.
+///
+/// Exists so a federating client can classify an ending without reading the
+/// human-facing `reason`. The distinction that matters is whether asking again
+/// could produce a different answer: a server never reuses a terminal id while
+/// it lives, so [`Self::TargetGone`] is final on sight, while
+/// [`Self::TargetUnavailable`] describes a condition that passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShutdownCode {
+    /// The server itself is going away, and every connection ends with it.
+    ServerStopping,
+    /// This connection was ended deliberately: a detach, or another client
+    /// taking the terminal over.
+    Detached,
+    /// The terminal this connection named does not exist.
+    ///
+    /// Authoritative. Ids are not reused while the answering server lives, so
+    /// reconnecting cannot find it and a view onto it should be retired rather
+    /// than retried.
+    TargetGone,
+    /// The terminal exists, but this connection cannot have it right now —
+    /// a read is in progress, or another client is attached.
+    TargetUnavailable,
+    /// Anything else. Retried like a transport failure, because nothing here
+    /// says it should not be.
+    Unspecified,
 }
 
 /// Keybinding profile requested by an attached app client.
@@ -218,7 +246,6 @@ impl ClientKeyCode {
 }
 
 impl ClientMouseButton {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(button: crossterm::event::MouseButton) -> Self {
         match button {
             crossterm::event::MouseButton::Left => Self::Left,
@@ -237,7 +264,6 @@ impl ClientMouseButton {
 }
 
 impl ClientMouseKind {
-    #[cfg(any(windows, test))]
     pub(crate) fn from_crossterm(kind: crossterm::event::MouseEventKind) -> Option<Self> {
         use crossterm::event::MouseEventKind;
         Some(match kind {
@@ -359,6 +385,14 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// Instance id of the server on the other end, when a server is the
+        /// client.
+        ///
+        /// Only a federating server sets this: it attaches to terminals here to
+        /// render them on its own side, so a terminal it asked for can be
+        /// reported as unattended once none of its connections remain. A human's
+        /// client is not a server and leaves it unset.
+        instance_id: Option<String>,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -449,6 +483,29 @@ pub enum ClientMessage {
 
     /// The direct command was written and flushed; terminal response timing starts now.
     GraphicsTransmissionStarted { transfer_id: u64, image_id: u32 },
+
+    /// A press, release, or drag on the attached terminal.
+    ///
+    /// Sent unencoded on purpose. Whether the running program wants mouse
+    /// reports, and in which protocol, is VT state only the server holding the
+    /// terminal can read, so it encodes this the same way it encodes a wheel
+    /// event arriving as [`Self::AttachScroll`]. A client that encoded this
+    /// itself would have to guess the mode and would be wrong whenever the
+    /// program changed it.
+    ///
+    /// Motion without a button is deliberately not carried here: it is
+    /// high-frequency, and no client can tell whether the program asked for
+    /// motion reporting without the mode this message exists to avoid needing.
+    AttachMouse {
+        /// Which button changed state, and how.
+        kind: ClientMouseKind,
+        /// Mouse column relative to the attached terminal.
+        column: u16,
+        /// Mouse row relative to the attached terminal.
+        row: u16,
+        /// Crossterm-compatible modifier bits.
+        modifiers: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +594,34 @@ pub struct FrameData {
     pub hyperlinks: Vec<String>,
     /// Kitty graphics protocol bytes to apply after the text frame.
     pub graphics: Vec<u8>,
+    /// Where these cells sit in the terminal's scrollback, when the sender
+    /// knows.
+    ///
+    /// Carried on the frame rather than polled beside it because the two are
+    /// one fact: a scroll position from a different moment than the cells it
+    /// describes maps screen rows onto the wrong buffer rows, silently. A
+    /// federating server needs the mapping to say what its viewport is looking
+    /// at — for the scrollbar, and to name a row to the peer that owns it.
+    ///
+    /// `None` from a sender that does not track it, which is every frame for a
+    /// full app client: those are composed of many panes and have no single
+    /// scroll position.
+    #[serde(default)]
+    pub scroll: Option<FrameScroll>,
+}
+
+/// A terminal's scroll position at the moment a frame was rendered.
+///
+/// The wire form of [`crate::pane::ScrollMetrics`], kept separate so the
+/// protocol does not depend on the pane module's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameScroll {
+    /// Rows scrolled up from the bottom. Zero when pinned to the live edge.
+    pub offset_from_bottom: u32,
+    /// How far up this terminal can scroll.
+    pub max_offset_from_bottom: u32,
+    /// Rows in the viewport these cells fill.
+    pub viewport_rows: u32,
 }
 
 impl FrameData {
@@ -597,12 +682,49 @@ impl FrameData {
             cursor,
             hyperlinks: hyperlink_uris,
             graphics: Vec::new(),
+            // Set by the terminal-stream path, which knows which single
+            // terminal these cells came from. A composed app frame has no one
+            // scroll position to report.
+            scroll: None,
         }
+    }
+
+    /// Records where these cells sit in their terminal's scrollback.
+    pub fn with_scroll(mut self, scroll: Option<FrameScroll>) -> Self {
+        self.scroll = scroll;
+        self
+    }
+
+    /// Whether `cells` describes exactly `width * height` cells.
+    ///
+    /// A frame that fails this is malformed and must not be indexed into.
+    pub fn is_well_formed(&self) -> bool {
+        self.cells.len() == (self.width as usize) * (self.height as usize)
+    }
+
+    /// Writes the cell at `(col, row)` into `target`.
+    ///
+    /// The blit primitive for drawing a frame straight into a render buffer,
+    /// without building a whole intermediate `Buffer` first. Callers must have
+    /// checked [`Self::is_well_formed`] and that the coordinates are inside the
+    /// frame.
+    pub fn write_cell_into(&self, col: u16, row: u16, target: &mut ratatui::buffer::Cell) {
+        let idx = (row as usize) * (self.width as usize) + (col as usize);
+        let cell_data = &self.cells[idx];
+        target.set_symbol(&cell_data.symbol);
+        target.fg = u32_to_color(cell_data.fg);
+        target.bg = u32_to_color(cell_data.bg);
+        target.modifier = u16_to_modifier(cell_data.modifier);
+        target.skip = cell_data.skip;
     }
 
     /// Reconstructs a ratatui `Buffer` from this frame data.
     ///
     /// Returns `None` if the cells vector length doesn't match `width * height`.
+    ///
+    /// Not for the render path: a remote pane blits with
+    /// [`Self::write_cell_into`] instead, because building a full-size `Buffer`
+    /// per render allocates it and then copies every cell a second time.
     #[cfg(test)]
     pub fn to_ratatui_buffer(&self) -> Option<ratatui::buffer::Buffer> {
         let expected = (self.width as usize) * (self.height as usize);
@@ -668,6 +790,18 @@ pub enum ServerMessage {
         /// If present, the handshake failed and this describes why.
         /// The client should exit with a clear error message.
         error: Option<String>,
+        /// The answering server's instance id.
+        ///
+        /// A federating client records this so it can tell, on reconnect,
+        /// whether the server behind a target is still the one the view was
+        /// opened against. A peer-local id like `w1:p1` names a completely
+        /// unrelated pane on a server that was restarted with a fresh session,
+        /// so reconnecting without this check restores *a reachable* server
+        /// rather than *the correct* one.
+        ///
+        /// `None` from a server too old to report it, which is also a server
+        /// this client cannot safely re-target.
+        instance_id: Option<String>,
     },
 
     /// A rendered frame to be displayed by a semantic-frame client.
@@ -686,6 +820,14 @@ pub enum ServerMessage {
     ServerShutdown {
         /// Optional reason for the shutdown.
         reason: Option<String>,
+        /// What kind of ending this is, as a value rather than as prose.
+        ///
+        /// `reason` is written for a human and may be reworded at any time.
+        /// A federating server has to *act* on this message — a gone target
+        /// retires a view and closes the pane, a busy one is retried — and
+        /// deciding that by matching the tail of a display string couples a
+        /// destructive action to wording across a version boundary.
+        code: ShutdownCode,
     },
 
     /// A notification event (sound/toast) to be rendered locally by the client.
@@ -753,6 +895,32 @@ pub enum ServerMessage {
 
     /// Suppress a direct command that expired before terminal delivery.
     GraphicsTransmissionRetired { transfer_id: u64, image_id: u32 },
+
+    /// The input modes of the attached terminal's program.
+    ///
+    /// Sent to terminal-stream clients only, because these are facts about
+    /// *that* terminal rather than about whatever this server happens to have
+    /// focused. A federating server has no VT of its own for the pane and
+    /// cannot read them any other way, yet it has to make the same decisions a
+    /// local pane makes from them.
+    ///
+    /// Appended rather than filed next to the other input-mode messages
+    /// because `bincode` tags variants by position, and inserting one
+    /// renumbers every variant after it.
+    TerminalInputModes {
+        /// True while the terminal has DECSET 2004 on.
+        ///
+        /// Decides whether pasted text is wrapped in `\x1b[200~`/`\x1b[201~`.
+        /// Without it a paste crosses the boundary unwrapped and an embedded
+        /// newline is read as a submitted command line rather than as text.
+        bracketed_paste: bool,
+        /// True while the program has asked to receive mouse events.
+        ///
+        /// Decides who owns a click: the program, or the pane. A federating
+        /// server that assumes the program always wants it can never start a
+        /// selection, so a drag over the pane selects nothing at all.
+        mouse_reporting: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -792,7 +960,6 @@ pub(crate) fn color_to_u32(color: ratatui::style::Color) -> u32 {
 }
 
 /// Converts a packed u32 back to a ratatui `Color`.
-#[cfg(test)]
 fn u32_to_color(val: u32) -> ratatui::style::Color {
     match val >> 24 {
         0x00 => match val & 0xFF {
@@ -847,7 +1014,6 @@ pub(crate) fn modifier_with_underline_style(
 }
 
 /// Converts a u16 back to a ratatui `Modifier`.
-#[cfg(test)]
 fn u16_to_modifier(val: u16) -> ratatui::style::Modifier {
     ratatui::style::Modifier::from_bits_truncate(val & !UNDERLINE_STYLE_MASK)
 }
@@ -1042,6 +1208,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            instance_id: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1053,6 +1220,20 @@ mod tests {
     fn client_input_roundtrip() {
         let msg = ClientMessage::Input {
             data: vec![0x1b, 0x5b, 0x41], // ESC [ A (up arrow)
+        };
+        let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn client_attach_mouse_roundtrip() {
+        let msg = ClientMessage::AttachMouse {
+            kind: ClientMouseKind::Down(ClientMouseButton::Left),
+            column: 12,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -1079,6 +1260,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                instance_id: None,
             }),
             0
         );
@@ -1131,6 +1313,23 @@ mod tests {
                 takeover: false,
             }),
             9
+        );
+        // Appended, so every tag above keeps the value an older peer expects.
+        //
+        // 13 rather than 10: protocol 20 also added the direct-graphics
+        // messages upstream, and they are left ahead of this one on purpose.
+        // Tags 0..=12 then mean the same thing in a herdr built from upstream
+        // as in one built here, so the two cannot read each other's messages as
+        // the wrong variant while both announce protocol 20. A build that does
+        // not know tag 13 fails to frame it, which is the loud failure.
+        assert_eq!(
+            tag(&ClientMessage::AttachMouse {
+                kind: ClientMouseKind::Down(ClientMouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: 0,
+            }),
+            13
         );
     }
 
@@ -1196,6 +1395,53 @@ mod tests {
         let (decoded, _): (ClientMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    /// The handshake is frozen because it is the one exchange that cannot
+    /// report its own version skew.
+    ///
+    /// `bincode` writes struct-variant fields positionally with no per-field
+    /// framing, and [`crate::protocol::read_message`] rejects trailing bytes, so
+    /// appending a field to `Hello` breaks both directions at once: an older
+    /// server decodes the fields it knows and refuses the remainder, a newer one
+    /// runs out of input. Neither reaches [`check_client_version`] — the message
+    /// carrying the version is the message that no longer parses — so the skew
+    /// surfaces as a framing error instead of "please upgrade your herdr
+    /// client".
+    ///
+    /// That is what happened under protocol 19: `instance_id` was appended to
+    /// `Hello` and `Welcome` and `AttachMouse` was added, all after 19 had
+    /// shipped in both the stable and preview channels. If this test fails,
+    /// the wire format moved, and [`PROTOCOL_VERSION`] has to move with it
+    /// unless the current value is still unpublished.
+    #[test]
+    fn the_handshake_wire_format_is_frozen_to_the_protocol_version() {
+        let hello = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+            instance_id: None,
+        };
+        let encoded = bincode::serde::encode_to_vec(&hello, bincode::config::standard()).unwrap();
+        assert_eq!(
+            encoded,
+            vec![0, 22, 80, 24, 0, 0, 0, 0, 0, 0],
+            "ClientMessage::Hello"
+        );
+
+        let welcome = ServerMessage::Welcome {
+            version: PROTOCOL_VERSION,
+            encoding: RenderEncoding::SemanticFrame,
+            error: None,
+            instance_id: None,
+        };
+        let encoded = bincode::serde::encode_to_vec(&welcome, bincode::config::standard()).unwrap();
+        assert_eq!(encoded, vec![0, 22, 0, 0, 0], "ServerMessage::Welcome");
     }
 
     #[test]
@@ -1382,6 +1628,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             encoding: RenderEncoding::SemanticFrame,
             error: None,
+            instance_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
@@ -1395,6 +1642,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             encoding: RenderEncoding::SemanticFrame,
             error: Some("incompatible version".to_owned()),
+            instance_id: None,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
@@ -1466,6 +1714,7 @@ mod tests {
             }),
             hyperlinks: vec!["https://example.com".to_owned()],
             graphics: Vec::new(),
+            scroll: None,
         };
         let msg = ServerMessage::Frame(frame.clone());
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
@@ -1485,6 +1734,7 @@ mod tests {
     fn server_shutdown_roundtrip() {
         let msg = ServerMessage::ServerShutdown {
             reason: Some("updating".to_owned()),
+            code: ShutdownCode::ServerStopping,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ServerMessage, _) =
@@ -1660,6 +1910,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            instance_id: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1701,6 +1952,7 @@ mod tests {
             }),
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            scroll: None,
         };
         let msg = ServerMessage::Frame(frame);
 
@@ -1734,6 +1986,7 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    instance_id: None,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -1898,11 +2151,13 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 encoding: RenderEncoding::SemanticFrame,
                 error: None,
+                instance_id: None,
             },
             VersionCheck::Incompatible(reason) => ServerMessage::Welcome {
                 version: PROTOCOL_VERSION,
                 encoding: RenderEncoding::SemanticFrame,
                 error: Some(reason),
+                instance_id: None,
             },
         };
 
@@ -2044,8 +2299,38 @@ mod tests {
             cursor: None,
             hyperlinks: Vec::new(),
             graphics: Vec::new(),
+            scroll: None,
         };
         assert!(frame.to_ratatui_buffer().is_none());
+        assert!(!frame.is_well_formed());
+    }
+
+    /// The render path blits cell by cell instead of building a whole `Buffer`
+    /// per render. This pins the two against each other so the cheap path cannot
+    /// drift from the reference one.
+    #[test]
+    fn blitting_a_cell_matches_the_reconstructed_buffer() {
+        let area = ratatui::layout::Rect::new(0, 0, 3, 2);
+        let mut source = ratatui::buffer::Buffer::filled(area, ratatui::buffer::Cell::new(" "));
+        source.cell_mut((0, 0)).unwrap().set_symbol("H");
+        source.cell_mut((0, 0)).unwrap().fg = Color::Red;
+        source.cell_mut((0, 0)).unwrap().bg = Color::Rgb(1, 2, 3);
+        source.cell_mut((0, 0)).unwrap().modifier = Modifier::BOLD | Modifier::ITALIC;
+        source.cell_mut((2, 1)).unwrap().set_symbol("é");
+        source.cell_mut((2, 1)).unwrap().skip = true;
+
+        let frame = FrameData::from_ratatui_buffer(&source, None);
+        assert!(frame.is_well_formed());
+        let reference = frame.to_ratatui_buffer().expect("should reconstruct");
+
+        let mut blitted = ratatui::buffer::Buffer::filled(area, ratatui::buffer::Cell::new("?"));
+        for row in 0..frame.height {
+            for col in 0..frame.width {
+                frame.write_cell_into(col, row, blitted.cell_mut((col, row)).unwrap());
+            }
+        }
+
+        assert_eq!(blitted, reference);
     }
 
     // ---- Color conversion coverage ----
@@ -2170,6 +2455,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            instance_id: None,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -2206,6 +2492,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                instance_id: None,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

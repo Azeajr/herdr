@@ -30,12 +30,27 @@ impl App {
             .retain_mut(|child| retain_detached_process_after_wait(child.id(), child.try_wait()));
     }
 
+    /// Tears down a terminal runtime that no pane references any more.
+    ///
+    /// Every close path reaches here through
+    /// [`crate::app::AppState::remove_unattached_terminal_ids`], which makes this
+    /// the one place that can tell a peer to close a pane it spawned for us.
+    /// Process exit deliberately does not pass through here: quitting is not
+    /// closing, so it leaves the peer's panes running.
     pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
         let target = super::TerminalInputTarget {
             terminal_id: terminal_id.clone(),
         };
         self.release_input_target_headless(&target);
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+            if let Some(spawned) = runtime.spawned_peer_pane() {
+                let (peer, peer_pane_id, expected_instance) = (
+                    spawned.peer.to_string(),
+                    spawned.peer_pane_id.to_string(),
+                    spawned.expected_instance.map(str::to_string),
+                );
+                self.close_spawned_peer_pane(&peer, &peer_pane_id, expected_instance);
+            }
             runtime.shutdown();
         }
     }
@@ -73,6 +88,29 @@ impl App {
             crate::api::schema::Method::ServerStop(_)
                 | crate::api::schema::Method::ServerLiveHandoff(_)
         );
+        // Before the local worktree branch, not after: a `worktree.*` inside a
+        // peer view runs on the peer, and the local branch would run git here
+        // against a path that only exists there.
+        if self.request_targets_peer_workspace(&msg.request) {
+            self.drain_all_internal_events();
+            let deferred_changed =
+                self.handle_deferred_peer_workspace_api_request(msg.request, msg.respond_to);
+            if !skip_default_workspace {
+                changed |= self.ensure_default_workspace();
+            }
+            self.sync_prefix_input_source(previous_mode);
+            return changed | deferred_changed;
+        }
+        if self.request_targets_peer_pane(&msg.request) {
+            self.drain_all_internal_events();
+            let deferred_changed =
+                self.handle_deferred_peer_pane_api_request(msg.request, msg.respond_to);
+            if !skip_default_workspace {
+                changed |= self.ensure_default_workspace();
+            }
+            self.sync_prefix_input_source(previous_mode);
+            return changed | deferred_changed;
+        }
         if matches!(
             &msg.request.method,
             crate::api::schema::Method::WorktreeCreate(_)

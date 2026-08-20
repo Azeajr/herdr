@@ -1,84 +1,118 @@
-# herdr
-
-
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
 </p>
 
-<p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
-</p>
+# herdr — personal fork
 
-<p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
-</p>
+A personal fork of [herdrdev/herdr](https://github.com/herdrdev/herdr), the
+terminal runtime for coding agents. Upstream is the real project — go there for
+docs, releases, and support: [herdr.dev](https://herdr.dev).
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
-</p>
+This fork exists to carry one feature that isn't upstream, and to stay current
+with upstream development while doing it. It is not a distribution, accepts no
+contributions, and sends nothing back upstream.
 
----
+## what this adds
 
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
+**Cross-machine peer federation.** One herdr server can register another as a
+peer and open that peer's workspaces locally, over a Unix socket or over ssh.
 
-**the runtime your coding agents live on.**
+- A peer's workspaces are enumerated and browsable from the sidebar, and opening
+  one renders it as an ordinary local workspace whose content comes from the peer.
+- The remote server owns the VT state and streams cells; the local side blits
+  them. Input, resize authority, scrollback, search and agent detection all cross
+  the boundary.
+- Peer-backed panes reconnect on their own with backoff and say so in the pane
+  while stale.
+- Splitting a peer-backed pane spawns the new pane on the peer. A pane spawned
+  that way is closed on the peer when its local view closes; a view onto a pane
+  that already existed there is not.
+- ssh peers stand up a local socket pair bridged over ssh stdio, so nothing
+  downstream needs an ssh-specific path. The remote host needs a compatible
+  `herdr`; interactive SSH setup can bootstrap one when it is missing, while
+  physical hosts running this fork should install the same checkout explicitly.
 
-- **always running** — herdr is a background server; the terminals live inside it. close the lid, drop the network, or restart the machine; agents keep working and sessions come back. reattach from any terminal, or over ssh.
-- **never hunt for the stuck one** — every pane is marked working, blocked, or idle. when an agent stops and needs an answer, herdr says so.
-- **agent-native** — agents drive herdr through the cli and socket api: they can spawn panes, prompt each other, and wait until another agent is genuinely blocked. [agent skill →](https://herdr.dev/docs/agent-skill/)
-- **runs what you already run** — claude code, codex, cursor, opencode, grok and the rest. herdr doesn't wrap or replace them; it owns their terminals.
-- **keyboard and mouse, both first-class** — tmux-style prefix keys *and* click, drag, split. pick per moment, not per tool.
-- **plugins** — extend panes and workflows. [browse the marketplace →](https://herdr.dev/plugins/)
-- **one rust binary, no electron** — runs in whatever terminal you already use.
+Aggregation lives in the **server**, not the TUI — herdr's client is a thin
+blitter holding no domain state, so the local server acts as a protocol client of
+the remote one.
 
----
+## install and update this fork
 
-## install
-
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
-
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [binaries](https://github.com/herdrdev/herdr/releases)
-
-then start it where the work lives:
+Build and install the current checkout as `~/.local/bin/herdr`:
 
 ```bash
-herdr
-```
-
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
-
-## docs
-
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
-
-## thanks
-
-every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
-
-enterprise / partnership: hey@herdr.dev
-
-## agent instructions
-
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
-
-## development
-
-```bash
-git clone https://github.com/herdrdev/herdr
+git clone https://github.com/Azeajr/herdr.git
 cd herdr
-cargo build --release
-
-just test        # unit tests
-just check       # formatting, tests, and maintenance checks
+ZIG=/opt/zig0.15/zig just install
 ```
+
+Set `HERDR_INSTALL_DIR` to use another binary directory. The installed binary is
+marked as a source build, so `herdr update` cannot replace it with an upstream
+release; pull or rebase this checkout and rerun `just install` to update it.
+
+For SSH federation between physical hosts, install the same checkout on both
+hosts. `herdr peer add <name> --ssh <destination> --yes` then registers the
+remote server.
+
+## test this fork
+
+| Command | Coverage |
+|---|---|
+| `ZIG=/opt/zig0.15/zig just check` | Formatting, Rust tests, Windows lint, and maintenance tests |
+| `ZIG=/opt/zig0.15/zig just test-e2e` | Local isolated servers and real TUI clients through tmux |
+| `ZIG=/opt/zig0.15/zig just test-boxes` | SSH federation across disposable Docker machines, including degraded links and missing-`herdr` discovery |
+
+The local lab and Docker topology are documented in
+[`peer-test/README.md`](peer-test/README.md). The lab is local-only; Docker owns
+cross-machine scenarios, and neither is an installation path.
+
+## build
+
+Needs Zig **0.15.2 exactly** for the vendored libghostty-vt. A newer Zig fails
+with a `readFileAlloc` arity error that reads like a code bug.
+
+```bash
+ZIG=/opt/zig0.15/zig cargo build --release
+ZIG=/opt/zig0.15/zig just check     # fmt, clippy, tests, Windows lint, script tests
+```
+
+## tracking upstream
+
+`main` is `upstream/master` plus a short queue of local commits.
+`git log upstream/master..main` is the whole diff against upstream.
+
+```bash
+git fetch upstream
+git rebase upstream/master
+ZIG=/opt/zig0.15/zig just check
+```
+
+Rebase onto `upstream/master`, never `origin/master` — this fork's mirror of
+master is stale, and rebasing onto it moves you backward.
+
+Conflicts against upstream are kept rather than automated away: a conflict on a
+file this fork deliberately diverged is how upstream's change gets reviewed
+before it is discarded. `rerere` is on, so a conflict already resolved once
+replays itself, while genuinely new upstream content still stops and shows up.
+
+## how this differs from upstream, beyond the feature
+
+- `AGENTS.md` (and `CLAUDE.md`, its symlink) carries this fork's instructions.
+  Upstream's maintainer workflow, contributor guardrails, release process and
+  docs governance are removed — none of it applies here.
+- Upstream's issue templates, release-audit and triage agent skills, pi
+  extensions and dependabot config are removed. The inert remainder
+  (`CONTRIBUTING`, `SPONSORS`, `MAINTAINERS`, the workflows) is left alone
+  deliberately: deleting it would buy tidiness and cost a permanent rebase
+  conflict carrying nothing worth reading.
+
+## branches
+
+- `main` — this work.
+- `browser-pane` — browser pane support, parked. The only copy; not upstream, not
+  merged upstream, not in `main`. Based on an older master, so it needs a rebase
+  before it builds.
 
 ## license
 
-Herdr is licensed under the [Apache License 2.0](LICENSE).
+Apache-2.0, same as upstream. See [LICENSE](LICENSE).

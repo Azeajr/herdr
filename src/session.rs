@@ -283,8 +283,13 @@ fn stop_socket_with_timeout(
     }
     if !wait_until_stopped_until(&stopped_socket_paths, deadline) {
         let reachable = reachable_socket_paths(&stopped_socket_paths);
+        // Deliberately not phrased as a failure. The server accepted the
+        // request and removes these sockets itself on the way out, so a
+        // reachable socket here means shutdown is still running, not that
+        // anything is wedged — and deleting the files it is about to delete
+        // only strands a live server with no way to reach it.
         return Err(format!(
-            "{label} did not stop within {}ms; sockets are still reachable at {}",
+            "{label} has not finished stopping after {}ms; it is still shutting down and removes its own sockets when it exits. Do not delete {}. Re-run this command to check.",
             timeout.as_millis(),
             reachable
                 .iter()
@@ -610,7 +615,7 @@ mod tests {
         let err = stop_session_with_timeout(Some(session_name), Duration::from_millis(75))
             .expect_err("silent session should fail after timeout");
 
-        assert!(err.contains("did not stop"), "{err}");
+        assert!(err.contains("has not finished stopping"), "{err}");
         keep_running.store(false, Ordering::Relaxed);
         handle.join().unwrap();
         let _ = std::fs::remove_dir_all(&config_home);
@@ -1003,7 +1008,7 @@ mod tests {
         let err = stop_session_with_timeout(Some(session_name), Duration::from_millis(75))
             .expect_err("still-running session should fail");
 
-        assert!(err.contains("did not stop"), "{err}");
+        assert!(err.contains("has not finished stopping"), "{err}");
         assert!(
             err.contains(socket_path.to_string_lossy().as_ref()),
             "{err}"

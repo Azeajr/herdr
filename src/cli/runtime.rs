@@ -1,9 +1,9 @@
 use crate::api::schema::{
     EmptyParams, Method, PaneFocusDirectionParams, PaneInputSetParams, PaneMoveParams,
     PaneRenameParams, PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget,
-    PaneZoomParams, Request, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
-    WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget, WorktreeCreateParams,
-    WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
+    PaneZoomParams, PeerWorkspaceOpenParams, Request, TabCreateParams, TabListParams,
+    TabRenameParams, TabTarget, WorkspaceCreateParams, WorkspaceRenameParams, WorkspaceTarget,
+    WorktreeCreateParams, WorktreeListParams, WorktreeOpenParams, WorktreeRemoveParams,
 };
 
 fn print_method_response(id: &'static str, method: Method) -> std::io::Result<i32> {
@@ -87,6 +87,19 @@ pub(super) fn worktree_open(params: WorktreeOpenParams) -> std::io::Result<i32> 
 
 pub(super) fn worktree_remove(params: WorktreeRemoveParams) -> std::io::Result<i32> {
     print_method_response("cli:worktree:remove", Method::WorktreeRemove(params))
+}
+
+pub(super) fn peer_workspace_open(params: PeerWorkspaceOpenParams) -> std::io::Result<i32> {
+    print_method_response("cli:peer:workspace:open", Method::PeerWorkspaceOpen(params))
+}
+
+pub(super) fn peer_workspace_create(
+    params: crate::api::schema::PeerWorkspaceCreateParams,
+) -> std::io::Result<i32> {
+    print_method_response(
+        "cli:peer:workspace:create",
+        Method::PeerWorkspaceCreate(params),
+    )
 }
 
 pub(super) fn pane_focus(params: PaneFocusDirectionParams) -> std::io::Result<i32> {

@@ -29,6 +29,8 @@ herdr api schema --output herdr-api.schema.json
 
 通常の `herdr api schema` は短い概要を表示します。`--json` はツール向けの完全な JSON Schema を表示し、`--output PATH` はそのドキュメントをファイルに書き込みます。スキーマには、生のリクエスト、成功レスポンス、エラーレスポンス、発行イベント、購読イベントが含まれます。
 
+リクエストには `if_instance_id` を指定できます。現在のインスタンス ID が一致しない場合、サーバーは `server_replaced` で拒否します。フェデレーションはこの前提条件を使い、あるサーバーから得た ID が置き換わった別サーバーを操作しないようにします。
+
 ## 制御できるもの
 
 ソケット API では次のことができます:
@@ -103,6 +105,7 @@ herdr pane read w1:p2 --source recent --lines 50
 | ポップアップ | `popup.close` |
 | レイアウト | `layout.export`、`layout.apply`、`layout.set_split_ratio` |
 | エージェント | `agent.list`、`agent.get`、`agent.read`、`agent.explain`、`agent.send_keys`、`agent.prompt`、`agent.wait`、`agent.rename`、`agent.focus`、`agent.start` |
+| ピア | `peer.add`、`peer.remove`、`peer.list`、`peer.workspace.open`、`peer.terminal.open` |
 | イベント | `events.subscribe`、`events.wait` |
 | インテグレーション | `integration.install`、`integration.uninstall` |
 | プラグイン | `plugin.link`、`plugin.list`、`plugin.unlink`、`plugin.enable`、`plugin.disable`、`plugin.action.list`、`plugin.action.invoke`、`plugin.log.list`、`plugin.pane.open`、`plugin.pane.focus`、`plugin.pane.close` |
@@ -659,6 +662,41 @@ herdr pane read w1:p1 --source detection
 
 `recent-unwrapped` はソフト折り返しを無視するのでログに便利です。
 `detection` は、エージェントのスクリーン検出が使う下部バッファのスナップショットを返します。
+
+ピアが背後にあるペインの読み取りは、画面を所有するピアが応答し、同じ形のレスポンスをあなた自身のペイン・タブ・ワークスペース id で返します。ピアに到達できないときは、空の画面を返すのではなく、ピアの接続状態を示す `unavailable` で失敗します。
+
+## ピアサーバー
+
+ピアを使うと、ある Herdr サーバーが別の Herdr サーバーのワークスペースを表示できます。ピアとは何か、ピアが背後にあるペインがどう振る舞うかは[永続化とリモートアクセス](/ja/docs/persistence-remote/)を、同じメソッドを JSON なしで扱う `herdr peer` は [CLI リファレンス](/ja/docs/cli-reference/)を参照してください。
+
+```json
+{"id":"req_add","method":"peer.add","params":{"name":"beta","target":{"type":"socket_path","path":"/home/you/.config/herdr/sessions/beta/herdr.sock"}}}
+{"id":"req_ssh","method":"peer.add","params":{"name":"workbox","target":{"type":"ssh","destination":"workbox","session":"agents"}}}
+{"id":"req_list","method":"peer.list","params":{}}
+{"id":"req_open","method":"peer.workspace.open","params":{"target":"<instance-id>:w1","focus":true}}
+{"id":"req_term","method":"peer.terminal.open","params":{"target":"<instance-id>:w1:p1","cols":80,"rows":24}}
+{"id":"req_rm","method":"peer.remove","params":{"name":"beta"}}
+```
+
+`peer.add`、`peer.remove`、`peer.list` はいずれもピアの全リストを返します。各エントリは `connection`(`connecting`、`connected`、`reconnecting`、`error`)、再試行中または断念後の `attempt` と `error`、ピアの `instance_id`、`version`、`protocol`、`stale` フラグ、そして最後に報告された `workspaces` を持ちます。`reconnecting` はまだ再試行中、`error` は停止した状態です。
+
+`peer.workspace.open` はワークスペース・ペイン・ターミナルのいずれかの id を取り、それを表示するローカルワークスペースを開きます。`peer.terminal.open` は、まわりにワークスペースを作らずにピア由来のターミナルを 1 つだけ開きます。どちらも `peer.list` が返す形の、ピアのインスタンス id で名前空間化された id を受け付けます。`name` が必要なのは、ピアローカルの素の id を渡すときだけです。同じターゲットを二度開くと、すでにあるビューが返ります。
+
+名前空間化されたワークスペース id に対する `workspace.rename` と `workspace.close` は、所有するピアへ転送されます。同じ id に対する `workspace.focus` はローカルです。そのワークスペースのビューを開くか、既存のビューへ切り替えます。
+
+`PaneInfo` は、ピアのターミナルを表示しているペインについて `peer` にピア名を報告します。選択や検索のように、そのペイン自身の画面を必要とする操作を提供する前に読んでください。`PaneInfo` のそれ以外のフィールドはそうしたペインでも埋まります。`cwd`、`foreground_cwd`、`terminal_title`、`agent`、`agent_status` は画面を所有するピアから届くので、ピアのエージェントも `agent.list` に現れ、ローカルのものと同じように `agent.wait` で待てます。これらは即時ではなく約 1.5 秒以内に更新され、接続が切れた場合は値をクリアせず最後の内容を保持します。
+
+保持されるからこそ、それらを信頼する前に `peer_view` を読んでください。ピアが背後にあるペインには必ず存在し、ローカルのペインには存在しません。`state` は次のいずれかです。
+
+- `connected` — ピアがそのペインを送っており、他のフィールドもすべて最新です。
+- `reconnecting` — 接続が切れ、再接続中です。ペインはピアの最後のフレームを表示したままで、原因が分かっている場合は `reason` に直近の失敗が入ります。
+- `disconnected` — 再接続を断念した状態です。`reason` がその理由を示し、ペインを閉じてビューを開き直すまで何も変わりません。この状態は、ピアに到達できない場合や、ピアが別のサーバーに入れ替わった場合のためのものです。ペイン自体がもう存在しないとピアが報告した場合、ビューはこの状態に入らずに閉じられます。
+
+`state` が変わるたびに `pane.updated` イベントが発行されるので、クライアントはポーリングせずにビューの生死を追えます。`state` が変わらないまま `reason` だけが変わった場合、そのための専用のイベントは出ません。`pane.updated` は他の理由でも発行され、そのときどきの `peer_view` の内容を運びます。
+
+ピアが背後にあるペインへの `agent.read` は、`pane.read` と同じくピアへ転送されます。`agent.explain` も同様です。そのペインの状態を決めたルールはピア上で、このサーバーが持たない画面に対して実行されたからです。転送された説明には出どころを示す `peer` と `peer_pane_id` の 2 つのフィールドが加わります。それ以外のフィールドは、マニフェストのソース、マニフェストのバージョン、ルール ID を含めてすべて、このサーバーではなくピア側のインストールを表しています。ピアからの拒否はメッセージ先頭にピア名を付けてそのまま返され、ピアに到達できないときはこのサーバーが説明をでっち上げるのではなく、ピアの状態を示す `unavailable` を返します。
+
+逆向きは `owner_instance_id` と `owner_attached` で、これはあるサーバーが「別のサーバーに作らされたペイン」について報告するものです。`owner_attached: false` は、そのペインを要求したインスタンスがいなくなった一方で、ペインはここでまだ動いていることを意味します。
 
 ## 状態の待機
 

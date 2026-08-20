@@ -15,9 +15,14 @@ pub(crate) use api_helpers::limit_snapshot_lines;
 mod config_io;
 mod creation;
 mod git_refresh;
+mod hidden_peer_picker;
+pub(crate) mod hitbox;
 mod ids;
 mod input;
 pub(crate) mod pane_graphics;
+mod peer_picker;
+mod peer_setup_dialog;
+pub mod peers;
 mod popup;
 mod runtime;
 mod runtime_mutations;
@@ -61,6 +66,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::events::AppEvent;
 
+pub(crate) use peer_picker::peer_unavailable_reason;
 pub use state::{AppState, Mode, ToastKind, ViewState};
 
 pub(crate) fn load_plugin_manifest(
@@ -122,6 +128,15 @@ pub struct App {
     pub(crate) git_refresh_due_after_in_flight: bool,
     pub(crate) git_identity_refresh_requested: bool,
     pub(crate) git_status_cache: HashMap<std::path::PathBuf, crate::workspace::GitStatusCacheEntry>,
+    /// Peer views whose connect is running on a worker, keyed by peer handle and
+    /// peer-local target.
+    ///
+    /// Opening a view used to connect on the event loop, which made "one view
+    /// per target" free: the check and the insert could not be interleaved.
+    /// Now that the connect is deferred, two opens of the same target can be in
+    /// flight at once, and each resulting view would reclaim the other's attach
+    /// on the peer forever. This is what makes the second one wait for the first.
+    pub(crate) peer_view_opens_in_flight: HashSet<(String, String)>,
     pub(crate) pending_api_worktree_creates: HashMap<std::path::PathBuf, u64>,
     pub(crate) pending_api_worktree_removes: HashMap<String, u64>,
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
@@ -141,6 +156,10 @@ pub struct App {
     pub(crate) selection_highlight_clear_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    /// Keystrokes joined across one routing batch; never outlives it.
+    pub(crate) pending_pane_input: Option<input::PendingPaneInput>,
+    /// Whether a routing batch is in progress, and therefore whether keys may be held.
+    pub(crate) input_batch_active: bool,
     pub(crate) detached_process_children: Vec<std::process::Child>,
     tab_bar_status_generation: u64,
     tab_bar_datetimes: Vec<tab_bar_status::TabBarDatetimeRuntime>,
@@ -378,6 +397,18 @@ fn resolve_effective_theme(
 }
 
 impl App {
+    /// Peers hidden by `[peer_hidden]`, normalized identically on the cold-start
+    /// and config-reload paths so a restart cannot disagree with a reload.
+    fn hidden_peers_from_config(config: &Config) -> std::collections::HashSet<String> {
+        config
+            .peer_hidden
+            .peers
+            .iter()
+            .map(|peer| peer.trim().to_string())
+            .filter(|peer| !peer.is_empty())
+            .collect()
+    }
+
     pub fn new(
         config: &Config,
         no_session: bool,
@@ -394,6 +425,7 @@ impl App {
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let mut restored_peers = peers::PeerRegistryState::default();
         let (
             workspaces,
             active,
@@ -402,6 +434,7 @@ impl App {
             sidebar_width_source,
             sidebar_section_split,
             collapsed_space_keys,
+            hidden_peers,
         ) = if no_session {
             (
                 Vec::new(),
@@ -410,6 +443,7 @@ impl App {
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
+                std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
             )
         } else if let Some(snap) = crate::persist::load() {
@@ -433,6 +467,7 @@ impl App {
             );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
+            restored_peers = crate::persist::restore_peers(&snap.peers);
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (
@@ -447,6 +482,7 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.hidden_peers,
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
@@ -464,6 +500,7 @@ impl App {
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
+                    snap.hidden_peers,
                 )
             }
         } else {
@@ -474,6 +511,7 @@ impl App {
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
+                std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
             )
         };
@@ -539,6 +577,7 @@ impl App {
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
+            peers: restored_peers,
             active,
             previous_pane_focus: None,
             selected,
@@ -555,9 +594,18 @@ impl App {
             request_submit_worktree_create: false,
             request_submit_worktree_open: false,
             request_submit_worktree_remove: false,
+            request_open_peer_workspace: None,
+            request_submit_peer_workspace_open: false,
+            request_open_add_peer: false,
+            request_submit_add_peer: false,
+            request_open_hidden_peers: false,
+            request_unhide_peer: false,
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_peer_selection_copy: None,
+            peer_copy_mode_query_generation: 0,
+            request_peer_copy_mode_query: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             pending_workspace_create_cwd: None,
@@ -565,8 +613,14 @@ impl App {
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
+            peer_workspace_open: None,
+            add_peer: None,
+            hidden_peers_picker: None,
             worktree_directory,
             collapsed_space_keys,
+            hidden_peers,
+            hidden_peers_config: Self::hidden_peers_from_config(config),
+            peer_history: config.peer_history.recent.clone(),
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -593,6 +647,7 @@ impl App {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
+                peer_header_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),
                 tab_scroll_left_hit_area: Rect::default(),
@@ -702,6 +757,7 @@ impl App {
             host_mouse_pixels: None,
             session_dirty: false,
             terminal_runtime_shutdowns: Vec::new(),
+            terminal_attached_instances: std::collections::HashMap::new(),
         };
 
         state.terminals = restored_terminals;
@@ -757,6 +813,7 @@ impl App {
             git_refresh_due_after_in_flight: false,
             git_identity_refresh_requested: false,
             git_status_cache: HashMap::new(),
+            peer_view_opens_in_flight: HashSet::new(),
             pending_api_worktree_creates: HashMap::new(),
             pending_api_worktree_removes: HashMap::new(),
             pending_api_worktree_remove_paths: HashMap::new(),
@@ -775,6 +832,8 @@ impl App {
             agent_metadata_deadline: None,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
+            pending_pane_input: None,
+            input_batch_active: false,
             session_save_thread: None,
             detached_process_children: Vec::new(),
             tab_bar_status_generation: 0,
@@ -942,6 +1001,10 @@ impl App {
         let mut sent_window_title: Option<Option<String>> = None;
         let mut host_mouse_capture_active = self.state.mouse_capture;
         let mut host_keyboard_report_all_active = false;
+        // Env-gated and off in every normal run; a loop local rather than an
+        // `App` field, because nothing outside this loop has any business
+        // reading it.
+        let mut hitbox_dump = hitbox::HitboxDump::from_env();
 
         while !self.state.should_quit {
             self.reap_finished_detached_processes();
@@ -1050,6 +1113,41 @@ impl App {
                 needs_render = true;
             }
 
+            if let Some(peer) = self.state.request_open_peer_workspace.take() {
+                self.open_peer_workspace_picker(&peer);
+                needs_render = true;
+            }
+
+            if self.state.request_submit_peer_workspace_open {
+                self.state.request_submit_peer_workspace_open = false;
+                self.submit_peer_workspace_open_via_api();
+                needs_render = true;
+            }
+
+            if self.state.request_open_add_peer {
+                self.state.request_open_add_peer = false;
+                self.open_add_peer_dialog();
+                needs_render = true;
+            }
+
+            if self.state.request_open_hidden_peers {
+                self.state.request_open_hidden_peers = false;
+                self.open_hidden_peers_picker();
+                needs_render = true;
+            }
+
+            if self.state.request_unhide_peer {
+                self.state.request_unhide_peer = false;
+                self.unhide_selected_peer();
+                needs_render = true;
+            }
+
+            if self.state.request_submit_add_peer {
+                self.state.request_submit_add_peer = false;
+                self.submit_add_peer();
+                needs_render = true;
+            }
+
             if self.state.request_reload_config {
                 self.state.request_reload_config = false;
                 self.reload_config();
@@ -1133,6 +1231,11 @@ impl App {
                         &self.terminal_runtimes,
                         cell_size,
                     )?;
+                }
+                // After the draw, so the dumped rects are the ones this frame
+                // was hit-tested against.
+                if let Some(dump) = hitbox_dump.as_mut() {
+                    dump.write(&self.state);
                 }
                 self.sync_pending_agent_resume_deadline(now);
                 if self.start_pending_agent_resumes(self.pending_agent_resume_due(now)) {
@@ -1600,6 +1703,14 @@ impl App {
                 crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
         }
 
+        if !invalid_section("peer_history") {
+            self.state.peer_history = config.peer_history.recent.clone();
+        }
+
+        if !invalid_section("peer_hidden") {
+            self.state.hidden_peers_config = Self::hidden_peers_from_config(config);
+        }
+
         if !invalid_section("theme") {
             self.state.theme_runtime = theme_runtime_config(config, !invalid_section("ui"));
             self.refresh_effective_app_theme();
@@ -1768,8 +1879,21 @@ impl App {
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
     ) {
+        // One client message expands to one event per character, and all of them are
+        // handled here, inside a single turn of the server loop. The batch size and how
+        // long it takes are therefore the same question as how long the loop is gone.
+        let batch_started = crate::render_prof::timer();
+        crate::render_prof::counter("input.route.events", events.len() as u64);
+        crate::render_prof::event("input.route.batches");
+        self.input_batch_active = true;
         for event in events {
             let previous_mode = self.state.mode;
+            // Only consecutive keys join. Everything else — a paste, a mouse report, a
+            // text commit — sends its own bytes or acts on the pane, so whatever is
+            // batched has to reach the pty first or the order the pane sees is wrong.
+            if !matches!(event, crate::raw_input::RawInputEvent::Key(_)) {
+                self.flush_pending_pane_input();
+            }
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
                     let lease_key = input::InputLeaseKey::new(source_id, &key);
@@ -1868,6 +1992,12 @@ impl App {
             }
             self.sync_prefix_input_source(previous_mode);
         }
+        // The batch never outlives this call. That is the whole safety argument for
+        // holding keystrokes at all: no other code path can see input that has been
+        // accepted but not yet handed to the pty.
+        self.input_batch_active = false;
+        self.flush_pending_pane_input();
+        crate::render_prof::histogram_since("input.route.batch", batch_started);
     }
 
     pub(crate) fn clear_input_source(&mut self, source_id: InputSourceId) {
@@ -1912,6 +2042,15 @@ impl App {
             }
             Mode::OpenExistingWorktree => {
                 self.handle_worktree_open_key(key_event);
+            }
+            Mode::OpenPeerWorkspace => {
+                self.handle_peer_workspace_open_key(key_event);
+            }
+            Mode::AddPeer => {
+                self.handle_add_peer_key(key_event);
+            }
+            Mode::UnhidePeers => {
+                self.handle_hidden_peers_key(key_event);
             }
             Mode::ConfirmRemoveWorktree => {
                 self.handle_worktree_remove_key(key_event);
@@ -2462,6 +2601,7 @@ mod tests {
         let mut app = test_app();
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
+            pane_id: None,
             content: b"copied".to_vec(),
         });
 
@@ -2477,6 +2617,7 @@ mod tests {
         app.state.toast_config.clipboard.enabled = false;
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
+            pane_id: None,
             content: b"copied".to_vec(),
         });
 
@@ -2497,6 +2638,7 @@ mod tests {
         let original_toast = app.state.toast.clone();
 
         app.handle_internal_event(AppEvent::ClipboardWrite {
+            pane_id: None,
             content: b"copied".to_vec(),
         });
 
@@ -4173,6 +4315,33 @@ mod tests {
         assert_eq!(seed_cwd, std::path::PathBuf::from("/tmp/pion"));
     }
 
+    /// `[peer_hidden]` and `[peer_history]` were only ever read on the config
+    /// reload path, so a hidden peer came back and the add-peer dialog lost its
+    /// recents every time the server restarted. Both are written by the UI, so
+    /// the cold start is the only place a user ever reads them back.
+    #[test]
+    fn a_cold_start_loads_peer_hidden_and_peer_history_from_config() {
+        let mut config = Config::default();
+        config.peer_hidden.peers = vec!["beta".to_string(), "  ".to_string()];
+        config.peer_history.recent = vec![crate::config::PeerHistoryEntry {
+            name: "beta".to_string(),
+            target: "socket:///tmp/beta.sock".to_string(),
+            last_used: 42,
+        }];
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.state.hidden_peers_config.contains("beta"));
+        assert_eq!(
+            app.state.hidden_peers_config.len(),
+            1,
+            "a blank entry must not become a hidden peer"
+        );
+        assert_eq!(app.state.peer_history.len(), 1);
+        assert_eq!(app.state.peer_history[0].name, "beta");
+    }
+
     #[test]
     fn new_terminal_cwd_follow_uses_source_cwd() {
         let cwd = creation::resolve_new_terminal_cwd(
@@ -4508,6 +4677,7 @@ mod tests {
                 focus: false,
                 right_click: Default::default(),
                 env: Default::default(),
+                owner_instance_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4589,6 +4759,7 @@ mod tests {
                 focus: true,
                 right_click: Default::default(),
                 env: Default::default(),
+                owner_instance_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4636,6 +4807,7 @@ mod tests {
                 focus: false,
                 right_click: crate::api::schema::PaneRightClickTarget::Pane,
                 env: Default::default(),
+                owner_instance_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4691,6 +4863,7 @@ mod tests {
                 focus: false,
                 right_click: Default::default(),
                 env: Default::default(),
+                owner_instance_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -6008,8 +6181,26 @@ last_pane = "prefix+tab"
         );
     }
 
+    /// Everything a routing call handed to the pane, joined in arrival order.
+    ///
+    /// Never awaits: routing forwards synchronously, so anything it sent is already in
+    /// the channel when it returns. A loop that awaits a message per character hangs
+    /// forever once those characters are delivered together, which is how this batching
+    /// change first showed up.
+    fn forwarded_after_routing(
+        rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> (Vec<u8>, usize) {
+        let mut bytes = Vec::new();
+        let mut messages = 0;
+        while let Ok(chunk) = rx.try_recv() {
+            bytes.extend_from_slice(&chunk);
+            messages += 1;
+        }
+        (bytes, messages)
+    }
+
     #[tokio::test]
-    async fn route_client_input_splits_multi_event_payloads_before_forwarding() {
+    async fn route_client_input_parses_multi_event_payloads_and_forwards_them_joined() {
         let mut app = test_app();
         let mut workspace = Workspace::test_new("test");
         let focused = workspace.focused_pane_id().unwrap();
@@ -6022,9 +6213,15 @@ last_pane = "prefix+tab"
 
         app.route_client_input(b"ab".to_vec());
 
-        assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from_static(b"a"));
-        assert_eq!(rx.recv().await.unwrap(), bytes::Bytes::from_static(b"b"));
-        assert!(rx.try_recv().is_err());
+        // The payload is still parsed into one event per character — that is what makes
+        // keybindings and re-encoding work — but the pane is written once. Sending each
+        // character separately is what made a large burst freeze the server.
+        let (forwarded, messages) = forwarded_after_routing(&mut rx);
+        assert_eq!(forwarded, b"ab");
+        assert_eq!(
+            messages, 1,
+            "consecutive keys for one pane are written once"
+        );
     }
 
     #[tokio::test]
@@ -6043,13 +6240,8 @@ last_pane = "prefix+tab"
 
         app.route_client_input(text.as_bytes().to_vec());
 
-        let mut forwarded = Vec::new();
-        for _ in text.chars() {
-            let chunk = rx.recv().await.unwrap();
-            forwarded.extend_from_slice(&chunk);
-        }
+        let (forwarded, _messages) = forwarded_after_routing(&mut rx);
         assert_eq!(forwarded, text.as_bytes());
-        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6068,13 +6260,11 @@ last_pane = "prefix+tab"
 
         app.route_client_input(text.as_bytes().to_vec());
 
-        let mut forwarded = Vec::new();
-        for _ in 0..char_count {
-            let chunk = rx.recv().await.unwrap();
-            forwarded.extend_from_slice(&chunk);
-        }
+        // The point of this one is that nothing is lost at length: a long dictation
+        // arrives whole. How many writes it takes is not what it is holding down, so
+        // it asserts the bytes and leaves the count to the batching test.
+        let (forwarded, _messages) = forwarded_after_routing(&mut rx);
         assert_eq!(forwarded, text.as_bytes());
-        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -6190,6 +6380,7 @@ last_pane = "prefix+tab"
             checkout_path: "/repo/herdr-generated-branch".into(),
             error: None,
             creating: false,
+            peer: None,
         });
 
         app.route_client_events(

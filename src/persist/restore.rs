@@ -408,6 +408,10 @@ fn restore_workspace(
 
     (
         Some(Workspace {
+            // Restored workspaces are always local: peer-backed ones are not
+            // persisted, so nothing here can come from a peer.
+            peer: None,
+            peer_workspace: None,
             id: workspace_id,
             custom_name: snap.custom_name.clone(),
             identity_cwd: snap.identity_cwd.clone(),
@@ -496,6 +500,7 @@ fn restore_tab(
             .and_then(|pane| pane.managed_agent_kind.as_deref())
             .and_then(crate::detect::parse_canonical_agent_label);
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
+        let saved_owner_instance_id = saved_pane.and_then(|p| p.owner_instance_id.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
@@ -629,6 +634,9 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                // Kept across restarts so a pane another server asked for stays
+                // attributable to it rather than becoming anonymous.
+                terminal.owner_instance_id = saved_owner_instance_id;
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1198,6 +1206,7 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            owner_instance_id: None,
                         },
                     )]),
                     zoomed: false,
@@ -1211,6 +1220,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            hidden_peers: Default::default(),
+            peers: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1279,6 +1290,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                owner_instance_id: None,
                             },
                         ),
                         (
@@ -1290,6 +1302,7 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 launch_argv: None,
+                                owner_instance_id: None,
                             },
                         ),
                     ]),
@@ -1304,6 +1317,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            hidden_peers: Default::default(),
+            peers: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1343,6 +1358,7 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     launch_argv: None,
+                    owner_instance_id: None,
                 },
             )
         };
@@ -1358,6 +1374,7 @@ mod tests {
                 value: "codex-session".into(),
             }),
             launch_argv: None,
+            owner_instance_id: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1411,6 +1428,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            hidden_peers: Default::default(),
+            peers: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1509,6 +1528,7 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            owner_instance_id: None,
                         },
                     )]),
                     zoomed: false,
@@ -1522,6 +1542,8 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            hidden_peers: Default::default(),
+            peers: Vec::new(),
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1670,6 +1692,7 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 launch_argv: None,
+                owner_instance_id: None,
             },
         );
         let history = SessionHistorySnapshot {
@@ -1716,6 +1739,8 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            hidden_peers: Default::default(),
+            peers: Vec::new(),
         };
         (snapshot, history)
     }

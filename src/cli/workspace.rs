@@ -30,7 +30,11 @@ pub(super) fn run_workspace_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn workspace_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
+    // `--json` is accepted and ignored: the answer is always JSON, and `peer list`
+    // needs the flag to get there, so a script that passed it to both used to fail
+    // here with `unknown option`. Kept out of the public spec, like the same flag
+    // on `worktree`.
+    if args.iter().any(|arg| arg != "--json") {
         eprintln!("usage: herdr workspace list");
         return Ok(2);
     }

@@ -188,7 +188,7 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return self.create_workspace_with_options(initial_cwd, focus);
         };
-        let (rows, cols) = self.state.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.state.estimate_pane_size();
         let ws = &mut self.state.workspaces[ws_idx];
         let (idx, terminal, runtime) = ws.create_tab(
             rows,
@@ -243,7 +243,7 @@ impl App {
         focus: bool,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<usize> {
-        let (rows, cols) = self.state.estimate_pane_size();
+        let crate::terminal::TerminalSize { rows, cols } = self.state.estimate_pane_size();
         let (ws, terminal, runtime) = Workspace::new_with_extra_env(
             initial_cwd,
             rows,
@@ -272,6 +272,48 @@ impl App {
         }
         self.schedule_session_save();
         Ok(idx)
+    }
+
+    /// Creates a local workspace whose single pane is a view onto a peer's
+    /// terminal.
+    ///
+    /// The workspace is local — it has its own local id and takes part in local
+    /// layout and focus — but its pane renders frames the peer produced.
+    pub(crate) fn create_attached_workspace(
+        &mut self,
+        initial_cwd: PathBuf,
+        peer: String,
+        peer_workspace: Option<String>,
+        label: Option<String>,
+        runtime: crate::terminal::TerminalRuntime,
+        focus: bool,
+    ) -> usize {
+        let (ws, terminal, runtime) = Workspace::new_attached(
+            initial_cwd,
+            peer,
+            peer_workspace,
+            label,
+            runtime,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        );
+        self.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        self.state.terminals.insert(terminal.id.clone(), terminal);
+        self.state.workspaces.push(ws);
+        let idx = self.state.workspaces.len() - 1;
+        self.state
+            .remove_alias_shadowed_by_new_pane(self.state.workspaces[idx].tabs[0].root_pane);
+        let workspace_id = self.state.workspaces[idx].id.clone();
+        let root_pane = self.state.workspaces[idx].tabs[0].root_pane.raw();
+        crate::logging::workspace_created(&workspace_id, root_pane);
+        if focus || self.state.active.is_none() {
+            self.state.switch_workspace(idx);
+            self.state.mode = Mode::Terminal;
+        }
+        // Not persisted: a peer-backed workspace cannot be restored without the
+        // peer, so it is rebuilt by reconnecting rather than from the snapshot.
+        idx
     }
 
     pub(super) fn collect_panes_for_workspace(
@@ -423,6 +465,21 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::PaneInfo> {
+        // Measured because idle subscriptions build one of these per poll,
+        // whether or not anything changed, and the cost is not obvious from the
+        // shape: scroll metrics take the terminal lock and the two cwd fields
+        // walk the process tree.
+        let started = crate::render_prof::timer();
+        let info = self.pane_info_inner(ws_idx, pane_id);
+        crate::render_prof::histogram_since("api.pane_info", started);
+        info
+    }
+
+    fn pane_info_inner(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::PaneInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
@@ -448,23 +505,62 @@ impl App {
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             focused,
-            cwd: ws.tabs[tab_idx]
-                .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
-            foreground_cwd: ws.tabs[tab_idx]
-                .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
-                .map(|cwd| cwd.display().to_string()),
+            cwd: {
+                let started = crate::render_prof::timer();
+                let cwd = ws.tabs[tab_idx]
+                    .cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+                    .map(|cwd| cwd.display().to_string());
+                crate::render_prof::histogram_since("api.pane_info.cwd", started);
+                cwd
+            },
+            foreground_cwd: {
+                let started = crate::render_prof::timer();
+                let cwd = ws.tabs[tab_idx]
+                    .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
+                    .map(|cwd| cwd.display().to_string());
+                crate::render_prof::histogram_since("api.pane_info.foreground_cwd", started);
+                cwd
+            },
             label: terminal.manual_label.clone(),
             agent: terminal.effective_agent_label().map(str::to_string),
             title: presentation.title,
             terminal_title: terminal.terminal_title.clone(),
             terminal_title_stripped: terminal.terminal_title_stripped(),
             display_agent: presentation.display_agent,
+            agent_osc_title: self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .map(|runtime| runtime.agent_osc_title())
+                .filter(|value| !value.is_empty()),
+            agent_osc_progress: self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .map(|runtime| runtime.agent_osc_progress())
+                .filter(|value| !value.is_empty()),
             agent_status: pane_agent_status(terminal.state, pane.seen),
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
             agent_session: terminal_agent_session_info(terminal),
             scroll,
+            keyboard_protocol: self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .and_then(|runtime| runtime.keyboard_protocol_info()),
+            peer: self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .and_then(|runtime| runtime.remote())
+                .map(|remote| remote.peer().to_string()),
+            peer_view: self
+                .state
+                .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+                .and_then(|runtime| runtime.remote())
+                .map(|remote| remote.view_state()),
+            owner_instance_id: terminal.owner_instance_id.clone(),
+            owner_attached: terminal.owner_instance_id.as_deref().map(|owner| {
+                self.state
+                    .instance_attached_to_terminal(owner, &terminal.id)
+            }),
             revision: terminal.revision,
         })
     }

@@ -120,6 +120,14 @@ struct RecentAgentProcessExit {
 pub struct TerminalState {
     pub id: TerminalId,
     pub cwd: PathBuf,
+    /// Instance id of the server that asked for this terminal, when another one
+    /// did.
+    ///
+    /// A federating server splits a pane here to back a view on its own side, so
+    /// the terminal exists for a machine that may never come back. Recording who
+    /// asked is what lets this server tell such a terminal apart from one its own
+    /// user created, and report it as unattended once that instance is gone.
+    pub owner_instance_id: Option<String>,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
     fallback_visible_blocker: bool,
@@ -154,6 +162,7 @@ impl TerminalState {
         Self {
             id,
             cwd,
+            owner_instance_id: None,
             detected_agent: None,
             fallback_state: AgentState::Unknown,
             fallback_visible_blocker: false,

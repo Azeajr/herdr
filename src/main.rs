@@ -67,6 +67,7 @@ mod events;
 mod ghostty;
 mod handoff_runtime;
 mod input;
+mod instance_id;
 mod integration;
 mod ipc;
 mod kitty_graphics;
@@ -84,6 +85,7 @@ mod popup_size;
 mod product_announcements;
 mod protocol;
 mod pty;
+mod queue_budget;
 mod raw_input;
 mod release_notes;
 mod remote;
@@ -576,6 +578,10 @@ fn main() -> io::Result<()> {
         return remote::run_remote_client_bridge();
     }
 
+    if args.get(1).map(|s| s.as_str()) == Some("remote-api-bridge") {
+        return remote::run_remote_api_bridge();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
     }
@@ -772,6 +778,7 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 "remote-client-bridge",
+                "remote-api-bridge",
                 "update",
                 "status",
                 "config",

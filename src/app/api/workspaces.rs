@@ -72,6 +72,17 @@ impl App {
     }
 
     pub(super) fn handle_workspace_focus(&mut self, id: String, target: WorkspaceTarget) -> String {
+        // A peer-owned id has no local index: there is nothing on this server to
+        // focus. Opening it is a view onto the peer's workspace, which connects
+        // to another machine and so is routed off the event loop by
+        // `request_targets_peer_workspace` before it reaches here.
+        if crate::app::peers::is_peer_id(&target.workspace_id) {
+            return encode_error(
+                id,
+                "invalid_request",
+                "focusing a peer workspace opens a view and must not run on the event loop",
+            );
+        }
         let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
             return workspace_not_found(id, &target.workspace_id);
         };

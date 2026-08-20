@@ -178,6 +178,23 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
     pub id: String,
+    /// Handle of the peer server backing this workspace's terminals, when it is
+    /// a view onto a peer rather than local panes.
+    ///
+    /// A peer-backed workspace is not persisted — it cannot be restored without
+    /// the peer — and the sidebar groups it under its peer.
+    pub peer: Option<String>,
+    /// The peer's own workspace id that this view's panes belong to.
+    ///
+    /// Stored rather than derived from a pane's remote target because a
+    /// disconnected view has no target to read, and reconnect is a supported
+    /// state: an operation that names the peer's workspace has to keep working
+    /// while the connection is down. Local ids are never peer ids, so this is
+    /// the only thing that can name the workspace on the other side.
+    ///
+    /// `None` for a local workspace, and for a view opened onto a bare pane
+    /// whose workspace the peer never reported.
+    pub peer_workspace: Option<String>,
     /// User-provided override. If set, auto-derived identity stops updating.
     pub custom_name: Option<String>,
     /// Fallback workspace identity source for tests, old snapshots, or missing runtimes.
@@ -253,6 +270,8 @@ impl Workspace {
             discover_workspace_git_identity(&identity_cwd);
         Self {
             id,
+            peer: None,
+            peer_workspace: None,
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
@@ -452,6 +471,8 @@ impl Workspace {
         Ok((
             Self {
                 id,
+                peer: None,
+                peer_workspace: None,
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
@@ -474,6 +495,66 @@ impl Workspace {
             terminal,
             runtime,
         ))
+    }
+
+    /// A workspace whose single pane is backed by an already-connected runtime,
+    /// such as a peer server's terminal.
+    ///
+    /// The workspace id is generated locally: this workspace is a local view of
+    /// a peer's terminal, not a copy of the peer's workspace, so it must not
+    /// borrow the peer's id.
+    pub fn new_attached(
+        initial_cwd: PathBuf,
+        peer: String,
+        peer_workspace: Option<String>,
+        label: Option<String>,
+        runtime: TerminalRuntime,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> (Self, TerminalState, TerminalRuntime) {
+        let id = generate_workspace_id();
+        let (tab, terminal, runtime) = Tab::new_attached(
+            1,
+            initial_cwd.clone(),
+            runtime,
+            events,
+            render_notify,
+            render_dirty,
+        );
+        let mut public_pane_numbers = HashMap::new();
+        public_pane_numbers.insert(tab.root_pane, 1);
+
+        (
+            Self {
+                id,
+                peer: Some(peer),
+                peer_workspace,
+                custom_name: label,
+                identity_cwd: initial_cwd.clone(),
+                cached_identity_cwd: initial_cwd.clone(),
+                // Git identity is discovered from a local checkout, which a
+                // peer-backed workspace does not have. The cwd is the peer's,
+                // so it is used only as a display fallback and never probed.
+                cached_auto_label: fallback_label_from_cwd(&initial_cwd),
+                cached_git_status_key: initial_cwd.clone(),
+                cached_git_branch: None,
+                cached_git_ahead_behind: None,
+                cached_git_space: None,
+                worktree_space: None,
+                metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+                metadata_token_sequences: HashMap::new(),
+                public_pane_numbers,
+                next_public_pane_number: 2,
+                next_public_tab_number: 2,
+                tabs: vec![tab],
+                active_tab: 0,
+                #[cfg(test)]
+                test_runtimes: HashMap::new(),
+            },
+            terminal,
+            runtime,
+        )
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -623,6 +704,46 @@ impl Workspace {
         self.register_new_pane_with_number(tab.root_pane, pane_number);
         self.tabs.push(tab);
         Ok((self.tabs.len() - 1, terminal, runtime))
+    }
+
+    /// Adds a tab whose single pane is backed by an already-connected runtime,
+    /// such as a second view onto a peer's terminal.
+    ///
+    /// The numbering and pane registration are the local ones, exactly as for a
+    /// tab that spawned a pty: the tab is this workspace's, only the terminal
+    /// behind it lives elsewhere.
+    pub fn create_tab_attached(
+        &mut self,
+        initial_cwd: PathBuf,
+        runtime: TerminalRuntime,
+    ) -> (usize, TerminalState, TerminalRuntime) {
+        let number = self.next_public_tab_number;
+        self.next_public_tab_number += 1;
+        let pane_number = self.next_public_pane_number;
+        let events = self
+            .active_tab()
+            .map(|tab| tab.events.clone())
+            .expect("workspace must always have at least one tab");
+        let render_notify = self
+            .active_tab()
+            .map(|tab| tab.render_notify.clone())
+            .expect("workspace must always have at least one tab");
+        let render_dirty = self
+            .active_tab()
+            .map(|tab| tab.render_dirty.clone())
+            .expect("workspace must always have at least one tab");
+
+        let (tab, terminal, runtime) = Tab::new_attached(
+            number,
+            initial_cwd,
+            runtime,
+            events,
+            render_notify,
+            render_dirty,
+        );
+        self.register_new_pane_with_number(tab.root_pane, pane_number);
+        self.tabs.push(tab);
+        (self.tabs.len() - 1, terminal, runtime)
     }
 
     pub fn close_tab(&mut self, idx: usize) -> bool {
@@ -874,6 +995,46 @@ impl Workspace {
             focus_new_pane,
             Some(argv),
         )
+    }
+
+    /// Splits `pane_id` and backs the new pane with an already-connected
+    /// runtime, such as a second view onto a peer's terminal.
+    ///
+    /// Layout, focus, and pane numbering stay local and identical to a normal
+    /// split; only the content comes from elsewhere.
+    ///
+    /// When the target pane is gone the runtime is handed back rather than
+    /// dropped, so the caller can close the connection behind it instead of
+    /// leaving the other end rendering for nobody.
+    pub fn split_pane_attached(
+        &mut self,
+        pane_id: PaneId,
+        direction: Direction,
+        ratio: Option<f32>,
+        cwd: PathBuf,
+        runtime: crate::terminal::TerminalRuntime,
+        focus_new_pane: bool,
+    ) -> Result<(usize, crate::workspace::tab::NewPane), Box<crate::terminal::TerminalRuntime>>
+    {
+        let Some(tab_idx) = self.find_tab_index_for_pane(pane_id) else {
+            return Err(Box::new(runtime));
+        };
+        let pane_number = self.next_public_pane_number;
+        let tab = &mut self.tabs[tab_idx];
+        let previous_focus = tab.layout.focused();
+        tab.layout.focus_pane(pane_id);
+        let new_pane = match tab.split_focused_attached(direction, ratio, cwd, runtime) {
+            Ok(new_pane) => new_pane,
+            Err(runtime) => {
+                tab.layout.focus_pane(previous_focus);
+                return Err(runtime);
+            }
+        };
+        if !focus_new_pane {
+            tab.layout.focus_pane(previous_focus);
+        }
+        self.register_new_pane_with_number(new_pane.pane_id, pane_number);
+        Ok((tab_idx, new_pane))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1202,6 +1363,15 @@ impl Workspace {
         self.tabs.iter().find_map(|tab| tab.terminal_id(pane_id))
     }
 
+    /// Whether any pane in this workspace is attached to `terminal_id`.
+    pub fn holds_terminal(&self, terminal_id: &TerminalId) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.panes
+                .values()
+                .any(|pane| &pane.attached_terminal_id == terminal_id)
+        })
+    }
+
     pub fn focused_pane_id(&self) -> Option<PaneId> {
         self.active_tab().map(|tab| tab.layout.focused())
     }
@@ -1290,6 +1460,8 @@ impl Workspace {
         public_pane_numbers.insert(tab.root_pane, 1);
         Self {
             id: generate_workspace_id(),
+            peer: None,
+            peer_workspace: None,
             custom_name: Some(name.to_string()),
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
@@ -1525,6 +1697,45 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `TerminalRuntime::test_with_channel` spawns a detector task, so this
+    // needs a tokio runtime even though nothing here awaits.
+    #[tokio::test]
+    async fn attached_workspace_has_a_local_identity_and_holds_invariants() {
+        let (runtime, _rx) = TerminalRuntime::test_with_channel(80, 24);
+        let (events, _events_rx) = mpsc::channel(64);
+        let (workspace, terminal, _runtime) = Workspace::new_attached(
+            PathBuf::from("/peer/cwd"),
+            "beta".to_string(),
+            Some("w1".to_string()),
+            Some("beta:w1:p1".to_string()),
+            runtime,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        workspace.assert_invariants_for_test();
+
+        // The id is generated locally: this is a local view of a peer terminal,
+        // not a copy of the peer's workspace, so it must not borrow a peer id.
+        assert!(workspace.id.starts_with('w'));
+        assert!(
+            !crate::app::peers::is_peer_id(&workspace.id),
+            "an attached workspace must carry a local id"
+        );
+        assert_eq!(workspace.custom_name.as_deref(), Some("beta:w1:p1"));
+        assert_eq!(workspace.peer.as_deref(), Some("beta"));
+        assert_eq!(workspace.tabs.len(), 1);
+        assert_eq!(workspace.public_pane_numbers.len(), 1);
+        assert_eq!(
+            workspace
+                .pane_state(workspace.tabs[0].root_pane)
+                .map(|pane| &pane.attached_terminal_id),
+            Some(&terminal.id),
+            "the root pane must bind to the terminal handed back"
+        );
+    }
 
     #[test]
     fn generated_workspace_ids_are_short_base32_handles() {

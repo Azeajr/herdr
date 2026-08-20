@@ -8,8 +8,8 @@ use super::integrations::{
 };
 use super::panes::{
     LayoutDescription, PaneEdgesResult, PaneFocusDirectionResult, PaneInfo, PaneLayoutSnapshot,
-    PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadResult, PaneResizeResult,
-    PaneSwapResult, PaneZoomResult,
+    PaneMoveResult, PaneNeighborResult, PaneProcessInfo, PaneReadRangeResult, PaneReadResult,
+    PaneResizeResult, PaneSwapResult, PaneTextQueryResult, PaneZoomResult,
 };
 use super::plugins::{
     InstalledPluginInfo, PluginActionInfo, PluginCommandLogInfo, PluginInvocationContext,
@@ -47,6 +47,10 @@ pub enum ResponseResult {
         protocol: u32,
         #[serde(default)]
         capabilities: Option<ServerCapabilities>,
+        /// Stable identity of this server instance, used to namespace ids when
+        /// federating with another server. Absent on servers predating it.
+        #[serde(default)]
+        instance_id: Option<String>,
     },
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
@@ -61,6 +65,15 @@ pub enum ResponseResult {
     },
     WorkspaceList {
         workspaces: Vec<WorkspaceInfo>,
+    },
+    PeerList {
+        peers: Vec<super::peers::PeerInfo>,
+    },
+    PeerTerminal {
+        terminal: super::peers::PeerTerminalInfo,
+    },
+    TerminalClosed {
+        terminal_id: String,
     },
     WorktreeList {
         source: WorktreeSourceInfo,
@@ -161,6 +174,12 @@ pub enum ResponseResult {
     },
     PaneRead {
         read: PaneReadResult,
+    },
+    PaneReadRange {
+        read: PaneReadRangeResult,
+    },
+    PaneTextQuery {
+        query: PaneTextQueryResult,
     },
     PaneGraphicsFrameAck {
         sequence: u64,

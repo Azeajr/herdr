@@ -75,6 +75,8 @@ pub(super) fn modal_action_from_buttons<A: Copy>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalMenuAction {
     Detach,
+    AddPeer,
+    UnhidePeers,
     WhatsNew,
     Keybinds,
     ReloadConfig,
@@ -86,7 +88,12 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
         GlobalMenuAction::Settings,
         GlobalMenuAction::Keybinds,
         GlobalMenuAction::ReloadConfig,
+        GlobalMenuAction::AddPeer,
     ];
+    // Index-aligned with `global_menu_labels`.
+    if !state.hidden_peers.is_empty() || !state.hidden_peers_config.is_empty() {
+        actions.push(GlobalMenuAction::UnhidePeers);
+    }
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
@@ -141,6 +148,16 @@ pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuA
             leave_modal(state);
         }
         GlobalMenuAction::Settings => super::settings::open_settings(state),
+        GlobalMenuAction::AddPeer => {
+            // Deferred like every other modal opened from a menu: the dialog is
+            // opened by the App, which owns what submitting it will create.
+            state.request_open_add_peer = true;
+            leave_modal(state);
+        }
+        GlobalMenuAction::UnhidePeers => {
+            state.request_open_hidden_peers = true;
+            leave_modal(state);
+        }
     }
 }
 
@@ -759,6 +776,18 @@ pub(crate) fn handle_confirm_close_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+/// Why a peer with workspaces open here cannot be hidden.
+///
+/// Shared so the two context-menu paths cannot drift: the live one is
+/// `App::apply_context_menu_action_via_api`, and they already disagreed once —
+/// `de82729b` gave this refusal a deadline in the live path only.
+fn peer_hide_refusal(peer: &str) -> (String, &'static str) {
+    (
+        format!("can't hide '{peer}'"),
+        "close the workspaces viewing it before hiding it",
+    )
+}
+
 #[cfg(test)]
 pub(super) fn apply_context_menu_action(
     state: &mut AppState,
@@ -778,6 +807,84 @@ pub(super) fn apply_context_menu_action(
         }
         (ContextMenuKind::GitWorkspace { ws_idx, .. }, Some("Open worktree...")) => {
             state.request_open_existing_worktree = Some(ws_idx);
+            leave_modal(state);
+        }
+        (ContextMenuKind::Peer { .. }, Some("Add peer...")) => {
+            state.request_open_add_peer = true;
+            leave_modal(state);
+        }
+        (ContextMenuKind::Peer { peer, .. }, Some("Open workspace...")) => {
+            state.request_open_peer_workspace = Some(peer);
+            leave_modal(state);
+        }
+        (
+            ContextMenuKind::Peer {
+                peer, collapsed, ..
+            },
+            Some("Collapse" | "Expand"),
+        ) => {
+            let key = crate::ui::peer_collapse_key(&peer);
+            if collapsed {
+                state.collapsed_space_keys.remove(&key);
+            } else {
+                state.collapsed_space_keys.insert(key);
+            }
+            state.mark_session_dirty();
+            leave_modal(state);
+        }
+        (ContextMenuKind::Peer { peer, .. }, Some("Hide for session")) => {
+            if state.peer_has_open_workspaces(&peer) {
+                // The live path is `apply_context_menu_action_via_api`, which
+                // reports through `App::report_action_outcome`; this twin can
+                // only reach the state half of it.
+                let (title, context) = peer_hide_refusal(&peer);
+                state.toast = Some(crate::app::state::ToastNotification {
+                    kind: crate::app::state::ToastKind::NeedsAttention,
+                    title,
+                    context: context.to_string(),
+                    position: None,
+                    target: None,
+                });
+            } else {
+                state.hidden_peers.insert(peer);
+                state.mark_session_dirty();
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Peer { peer, .. }, Some("Hide permanently")) => {
+            if state.peer_has_open_workspaces(&peer) {
+                let (title, context) = peer_hide_refusal(&peer);
+                state.toast = Some(crate::app::state::ToastNotification {
+                    kind: crate::app::state::ToastKind::NeedsAttention,
+                    title,
+                    context: context.to_string(),
+                    position: None,
+                    target: None,
+                });
+            } else {
+                let mut peers: Vec<String> = state.hidden_peers_config.iter().cloned().collect();
+                peers.push(peer.clone());
+                peers.sort();
+                peers.dedup();
+                match crate::config::write_peer_hidden_peers(&peers) {
+                    Ok(()) => {
+                        state.hidden_peers_config.insert(peer);
+                    }
+                    Err(err) => {
+                        state.toast = Some(crate::app::state::ToastNotification {
+                            kind: crate::app::state::ToastKind::NeedsAttention,
+                            title: format!("can't hide '{peer}'"),
+                            context: err,
+                            position: None,
+                            target: None,
+                        });
+                    }
+                }
+            }
+            leave_modal(state);
+        }
+        (ContextMenuKind::Peer { .. }, Some("Unhide peer...")) => {
+            state.request_open_hidden_peers = true;
             leave_modal(state);
         }
         (
@@ -1209,6 +1316,67 @@ impl App {
                 self.state.request_open_existing_worktree = Some(ws_idx);
                 leave_modal(&mut self.state);
             }
+            (ContextMenuKind::Peer { .. }, Some("Add peer...")) => {
+                self.state.request_open_add_peer = true;
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Peer { peer, .. }, Some("Open workspace...")) => {
+                self.state.request_open_peer_workspace = Some(peer);
+                leave_modal(&mut self.state);
+            }
+            (
+                ContextMenuKind::Peer {
+                    peer, collapsed, ..
+                },
+                Some("Collapse" | "Expand"),
+            ) => {
+                let key = crate::ui::peer_collapse_key(&peer);
+                if collapsed {
+                    self.state.collapsed_space_keys.remove(&key);
+                } else {
+                    self.state.collapsed_space_keys.insert(key);
+                }
+                self.state.mark_session_dirty();
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Peer { peer, .. }, Some("Hide for session")) => {
+                if self.state.peer_has_open_workspaces(&peer) {
+                    let (title, context) = peer_hide_refusal(&peer);
+                    self.report_action_outcome(title, context);
+                } else {
+                    self.state.hidden_peers.insert(peer);
+                    self.state.mark_session_dirty();
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Peer { peer, .. }, Some("Hide permanently")) => {
+                if self.state.peer_has_open_workspaces(&peer) {
+                    let (title, context) = peer_hide_refusal(&peer);
+                    self.report_action_outcome(title, context);
+                } else {
+                    let mut peers: Vec<String> =
+                        self.state.hidden_peers_config.iter().cloned().collect();
+                    peers.push(peer.clone());
+                    peers.sort();
+                    peers.dedup();
+                    match crate::config::write_peer_hidden_peers(&peers) {
+                        Ok(()) => {
+                            self.state.hidden_peers_config.insert(peer);
+                        }
+                        // The one refusal here that *is* about config.toml, and
+                        // it is still feedback on an action: the user pressed
+                        // Hide permanently and it did not take.
+                        Err(err) => {
+                            self.report_action_outcome(format!("can't hide '{peer}'"), err);
+                        }
+                    }
+                }
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::Peer { .. }, Some("Unhide peer...")) => {
+                self.state.request_open_hidden_peers = true;
+                leave_modal(&mut self.state);
+            }
             (
                 ContextMenuKind::GitWorkspace {
                     ws_idx, collapsed, ..
@@ -1395,7 +1563,23 @@ fn cancel_rename_modal(state: &mut AppState) {
 }
 
 impl AppState {
-    pub(super) fn global_menu_item_at(&self, col: u16, row: u16) -> Option<GlobalMenuAction> {
+    /// Rect of one launcher-menu row, or `None` when that row has no room.
+    ///
+    /// Paired with `global_menu_item_at` the same way `context_menu_item_rect`
+    /// is with its hit test: the hitbox dump reads these rects rather than
+    /// deriving its own from `global_menu_rect`.
+    pub(crate) fn global_menu_item_rect(&self, idx: usize) -> Option<Rect> {
+        let rect = self.global_menu_rect();
+        let inner_w = rect.width.saturating_sub(2);
+        let rows = rect
+            .height
+            .saturating_sub(2)
+            .min(global_menu_actions(self).len() as u16);
+        let idx = u16::try_from(idx).ok()?;
+        (idx < rows && inner_w > 0).then(|| Rect::new(rect.x + 1, rect.y + 1 + idx, inner_w, 1))
+    }
+
+    pub(crate) fn global_menu_item_at(&self, col: u16, row: u16) -> Option<GlobalMenuAction> {
         let rect = self.global_menu_rect();
         if col <= rect.x
             || col >= rect.x + rect.width.saturating_sub(1)
@@ -2370,5 +2554,109 @@ mod tests {
         assert_eq!(app.state.mode, Mode::ConfirmClose);
         assert_eq!(app.state.workspaces.len(), 2);
         assert!(app.state.context_menu.is_none());
+    }
+
+    fn peer_menu(peer: &str, has_hidden: bool) -> ContextMenuState {
+        ContextMenuState {
+            kind: ContextMenuKind::Peer {
+                peer: peer.into(),
+                collapsed: false,
+                has_hidden,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        }
+    }
+
+    fn apply_peer_menu_item(app: &mut App, menu: ContextMenuState, item: &str) {
+        let idx = menu
+            .items()
+            .iter()
+            .position(|candidate| *candidate == item)
+            .unwrap_or_else(|| panic!("menu item {item:?} missing"));
+        app.apply_context_menu_action_via_api(menu, idx);
+    }
+
+    #[test]
+    fn hide_for_session_hides_a_peer_without_open_workspaces() {
+        let mut app = app_with_test_workspaces(&["local"]);
+
+        apply_peer_menu_item(&mut app, peer_menu("beta", false), "Hide for session");
+
+        assert!(app.state.hidden_peers.contains("beta"));
+        assert!(app.state.toast.is_none());
+        assert_ne!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn hide_for_session_refuses_a_peer_with_open_workspaces() {
+        let mut app = app_with_test_workspaces(&["local"]);
+        let mut remote = Workspace::test_new("remote");
+        remote.peer = Some("beta".to_string());
+        app.state.workspaces.push(remote);
+
+        apply_peer_menu_item(&mut app, peer_menu("beta", false), "Hide for session");
+
+        assert!(!app.state.hidden_peers.contains("beta"));
+        // A refusal is feedback on the action, not a problem with config.toml:
+        // the server writes its own config diagnostic into that slot and only
+        // replaces the message when it still finds its own there.
+        assert!(app.state.config_diagnostic.is_none());
+        assert!(app
+            .state
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.title.contains("beta")));
+        // Without a deadline the refusal outlives the condition: close the
+        // workspaces, hide successfully, and the stale error is still on screen.
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[test]
+    fn hide_permanently_refuses_a_peer_with_open_workspaces() {
+        let mut app = app_with_test_workspaces(&["local"]);
+        let mut remote = Workspace::test_new("remote");
+        remote.peer = Some("beta".to_string());
+        app.state.workspaces.push(remote);
+
+        apply_peer_menu_item(&mut app, peer_menu("beta", false), "Hide permanently");
+
+        assert!(!app.state.hidden_peers_config.contains("beta"));
+        assert!(app.state.config_diagnostic.is_none());
+        assert!(app
+            .state
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.title.contains("beta")));
+        assert!(app.toast_deadline.is_some());
+    }
+
+    #[test]
+    fn hide_permanently_writes_the_config_and_state() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("hide-permanent");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = app_with_test_workspaces(&["local"]);
+        apply_peer_menu_item(&mut app, peer_menu("beta", false), "Hide permanently");
+
+        assert!(app.state.hidden_peers_config.contains("beta"));
+        let written = std::fs::read_to_string(&path).expect("config written");
+        assert!(written.contains("[peer_hidden]"));
+        assert!(written.contains("\"beta\""));
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unhide_peer_requests_the_picker() {
+        let mut app = app_with_test_workspaces(&["local"]);
+        app.state.hidden_peers.insert("beta".to_string());
+
+        apply_peer_menu_item(&mut app, peer_menu("beta", true), "Unhide peer...");
+
+        assert!(app.state.request_open_hidden_peers);
     }
 }

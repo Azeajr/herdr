@@ -1,0 +1,13 @@
+# A test that hangs must fail, not wait.
+#
+# `rx.recv().await` on a channel that will never receive again blocks forever, and a
+# test doing that inside a loop pins a runner thread until something outside kills it.
+# That happened here: a change that joined per-character pty writes left three tests
+# awaiting a message per character, and `just check` printed one failure and then sat
+# there reporting "7 tests still running" with no further output.
+#
+# Sixty seconds is far above anything this suite legitimately takes — the whole run is
+# about 35 seconds across 3,700 tests — so terminating at that point can only catch a
+# test that is stuck.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 1 }

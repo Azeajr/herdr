@@ -197,6 +197,44 @@ impl Tab {
         ))
     }
 
+    /// A tab whose root pane is backed by an already-connected runtime, such as
+    /// a peer server's terminal.
+    ///
+    /// Nothing is spawned locally: the runtime is handed in already attached to
+    /// whatever is producing its content.
+    pub fn new_attached(
+        number: usize,
+        initial_cwd: PathBuf,
+        runtime: TerminalRuntime,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> (Self, TerminalState, TerminalRuntime) {
+        let (layout, root_id) = TileLayout::new();
+        let terminal_id = TerminalId::alloc();
+        let terminal = TerminalState::new(terminal_id.clone(), initial_cwd);
+        let mut panes = HashMap::new();
+        panes.insert(root_id, PaneState::new(terminal_id));
+
+        (
+            Self {
+                custom_name: None,
+                number,
+                root_pane: root_id,
+                layout,
+                panes,
+                #[cfg(test)]
+                runtimes: HashMap::new(),
+                zoomed: false,
+                events,
+                render_notify,
+                render_dirty,
+            },
+            terminal,
+            runtime,
+        )
+    }
+
     pub fn is_auto_named(&self) -> bool {
         self.custom_name.is_none()
     }
@@ -265,6 +303,43 @@ impl Tab {
                 launch_env,
             }),
         )
+    }
+
+    /// Splits the focused pane and gives the new tile an already-connected
+    /// runtime instead of spawning one.
+    ///
+    /// The peer counterpart of the new pane already exists, so nothing is
+    /// launched locally and there is no failure path: unlike a spawn, the
+    /// runtime was built before the layout was touched.
+    pub fn split_focused_attached(
+        &mut self,
+        direction: Direction,
+        ratio: Option<f32>,
+        cwd: PathBuf,
+        runtime: TerminalRuntime,
+    ) -> Result<NewPane, Box<TerminalRuntime>> {
+        // `split_pane` rather than the focus-relative helpers: those are
+        // test-only now, because a production split has to be able to fail
+        // without having touched the layout. Nothing was launched here, so the
+        // only failure is a target that is not in the layout — and the runtime
+        // goes back to the caller rather than being dropped on the floor.
+        let target = self.layout.focused();
+        let Some(new_id) = self
+            .layout
+            .split_pane(target, direction, ratio.unwrap_or(0.5))
+        else {
+            return Err(Box::new(runtime));
+        };
+        self.layout.focus_pane(new_id);
+        let terminal_id = TerminalId::alloc();
+        let terminal = TerminalState::new(terminal_id.clone(), cwd);
+        self.panes.insert(new_id, PaneState::new(terminal_id));
+        self.zoomed = false;
+        Ok(NewPane {
+            pane_id: new_id,
+            terminal,
+            runtime,
+        })
     }
 
     /// Split `target` with a shell pane. Focus moves to the new pane only when

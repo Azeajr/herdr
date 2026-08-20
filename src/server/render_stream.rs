@@ -308,18 +308,28 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    let cursor_policy_started = crate::render_prof::timer();
     let popup_visible = app_state.popup_pane.is_some();
     let pre_compute_suppresses_focused_terminal_cursor =
         !popup_visible && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
+    crate::render_prof::duration_since(
+        "render_virtual.cursor_policy_before",
+        cursor_policy_started,
+    );
+    let compute_started = crate::render_prof::timer();
     if resize_panes {
         crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
     } else {
         crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
     }
+    crate::render_prof::duration_since("render_virtual.compute_view", compute_started);
+    let cursor_policy_started = crate::render_prof::timer();
     let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
         || (!popup_visible
             && focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes));
+    crate::render_prof::duration_since("render_virtual.cursor_policy_after", cursor_policy_started);
 
+    let draw_started = crate::render_prof::timer();
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
 
@@ -328,8 +338,12 @@ pub(crate) fn render_virtual_with_runtime_registry(
             crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
         })
         .expect("render to TestBackend should never fail");
+    crate::render_prof::duration_since("render_virtual.draw", draw_started);
 
+    let clone_started = crate::render_prof::timer();
     let buffer = terminal.backend().buffer().clone();
+    crate::render_prof::duration_since("render_virtual.buffer_clone", clone_started);
+    let cursor_started = crate::render_prof::timer();
     let cursor = if popup_visible {
         popup_terminal_cursor(app_state, terminal_runtimes)
     } else if suppress_focused_terminal_cursor {
@@ -341,6 +355,7 @@ pub(crate) fn render_virtual_with_runtime_registry(
                 .flatten()
         })
     };
+    crate::render_prof::duration_since("render_virtual.cursor", cursor_started);
 
     (buffer, cursor)
 }

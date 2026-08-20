@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -164,6 +165,7 @@ pub(crate) struct TerminalReadSnapshot {
 
 pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
+    alternate_screen_active: AtomicBool,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
     pending_pty_responses: Arc<Mutex<Vec<Bytes>>>,
 }
@@ -477,6 +479,10 @@ impl PaneTerminal {
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
         self.ghostty.extract_selection(selection)
+    }
+
+    pub fn read_text_range(&self, start: (u16, u32), end: (u16, u32)) -> Option<String> {
+        self.ghostty.read_text_range(start, end)
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
@@ -1044,6 +1050,8 @@ impl GhosttyPaneTerminal {
         let mut key_encoder =
             crate::ghostty::KeyEncoder::new().map_err(|e| std::io::Error::other(e.to_string()))?;
         key_encoder.set_from_terminal(&terminal);
+        let alternate_screen_active =
+            terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Alternate);
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
@@ -1066,6 +1074,7 @@ impl GhosttyPaneTerminal {
                 cursor_settle_state: CursorPositionSettleState::default(),
                 windows_powershell_prompt_cwd_reporting: false,
             }),
+            alternate_screen_active: AtomicBool::new(alternate_screen_active),
             key_encoder: Mutex::new(key_encoder),
             pending_pty_responses,
         })
@@ -1221,6 +1230,7 @@ impl GhosttyPaneTerminal {
         _response_writer: &mpsc::Sender<Bytes>,
     ) -> ProcessBytesResult {
         crate::render_prof::counter("pty.bytes", bytes.len() as u64);
+        let lock_started = crate::render_prof::timer();
         let Ok(mut core) = self.core.lock() else {
             error!(pane = pane_id.raw(), "ghostty core lock poisoned in reader");
             return ProcessBytesResult {
@@ -1233,6 +1243,8 @@ impl GhosttyPaneTerminal {
                 terminal_responses: Vec::new(),
             };
         };
+        crate::render_prof::histogram_since("pty.core_lock.wait", lock_started);
+        let hold_started = crate::render_prof::timer();
 
         let _ = core.terminal.take_pwd_changes();
         // Restored history may have exercised terminal callbacks before this live PTY write.
@@ -1358,7 +1370,11 @@ impl GhosttyPaneTerminal {
         if synchronized_output {
             crate::render_prof::event("pty.synchronized_output_suppressed");
         }
-        ProcessBytesResult {
+        self.alternate_screen_active.store(
+            core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Alternate),
+            Ordering::Release,
+        );
+        let result = ProcessBytesResult {
             request_render,
             render_delay,
             terminal_title_changed,
@@ -1366,7 +1382,10 @@ impl GhosttyPaneTerminal {
             clipboard_writes,
             reported_cwd,
             terminal_responses,
-        }
+        };
+        drop(core);
+        crate::render_prof::histogram_since("pty.core_lock.hold", hold_started);
+        result
     }
 
     fn write_pty_bytes_with_ordered_responses(
@@ -1457,6 +1476,10 @@ impl GhosttyPaneTerminal {
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
         }
+        self.alternate_screen_active.store(
+            core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Alternate),
+            Ordering::Release,
+        );
     }
 
     #[cfg(unix)]
@@ -1520,6 +1543,10 @@ impl GhosttyPaneTerminal {
         if let Ok(mut key_encoder) = self.key_encoder.lock() {
             key_encoder.set_from_terminal(&core.terminal);
         }
+        self.alternate_screen_active.store(
+            core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Alternate),
+            Ordering::Release,
+        );
     }
 
     #[cfg(unix)]
@@ -1727,9 +1754,7 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn alternate_screen_active(&self) -> bool {
-        self.core.lock().is_ok_and(|core| {
-            core.terminal.active_screen().ok() == Some(crate::ghostty::ActiveScreen::Alternate)
-        })
+        self.alternate_screen_active.load(Ordering::Acquire)
     }
 
     // This aggregate snapshot performs multiple terminal queries. Pane-scaled
@@ -2063,6 +2088,19 @@ impl GhosttyPaneTerminal {
             .lock()
             .ok()
             .and_then(|mut core| ghostty_extract_selection(&mut core, selection).ok())
+    }
+
+    /// The same read [`Self::extract_selection`] performs, named by coordinates
+    /// rather than by a selection.
+    ///
+    /// Deliberately the identical terminal call: this is what a server answers
+    /// when another server holds the selection but not the screen, and the two
+    /// must not join soft-wrapped lines or trim trailing blanks differently.
+    pub fn read_text_range(&self, start: (u16, u32), end: (u16, u32)) -> Option<String> {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| core.terminal.read_text_screen(start, end, false).ok())
     }
 
     pub fn visible_hyperlinks(&self, area: Rect) -> Vec<((u16, u16), String, String)> {
@@ -3333,6 +3371,20 @@ mod tests {
             color_scheme_reporting: false,
         }
         .plain_page_keys_use_host_scrollback());
+    }
+
+    #[test]
+    fn alternate_screen_cache_tracks_pty_writes() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(40, 3, 1024).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+
+        assert!(!pane.alternate_screen_active());
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049h", &tx);
+        assert!(pane.alternate_screen_active());
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?1049l", &tx);
+        assert!(!pane.alternate_screen_active());
     }
 
     fn text_cell(text: &str) -> crate::ghostty::ScreenTextCell {
