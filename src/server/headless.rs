@@ -3484,18 +3484,33 @@ impl HeadlessServer {
                         });
                 let mut routed_events = Vec::with_capacity(events.len());
                 for event in events {
-                    let focus = match event {
-                        crate::protocol::ClientInputEvent::FocusGained => {
-                            Some(crate::ghostty::FocusEvent::Gained)
-                        }
-                        crate::protocol::ClientInputEvent::FocusLost => {
-                            Some(crate::ghostty::FocusEvent::Lost)
-                        }
-                        _ => None,
-                    };
-                    if let (Some(terminal_id), Some(focus)) = (&attached_terminal_id, focus) {
-                        if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
-                            runtime.try_send_focus_event(focus);
+                    if let Some(terminal_id) = &attached_terminal_id {
+                        match event {
+                            crate::protocol::ClientInputEvent::FocusGained => {
+                                if let Some(runtime) =
+                                    self.runtime_for_terminal_id_string(terminal_id)
+                                {
+                                    runtime
+                                        .try_send_focus_event(crate::ghostty::FocusEvent::Gained);
+                                }
+                            }
+                            crate::protocol::ClientInputEvent::FocusLost => {
+                                if let Some(runtime) =
+                                    self.runtime_for_terminal_id_string(terminal_id)
+                                {
+                                    runtime.try_send_focus_event(crate::ghostty::FocusEvent::Lost);
+                                }
+                            }
+                            crate::protocol::ClientInputEvent::Paste { text } => {
+                                if let Some(runtime) =
+                                    self.runtime_for_terminal_id_string(terminal_id)
+                                {
+                                    if let Err(err) = runtime.try_send_paste(text) {
+                                        warn!(client_id, terminal_id, %err, "terminal attach paste failed");
+                                    }
+                                }
+                            }
+                            event => routed_events.push(event),
                         }
                     } else {
                         routed_events.push(event);
@@ -9600,6 +9615,44 @@ next_tab = ""
         server.app.state.selected = 0;
         server.app.state.mode = crate::app::Mode::Terminal;
         input_rx
+    }
+
+    #[tokio::test]
+    async fn terminal_attach_structured_paste_goes_to_attached_terminal() {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("attached-paste");
+        let pane_id = workspace.tabs[0].root_pane;
+        let runtime_id = workspace
+            .terminal_id(pane_id)
+            .expect("attached terminal")
+            .clone();
+        let terminal_id = runtime_id.to_string();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.ensure_test_terminals();
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server.app.terminal_runtimes.insert(runtime_id, runtime);
+
+        connect_pending_terminal_client(&mut server, 7);
+        assert!(
+            server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                client_id: 7,
+                terminal_id,
+                takeover: false,
+            })
+        );
+
+        assert!(!server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 7,
+            events: vec![crate::protocol::ClientInputEvent::Paste {
+                text: "remote paste".to_owned(),
+            }],
+        }));
+        assert_eq!(
+            input_rx
+                .try_recv()
+                .expect("paste delivered to attached terminal"),
+            Bytes::from_static(b"remote paste")
+        );
     }
 
     fn test_app_client(outer_terminal_focus: Option<bool>, last_activity: u64) -> ClientConnection {
