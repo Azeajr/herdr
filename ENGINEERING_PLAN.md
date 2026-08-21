@@ -1,11 +1,11 @@
 # Herdr engineering plan
 
-Execution record for the findings in [ENGINEERING_ANALYSIS.md](ENGINEERING_ANALYSIS.md).
+Execution record for the federation correctness and performance audit.
 Started 2026-08-16.
 
 ## Status
 
-Every finding in the analysis document has been addressed, and phase 6's stress
+Every finding in the initial audit has been addressed, and phase 6's stress
 harness has been built and run. It found one new confirmed defect of its own,
 recorded below as B6: typed input into a pane whose child has stopped reading
 froze the server for 42 seconds. Fixed in three passes — the client no longer
@@ -18,7 +18,7 @@ build, because the harness has no release path. Rerunning in release closed B6
 outright and reordered what is left; the phase 8 section has both.
 
 Phase 9 is a separate line: correctness at the peer boundary rather than cost.
-It came from a user report, not from the analysis, and found four bugs where a
+It came from a user report, not from the initial audit, and found four bugs where a
 remote pane answered the local default to a question only the peer could answer.
 
 **The plan is complete as of phase 10.** Both formerly-live lists now have an
@@ -40,7 +40,7 @@ measured and closed or explicitly accepted under the completion contract.
 | P2 frames do not wake the loop | Fixed. |
 | P2 idle subscription cost | Measured, then fixed. ~5× on the loop. |
 | P2 history capture stall | Measured, then fixed. ~500× on the loop. |
-| B6 typed input freezes the server | Found by the phase 6 harness, not the analysis. Fixed in three passes; 42.5 s to 3.2 s debug, 0.2 s release. |
+| B6 typed input freezes the server | Found by the phase 6 harness, not the initial audit. Fixed in three passes; 42.5 s to 3.2 s debug, 0.2 s release. |
 | P3 100 ms API concurrency floor | Fixed. Release p99 at concurrency 32: 102.4 ms to 3.3 ms. |
 | P4 50-pane render scaling | Fixed at the responsible layer. `render_virtual`: 92.5 ms to 14.6 ms in the focused run. |
 | P5 terminal-core contention | Measured and disproven as the scaling mechanism; average wait 3–4 µs at 50 panes. |
@@ -142,7 +142,7 @@ measurement of that terminal.**
 
 ## Why this order
 
-This is dependency order, not the analysis document's own "Top next actions"
+This is dependency order, not the initial audit's own "Top next actions"
 order. That list puts instrumentation at position 5, which is wrong for
 execution: three of the fixes ranked above it state numeric acceptance criteria
 that cannot be measured until the instrumentation exists.
@@ -181,7 +181,7 @@ load average of 0.11. The load figure matters: `AGENTS.md` records that
 contention makes the heavy suites look like code regressions, so a green run on
 an idle machine is the trustworthy kind.
 
-**References.** 44 unique `file:line` references in the analysis document. 40
+**References.** The initial audit contained 44 unique `file:line` references. 40
 land exactly on the construct described. Four were corrected: `src/ipc.rs:166`
 to `:185`, `src/api/mod.rs:82` to `:84`, `:90` to `:91`, and `src/pane.rs:288` to
 `:289`. The underlying claims were all correct; only line numbers drifted.
@@ -210,7 +210,7 @@ ZIG=/opt/zig0.15/zig HERDR_UPDATE_API_SCHEMA=1 cargo nextest run --locked genera
 
 `src/render_prof.rs` gained two measurement kinds. `duration` reports count,
 average and maximum, which cannot answer any of the acceptance criteria in the
-analysis — those are percentiles. `histogram` adds p50/p95/p99 over fixed
+initial audit — those are percentiles. `histogram` adds p50/p95/p99 over fixed
 buckets spanning 50 µs to 5 s, recording without allocating. `gauge` samples a
 level and retains its peak, because the useful facts about a queue are how deep
 it is now and how deep it ever got, and a counter gives neither.
@@ -297,7 +297,7 @@ the writer thread for real by filling the socket buffer against a peer that
 accepted the connection and then stopped reading.
 
 No new harness was needed: `MutePeer` already completes a handshake and then
-never reads, which is exactly the driver the analysis asks for. That is the
+never reads, which is exactly the driver the initial audit asks for. That is the
 phase 6 item that was pulled forward, and it turned out to already exist.
 
 Validation: 600 sends to a wedged peer complete in under a second against a
@@ -405,7 +405,7 @@ adversarial case failed exactly as predicted: a view abandoned because its peer
 was replaced was resurrected by a reconnect that finished against the old
 server, coming back live and accepting input.
 
-**The prescribed fix was larger than the defect needs.** The analysis asks for a
+**The prescribed fix was larger than the defect needs.** The initial audit asks for a
 monotonically increasing reconnect generation. `reconnect_due` already refuses
 to start an attempt while `in_flight` is set, so attempts are serialized per
 view and there is no second generation to tell apart. What was missing is not
@@ -491,7 +491,7 @@ Ten calls per second is exactly the 100 ms poll, none of it triggered by
 anything changing: roughly 6.9 ms/sec of `loop.active` time per idle
 subscription, the same budget rendering and input compete for.
 
-**The analysis attributes the cost to the wrong things.** It lists "terminal
+**The initial audit attributes the cost to the wrong things.** It lists "terminal
 lock acquisitions, snapshot formatting, regex scans, allocation, and `/proc`
 inspection". Broken down:
 
@@ -511,7 +511,7 @@ expensive part of that refresh is this walk.
 
 ### The fix, and the three rejected
 
-A narrow scroll probe (what the analysis prescribes) adds public API surface for
+A narrow scroll probe (what the initial audit prescribes) adds public API surface for
 an internal optimization and fixes only one of three subscription kinds.
 Skipping the `process_argv` read that this path discards needs four platform
 implementations, three unrunnable here, for maybe a fifth of the cost. Skipping
@@ -565,7 +565,7 @@ Capture is split. On the loop, beside the structural snapshot, the save decides
 reference-count bump on the terminal. The save thread reads the bytes through
 those handles.
 
-That split preserves the property the analysis warns about and an existing test
+That split preserves the property the initial audit warns about and an existing test
 already asserts: structural and history snapshots pair positionally, so the
 positions must come from one consistent moment on the loop. Only content is
 deferred, and content read a moment later is not an inconsistency.
@@ -978,7 +978,7 @@ around a region that *already holds* the core lock, so it measures hold time, no
 wait time. Whatever is scaling is inside the hold — a candidate is scrollback
 trimming as each pane fills its 10 MB budget, another is cache behaviour at
 521 MB resident. This is the strongest argument yet for the terminal-lock
-contention instrument, which is the one measurement gap from the analysis that
+contention instrument, which is the one measurement gap from the initial audit that
 was never built.
 
 **API — the 100 ms floor is not compute.**
@@ -1028,7 +1028,7 @@ The findings as they stood before closure:
    pane and 141 ns/byte at fifty, for the same bytes through the same
    already-optimized parser, and the total inside `pty.ghostty_write` is the one
    figure that did not improve in release. Cause unknown, and the terminal-lock
-   contention instrument — one of the analysis's three unbuilt measurement gaps —
+   contention instrument — one of the initial audit's three unbuilt measurement gaps —
    is what would say whether contention is even the mechanism.
 2. **`full_render.render_virtual` scaling** — 1.1 ms at one pane, 21.9 ms at fifty,
    which is ~80% of a full render and past a frame budget on its own. Fixed-geometry

@@ -30,16 +30,13 @@ and rebasing onto it moves you backward.
 `.local/` is gitignored and is the right home for local notes, PRDs and scratch
 specs.
 
-### What is still open
+### Engineering record
 
-[`ENGINEERING_PLAN.md`](ENGINEERING_PLAN.md) is the live record of work in
-progress and what remains. Its Status section links **two** still-open lists —
-performance (phases 0–8) and peer-boundary correctness (phase 9) — and neither
-supersedes the other, so read both before picking something up.
-
-[`ENGINEERING_ANALYSIS.md`](ENGINEERING_ANALYSIS.md) is not live. It is a frozen
-snapshot kept for comparing prediction against outcome; its `file:line`
-references mostly no longer land. Do not work from it.
+[`ENGINEERING_PLAN.md`](ENGINEERING_PLAN.md) is the completed execution record
+for the federation correctness and performance work. Its phase 8 and phase 9
+closure tables preserve the two former open lists and their evidence-backed
+dispositions; they are historical indexes, not pending work. The Status section
+and phase 10 final decisions record the deliberately accepted gaps.
 
 ### After a rebase
 
