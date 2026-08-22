@@ -1,0 +1,35 @@
+{
+  "_thresholds": {
+    "core_lock_wait_p99_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "full_render_avg_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "loop_active_max_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "pty_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "rss_peak_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    }
+  },
+  "binary_hash": "8bbe87411019a1e1d897735b63c5af3353e4d81a5f30f9d210c62c438071df1f",
+  "concurrency": 50,
+  "metrics": {
+    "core_lock_wait_p99_us": 50,
+    "full_render_avg_us": 5624,
+    "loop_active_max_us": 23394,
+    "pty_mb": 12.5,
+    "rss_peak_mb": 239
+  },
+  "profile": "release",
+  "workload": "output"
+}

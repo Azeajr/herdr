@@ -1,0 +1,25 @@
+{
+  "_thresholds": {
+    "loop_active_max_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "max_ms": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "p99_ms": {
+      "band": 0.25,
+      "cliff": 1.0
+    }
+  },
+  "binary_hash": "8bbe87411019a1e1d897735b63c5af3353e4d81a5f30f9d210c62c438071df1f",
+  "concurrency": 1,
+  "metrics": {
+    "loop_active_max_us": 3173,
+    "max_ms": 0.2,
+    "p99_ms": 0.2
+  },
+  "profile": "release",
+  "workload": "api"
+}

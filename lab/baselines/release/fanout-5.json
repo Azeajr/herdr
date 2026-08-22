@@ -1,0 +1,25 @@
+{
+  "_thresholds": {
+    "full_render_avg_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "loop_active_max_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "rss_peak_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    }
+  },
+  "binary_hash": "8bbe87411019a1e1d897735b63c5af3353e4d81a5f30f9d210c62c438071df1f",
+  "concurrency": 5,
+  "metrics": {
+    "full_render_avg_us": 4479,
+    "loop_active_max_us": 5936,
+    "rss_peak_mb": 34
+  },
+  "profile": "release",
+  "workload": "fanout"
+}

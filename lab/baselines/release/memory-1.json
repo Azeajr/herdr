@@ -1,0 +1,20 @@
+{
+  "_thresholds": {
+    "rss_delta_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "rss_peak_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    }
+  },
+  "binary_hash": "8bbe87411019a1e1d897735b63c5af3353e4d81a5f30f9d210c62c438071df1f",
+  "concurrency": 1,
+  "metrics": {
+    "rss_delta_mb": 2.3,
+    "rss_peak_mb": 23
+  },
+  "profile": "release",
+  "workload": "memory"
+}
