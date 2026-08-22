@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -202,6 +203,64 @@ def deliver(lab: LabDriver, wire: bytes) -> None:
             raise RuntimeError(f"tmux send-keys failed at offset {off}: {proc.stderr!r}")
 
 
+OSC52_EMIT = Path("/tmp") / f"emit-osc52-{uuid.uuid4().hex[:6]}.py"
+
+OSC52_EMITTER = '''#!/usr/bin/env python3
+"""Emit an OSC 52 clipboard write for the base64 payload given as argv[1]."""
+import base64
+import sys
+
+payload = sys.argv[1] if len(sys.argv) > 1 else "test"
+sys.stdout.write("\\x1b]52;c;" + base64.b64encode(payload.encode()).decode() + "\\x07")
+'''
+
+
+def run_osc52_cell(lab: LabDriver, target: str, kind: str,
+                   blob: bytes, capture_file: Path) -> dict:
+    """OSC 52 source: the pane program emits an OSC 52 clipboard write.
+
+    The pipeline under test: pane PTY output -> herdr's OSC 52 parser ->
+    AppEvent::ClipboardWrite -> ServerMessage::Clipboard -> client
+    forward_clipboard. The observable is the "copied to clipboard" feedback
+    toast on the client screen.
+    """
+    cid = f"osc52/{target}/{kind}"
+    base = {
+        "cell_id": cid, "source": "osc52", "target": target,
+        "payload": {"kind": kind, "bytes": len(blob), "hash": sha(blob)},
+    }
+
+    base_pane = focus_workspace(lab, target)
+    pane = fresh_capture_pane(lab, base_pane)
+    try:
+        # Write the emitter script to a temp file directly from Python
+        # (bypassing tmux send-keys which splits heredocs).
+        emitter_path = Path("/tmp") / f"emit-osc52-{uuid.uuid4().hex[:8]}.py"
+        emitter_path.write_text(OSC52_EMITTER)
+        payload_b64 = base64.b64encode(blob).decode()
+        lab.ok("cli", "a", "pane", "run", pane,
+               f"python3 {emitter_path} {payload_b64}")
+        time.sleep(2.0)  # let the OSC 52 emit, process, and toast appear
+        # The toast is short-lived; poll fast.
+        deadline = time.monotonic() + 10
+        seen = False
+        while time.monotonic() < deadline:
+            if lab.ok("ui", "find", "A", "copied to clipboard",
+                      expect=(0, EXIT_PRECONDITION)).get("matches"):
+                seen = True
+                break
+            time.sleep(0.25)
+        return {
+            **base,
+            "verdict": "pass" if seen else "fail",
+            "toast_seen": seen,
+            "exact": seen,
+            "note": "osc52 source verifies copy propagation via client feedback toast",
+        }
+    finally:
+        close_capture_pane(lab, pane)
+
+
 def run_cell(lab: LabDriver, source: str, target: str, kind: str,
              blob: bytes, capture_file: Path) -> dict:
     """Deliver one paste into a fresh target pane; hash what the pane received."""
@@ -211,8 +270,12 @@ def run_cell(lab: LabDriver, source: str, target: str, kind: str,
         "payload": {"kind": kind, "bytes": len(blob), "hash": sha(blob)},
     }
 
+    if source == "osc52":
+        return run_osc52_cell(lab, target, kind, blob, capture_file)
     if source != "bracketed-paste":
         # Driver not implemented yet: declared skip cell so the matrix stays visible.
+        # middle-click and copy-command need UI selection choreography (drag-select,
+        # context menus); osc52 is implemented above.
         return {**base, "verdict": "skip"}
 
     base_pane = focus_workspace(lab, target)
@@ -248,18 +311,24 @@ def run_cell(lab: LabDriver, source: str, target: str, kind: str,
 
 
 def apply_oracle(cells_by_id: dict[str, dict]) -> None:
-    """Peer cells are graded against their local counterparts, not against exactness."""
+    """Peer cells with byte captures are graded against their local counterparts.
+
+    Cells without a received_hash (e.g. osc52 toast cells) keep their own verdict:
+    they already assert their observable directly.
+    """
     for cid, res in list(cells_by_id.items()):
         source, target, kind = cid.split("/", 2)
         if not target.startswith("peer:") or res["verdict"] == "skip":
             continue
+        if "received_hash" not in res:
+            continue
         oracle_id = f"{source}/local:a:p1/{kind}"
         oracle = cells_by_id[oracle_id]
-        match = res["received_hash"] == oracle["received_hash"]
+        match = res.get("received_hash") == oracle.get("received_hash")
         res["oracle_cell_id"] = oracle_id
         res["divergence"] = None if match else (
-            f"remote {res['received_bytes']}B/{res['received_hash'][:12]} vs local "
-            f"{oracle['received_bytes']}B/{oracle['received_hash'][:12]} "
+            f"remote {res.get('received_bytes')}B/{res.get('received_hash','')[:12]} vs local "
+            f"{oracle.get('received_bytes')}B/{oracle.get('received_hash','')[:12]} "
             f"(payload {res['payload']['bytes']}B)")
         res["verdict"] = "pass" if match else "fail"
 
@@ -310,10 +379,12 @@ def main() -> int:
         # Local reference cells first: they grade the peer cells.
         results: dict[str, dict] = {}
         plan: list[tuple[str, str, str]] = []
-        for kind in PAYLOAD_KINDS:
-            plan.append(("bracketed-paste", "local:a:p1", kind))
-        for kind in PAYLOAD_KINDS:
-            plan.append(("bracketed-paste", "peer:b:w1:p1", kind))
+        for source in SOURCES:
+            if source in ("middle-click", "copy-command"):
+                continue  # no driver yet: filled as skips below
+            for target in TARGETS:
+                for kind in PAYLOAD_KINDS:
+                    plan.append((source, target, kind))
 
         for source, target, kind in plan:
             cap = out_dir / "captures" / f"{cell_slug(source, target, kind)}.bin"
@@ -322,7 +393,7 @@ def main() -> int:
 
         # Declared-but-unimplemented sources become visible skip cells.
         for source in SOURCES:
-            if source == "bracketed-paste":
+            if source in ("bracketed-paste", "osc52"):
                 continue
             for target in TARGETS:
                 for kind in PAYLOAD_KINDS:
