@@ -490,6 +490,11 @@ def main() -> int:
 
     envelope.body = {"cells": cells}
     envelope.finish(verdict)
+    # Automatic evidence bundle on any non-green matrix (backlog: harness
+    # ergonomics). Best-effort; never masks the original verdict.
+    from runners.evidence import bundle_on_failure
+    bundle_on_failure(lab, envelope, out_dir, verdict,
+                      note=f"automatic bundle: paste-matrix -> {verdict}")
     cap_dir = out_dir / "captures"
     if cap_dir.exists():
         for f in sorted(cap_dir.iterdir()):

@@ -1,0 +1,97 @@
+# Generic fault-choreography scenarios. Each [[phase]] is a step executed in
+# order by runners/fault_suite.py; faults name a harness-side action from the
+# D6 toolkit (kill, stop/resume, partition, slow, client-kill). Nothing about
+# the sequence lives in Python — add a cell by adding a file here.
+
+# --- cell 1: kill peer mid-paste (was runners/fault_kill_peer.py) -----------
+[[cell]]
+id = "kill-peer-mid-paste"
+family = "fault"
+determinism_tier = "seeded-simulated"
+
+[cell.topology]
+servers = ["a", "b"]
+peer = "a->b"
+
+[[cell.phase]]
+at = "setup"
+do = "open-peer-workspace"        # boot topology, wire peers, open b's ws on a
+
+[[cell.phase]]
+at = "setup"
+do = "start-capture"              # fresh split pane running stty raw + head -c
+
+[[cell.phase]]
+do = "deliver-paste"
+payload = "large"
+until = "one third through"       # kill fires when this phase passes 1/3
+
+[[cell.phase]]
+do = "fault"
+action = "kill"
+target = "server-b"
+params = { signal = "SIGKILL" }
+
+[[cell.phase]]
+do = "recover"
+method = "lab-up"                 # lab.py up reboots b and re-wires the peer
+
+[[cell.phase]]
+do = "assert-reconnected"
+timeout_s = 30
+
+[[cell.phase]]
+do = "assert-liveness"            # paste into a fresh peer pane post-recovery
+probe = "alive"
+timeout_s = 15
+
+[cell.characterization]
+note = """In-flight paste bytes across the SIGKILL are recorded as data
+(interrupted_capture_bytes/hash), not asserted: what survives an abrupt kill
+is precisely what this cell characterizes."""
+
+# --- cell 2: client killed mid-paste ----------------------------------------
+[[cell]]
+id = "client-kill-mid-paste"
+family = "fault"
+determinism_tier = "seeded-simulated"
+
+[cell.topology]
+servers = ["a", "b"]
+peer = "a->b"
+
+[[cell.phase]]
+at = "setup"
+do = "open-peer-workspace"
+
+[[cell.phase]]
+at = "setup"
+do = "start-capture"
+
+[[cell.phase]]
+do = "deliver-paste"
+payload = "large"
+until = "one third through"
+
+[[cell.phase]]
+do = "fault"
+action = "client-kill"            # SIGKILL client A's process mid-stream
+target = "client-A"
+
+[[cell.phase]]
+do = "recover"
+method = "client-reopen"          # ui open A again on server a
+
+[[cell.phase]]
+do = "assert-server-sane"         # a's state API answers, panes intact
+timeout_s = 30
+
+[[cell.phase]]
+do = "assert-fresh-client"        # new client attaches and input still flows
+probe = "alive"
+timeout_s = 15
+
+[cell.characterization]
+note = """Bytes lost in the killed client's buffers are characterized data.
+The assertions cover server-side sanity and clean reattachment, which is what
+a user needs after their client dies."""
