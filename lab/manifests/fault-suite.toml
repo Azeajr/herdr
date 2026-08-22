@@ -75,19 +75,19 @@ until = "one third through"
 
 [[cell.phase]]
 do = "fault"
-action = "client-kill"            # SIGKILL client A's process mid-stream
+action = "client-kill"
 target = "client-A"
 
 [[cell.phase]]
 do = "recover"
-method = "client-reopen"          # ui open A again on server a
+method = "client-reopen"
 
 [[cell.phase]]
-do = "assert-server-sane"         # a's state API answers, panes intact
+do = "assert-server-sane"
 timeout_s = 30
 
 [[cell.phase]]
-do = "assert-fresh-client"        # new client attaches and input still flows
+do = "assert-fresh-client"
 probe = "alive"
 timeout_s = 15
 
@@ -95,3 +95,153 @@ timeout_s = 15
 note = """Bytes lost in the killed client's buffers are characterized data.
 The assertions cover server-side sanity and clean reattachment, which is what
 a user needs after their client dies."""
+
+# --- cell 3: network partition during active paste (requires docker boxes) ---
+[[cell]]
+id = "partition-during-paste"
+family = "fault"
+determinism_tier = "seeded-simulated"
+requires = ["docker-boxes"]
+
+[cell.topology]
+servers = ["a", "b"]
+peer = "a->b"
+remote = true
+
+[[cell.phase]]
+at = "setup"
+do = "open-ssh-lab"
+
+[[cell.phase]]
+at = "setup"
+do = "start-capture"
+
+[[cell.phase]]
+do = "deliver-paste"
+payload = "large"
+until = "half through"
+
+[[cell.phase]]
+do = "fault"
+action = "partition"
+target = "server-b"
+params = { direction = "egress", loss = "100%" }
+
+[[cell.phase]]
+do = "wait"
+duration_s = 10
+
+[[cell.phase]]
+do = "fault"
+action = "partition-clear"
+target = "server-b"
+
+[[cell.phase]]
+do = "wait"
+duration_s = 5
+
+[[cell.phase]]
+do = "assert-reconnected"
+timeout_s = 30
+
+[[cell.phase]]
+do = "assert-liveness"
+probe = "alive"
+timeout_s = 15
+
+[cell.characterization]
+note = """Network partition (100% loss on b's egress) during an active paste.
+The peer should reconnect when the partition clears; in-flight bytes are
+characterized, not asserted."""
+
+# --- cell 4: slow peer (delay/loss) during active paste ---------------------
+[[cell]]
+id = "slow-peer-during-paste"
+family = "fault"
+determinism_tier = "seeded-simulated"
+requires = ["docker-boxes"]
+
+[cell.topology]
+servers = ["a", "b"]
+peer = "a->b"
+remote = true
+
+[[cell.phase]]
+at = "setup"
+do = "open-ssh-lab"
+
+[[cell.phase]]
+at = "setup"
+do = "start-capture"
+
+[[cell.phase]]
+do = "deliver-paste"
+payload = "large"
+until = "half through"
+
+[[cell.phase]]
+do = "fault"
+action = "slow-peer"
+target = "server-b"
+params = { delay = "200ms", loss = "10%" }
+
+[[cell.phase]]
+do = "wait"
+duration_s = 15
+
+[[cell.phase]]
+do = "fault"
+action = "slow-peer-clear"
+target = "server-b"
+
+[[cell.phase]]
+do = "assert-liveness"
+probe = "alive"
+timeout_s = 15
+
+# --- cell 5: deliberately failing cell for evidence bundle test --------------
+[[cell]]
+id = "evidence-bundle-test"
+family = "fault"
+determinism_tier = "seeded-simulated"
+
+[cell.topology]
+servers = ["a", "b"]
+peer = "a->b"
+
+[[cell.phase]]
+at = "setup"
+do = "open-peer-workspace"
+
+[[cell.phase]]
+at = "setup"
+do = "start-capture"
+
+[[cell.phase]]
+do = "deliver-paste"
+payload = "tiny"
+until = "one third through"
+
+[[cell.phase]]
+do = "fault"
+action = "kill"
+target = "server-b"
+
+[[cell.phase]]
+do = "recover"
+method = "lab-up"
+
+[[cell.phase]]
+do = "assert-reconnected"
+timeout_s = 30
+
+[[cell.phase]]
+do = "assert-liveness"
+probe = "this-should-fail"
+timeout_s = 5
+
+[cell.characterization]
+note = """Deliberately failing cell to test evidence bundling. The liveness
+probe 'this-should-fail' will not match the expected 'alive', causing a
+fail verdict. This tests that evidence bundling captures diagnosis material
+on failure."""

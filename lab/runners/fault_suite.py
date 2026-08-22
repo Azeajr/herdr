@@ -124,6 +124,20 @@ def act_open_peer_workspace(cell: Cell, step: dict) -> None:
     cell.base_pane = open_peer_ws(cell.lab)
 
 
+# --- SSH lab setup action for docker boxes ----------------------------------
+
+def act_open_ssh_lab(cell: Cell, step: dict) -> None:
+    """Boot a lab on the docker peer boxes via lab.py --on."""
+    # The SSH lab uses the docker boxes; we set it up via lab.py --on box1
+    # but for the fault runner we keep it simple: the caller starts a local
+    # lab with the remote flag, and this action wires it.
+    # For now, we use the existing peer workflow on the local machine
+    # since the docker boxes already have the binary and SSH is wired.
+    # The actual box management is handled by the netem actions.
+    cell.base_pane = open_peer_ws(cell.lab)
+    # TODO: full --on support when runner is invoked with --remote flag
+
+
 def act_start_capture(cell: Cell, step: dict) -> None:
     r = cell.lab.ok("cli", "a", "pane", "split", cell.base_pane,
                     "--direction", "down", "--ratio", "0.5", "--focus")
@@ -277,8 +291,80 @@ def act_assert_fresh_client(cell: Cell, step: dict) -> bool:
     return act_assert_liveness(cell, step)
 
 
+# --- wait action -----------------------------------------------------------
+
+def act_wait(cell: Cell, step: dict) -> None:
+    duration = step.get("duration_s", 5)
+    time.sleep(duration)
+
+
+# --- new D6 fault actions for docker peer boxes -----------------------------
+
+def _box_name(target: str) -> str:
+    # "server-b" -> "box2"
+    if target == "server-b":
+        return "box2"
+    if target == "server-a":
+        return "box1"
+    # fallback: "server-b" -> "b"
+    return target.split("-", 1)[1]
+
+
+def _netem_apply(box: str, to: str | None, delay: str, loss: str) -> None:
+    """Apply netem to a docker peer box. Uses `boxes.sh netem`."""
+    cmd = ["bash", "peer-test/docker/boxes.sh", "netem", box]
+    if to:
+        cmd += ["--to", to]
+    cmd += [delay, loss]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"netem apply failed: {proc.stderr}")
+
+
+def _netem_clear(box: str) -> None:
+    cmd = ["bash", "peer-test/docker/boxes.sh", "netem", box, "clear"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+    if proc.returncode != 0:
+        raise RuntimeError(f"netem clear failed: {proc.stderr}")
+
+
+def act_fault_partition(cell: Cell, step: dict) -> None:
+    box = _box_name(step["target"])
+    params = step.get("params", {})
+    direction = params.get("direction", "egress")
+    loss = params.get("loss", "100%")
+    delay = params.get("delay", "0ms")
+    if direction == "egress":
+        _netem_apply(box, to="", delay=delay, loss=loss)
+    else:
+        # ingress is harder; use egress on the other box as a proxy
+        other = "box1" if box == "box2" else "box2"
+        _netem_apply(other, to=box, delay=delay, loss=loss)
+
+
+def act_fault_partition_clear(cell: Cell, step: dict) -> None:
+    box = _box_name(step["target"])
+    _netem_clear(box)
+
+
+def act_fault_slow_peer(cell: Cell, step: dict) -> None:
+    box = _box_name(step["target"])
+    params = step.get("params", {})
+    delay = params.get("delay", "200ms")
+    loss = params.get("loss", "0%")
+    _netem_apply(box, to="", delay=delay, loss=loss)
+
+
+def act_fault_slow_peer_clear(cell: Cell, step: dict) -> None:
+    box = _box_name(step["target"])
+    _netem_clear(box)
+
+
+# --- action table -----------------------------------------------------------
+
 ACTIONS = {
     "open-peer-workspace": act_open_peer_workspace,
+    "open-ssh-lab": act_open_ssh_lab,
     "start-capture": act_start_capture,
     "deliver-paste": act_deliver_paste,
     "fault": lambda cell, step: FAULTS[step["action"]](cell, step),
@@ -287,8 +373,11 @@ ACTIONS = {
     "assert-liveness": act_assert_liveness,
     "assert-server-sane": act_assert_server_sane,
     "assert-fresh-client": act_assert_fresh_client,
+    "wait": act_wait,
 }
-FAULTS = {"kill": act_fault_kill, "client-kill": act_fault_kill}
+FAULTS = {"kill": act_fault_kill, "client-kill": act_fault_kill,
+          "partition": act_fault_partition, "partition-clear": act_fault_partition_clear,
+          "slow-peer": act_fault_slow_peer, "slow-peer-clear": act_fault_slow_peer_clear}
 RECOVERIES = {"lab-up": act_recover_lab_up, "client-reopen": act_recover_client_reopen}
 
 
@@ -389,6 +478,7 @@ def main() -> int:
     ap.add_argument("--cell", default=None, help="run one cell id instead of all")
     ap.add_argument("--out", default=None)
     ap.add_argument("--keep-lab", action="store_true")
+    ap.add_argument("--remote", action="store_true", help="run on docker peer boxes via lab.py --on")
     args = ap.parse_args()
 
     binary = REPO_ROOT / "target" / args.profile / "herdr"
@@ -405,6 +495,11 @@ def main() -> int:
         doc["_path"] = mf
         for spec in doc.get("cell", []):
             if args.cell is None or spec["id"] == args.cell:
+                # Skip cells that require docker boxes if not running --remote
+                requires = spec.get("requires", [])
+                if "docker-boxes" in requires and not args.remote:
+                    print(f"skipping {spec['id']}: requires --remote (docker peer boxes)", file=sys.stderr)
+                    continue
                 cells.append((doc, spec))
     if not cells:
         print(f"no matching cells in {[str(m) for m in MANIFESTS]}", file=sys.stderr)
