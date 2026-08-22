@@ -9,9 +9,13 @@ Baselines live in lab/baselines/<workload>-<concurrency>.json. When none exists,
 the run is recorded as `no-baseline` and the envelope is written as the new
 baseline candidate (committed by hand after review).
 
+Baselines live in lab/baselines/<profile>/<workload>-<concurrency>.json so a
+debug number can never masquerade as a release finding (and vice versa).
+
 Usage:
     uv run lab/runners/bench_baseline.py api --at 32 [--seconds 4]
-    uv run lab/runners/bench_baseline.py output --at 15 [--accept]  # overwrite baseline
+    uv run lab/runners/bench_baseline.py output --at 15 [--profile release]
+    uv run lab/runners/bench_baseline.py output --at 15 --accept   # overwrite baseline
 """
 
 # /// script
@@ -58,16 +62,22 @@ def file_sha(path: Path) -> str:
     return sha(path.read_bytes())
 
 
-def binary_for(profile: str) -> tuple[Path, bool]:
+def binary_for(profile: str) -> Path:
     binary = REPO_ROOT / "target" / profile / "herdr"
     if not binary.exists():
         print(f"no herdr binary at {binary}; build first", file=sys.stderr)
         raise SystemExit(2)
-    return binary, profile == "release"
+    return binary
 
 
-def run_stress(workload: str, at: int, seconds: int | None) -> tuple[Path, dict]:
-    cmd = ["uv", "run", "--script", str(STRESS), "run", workload, "--at", str(at)]
+# Workloads whose report rows key on a column other than concurrency/panes/clients.
+ROW_KEYS = ("concurrency", "panes", "clients", "rounds", "events", "peer_panes")
+
+
+def run_stress(workload: str, at: int, seconds: int | None,
+               binary: Path) -> tuple[Path, dict]:
+    cmd = ["uv", "run", "--script", str(STRESS), "run", workload,
+           "--at", str(at), "--bin", str(binary)]
     if seconds:
         cmd += ["--seconds", str(seconds)]
     before = set((REPO_ROOT / "peer-test" / "evidence").glob("stress-*"))
@@ -79,6 +89,17 @@ def run_stress(workload: str, at: int, seconds: int | None) -> tuple[Path, dict]
         raise SystemExit(f"stress.py produced no evidence directory (exit {proc.returncode})")
     report_path = new_dirs[-1] / "report.json"
     report = json.loads(report_path.read_text())
+
+    # Guard against the exact failure AGENTS.md documents: a release finding
+    # stated from debug numbers. stress.py stamps the profile it measured;
+    # refuse to proceed if the harness somehow ran the wrong binary.
+    measured_profile = report.get("profile")
+    expected_profile = binary.parent.name
+    if measured_profile != expected_profile:
+        raise SystemExit(
+            f"profile mismatch: asked for {expected_profile} but stress.py "
+            f"measured {measured_profile!r} ({binary}); refusing to grade or baseline"
+        )
     return report_path, report
 
 
@@ -110,16 +131,15 @@ def main() -> int:
     args = ap.parse_args()
 
     started = time.time()
-    binary, _is_release = binary_for(args.profile)
-    report_path, report = run_stress(args.workload, args.at, args.seconds)
+    binary = binary_for(args.profile)
+    report_path, report = run_stress(args.workload, args.at, args.seconds, binary)
 
-    # Workloads key their rows differently: api/churn by concurrency, the rest by
-    # pane/client/round counts. Match on whichever count column the row carries.
-    row = next((r for r in report["rows"] if r.get("concurrency") == args.at
-                or r.get("panes") == args.at
-                or r.get("clients") == args.at), None)
+    # Match the report row on whichever count column the workload carries
+    # (concurrency for api/churn, panes/clients/rounds/events/peer_panes elsewhere).
+    row = next((r for r in report["rows"]
+                if any(r.get(key) == args.at for key in ROW_KEYS)), None)
     if row is None:
-        raise SystemExit(f"no report row for concurrency {args.at}")
+        raise SystemExit(f"no report row for cardinality {args.at} (keys checked: {ROW_KEYS})")
 
     out_dir = LAB_ROOT / "artifacts" / f"bench-{args.workload}-{args.at}-{time.strftime('%Y%m%dT%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +161,8 @@ def main() -> int:
         verdict="pass", family="benchmark",
     )
 
-    baseline_path = LAB_ROOT / "baselines" / f"{args.workload}-{args.at}.json"
+    # Baselines are per-profile: lab/baselines/<profile>/<workload>-<at>.json.
+    baseline_path = LAB_ROOT / "baselines" / args.profile / f"{args.workload}-{args.at}.json"
     baseline = None
     if baseline_path.exists():
         baseline = json.loads(baseline_path.read_text())
@@ -175,10 +196,11 @@ def main() -> int:
                 m["name"]: {"cliff": 1.0, "band": 0.25} for m in metrics
             },
         }
-        baseline_path.parent.mkdir(exist_ok=True)
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
         baseline_path.write_text(json.dumps(baseline_doc, indent=2, sort_keys=True) + "\n")
         print(f"baseline written: {baseline_path}")
-    elif baseline.get("binary_hash") != file_sha(binary) or baseline.get("profile") != args.profile:
+    elif (baseline.get("binary_hash") != file_sha(binary)
+          or baseline.get("profile") != args.profile):
         # D7: comparison is refused, not warned, on provenance mismatch.
         status = "refused-provenance-mismatch"
         regressions = []

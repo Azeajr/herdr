@@ -100,6 +100,46 @@ what it is and what it needs; none is designed yet.
   policy: re-accept on every upstream rebase? Only on suspicion? Document it
   here once decided.
 
+### Baseline policy (adopted 2026-08-22)
+
+**Layout.** Baselines live at `lab/baselines/<profile>/<workload>-<at>.json`.
+A debug number can never be graded against a release baseline or vice versa;
+the runner also cross-checks the profile stress.py *measured* against the
+profile it was *asked* for and refuses on mismatch (the harness defect where
+`--profile release` still measured the debug binary is closed).
+
+**When a baseline may be refreshed** — all of the following must hold:
+
+1. **Legitimate cause**, one of:
+   - an upstream rebase or local herdr change that plausibly moves the metric
+     (the commit touching a multiplicative path is the trigger);
+   - a harness/measurement change (different workload parameters, profiler
+     window, machine) that makes old numbers non-comparable;
+   - the baseline itself is proven wrong (measured in the wrong profile, on a
+     busy machine, with a harness defect now fixed).
+2. **The envelope trail proves it.** A refresh is `--accept` on a run whose
+   envelope is committed under `lab/artifacts/` with verdict `pass` and
+   baseline status recorded; the commit message names the cause (1) and cites
+   the run_id.
+3. **No red left behind.** A cliff regression may never be cleared by
+   refreshing the baseline in the same change that introduced it. First
+   investigate; if the regression is genuine herdr behavior, it is either
+   fixed or explicitly accepted in a decision note — the baseline then
+   refreshes in a *separate* commit referencing that note.
+
+**When baselines may NOT be refreshed:**
+
+- to make a red cell green without a cause from (1);
+- on provenance mismatch — a mismatch is `refused`, and the fix is re-running
+  with the matching binary/profile, not re-baselining;
+- silently: a baseline file change without an envelope + cause in its commit
+  message is review-blocking.
+
+**Cadence.** No scheduled re-accept. Debug baselines are working numbers;
+release baselines are the authoritative ones for findings and are refreshed
+only per the rules above — typically after an upstream rebase that touches
+`src/render`, `src/terminal`, `src/pane`, or the client fanout paths.
+
 ### Fault injection expansion
 
 - **Network partition cells** via tc/netem in the peer-test Docker boxes:
