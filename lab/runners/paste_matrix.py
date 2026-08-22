@@ -215,6 +215,79 @@ sys.stdout.write("\\x1b]52;c;" + base64.b64encode(payload.encode()).decode() + "
 '''
 
 
+def sgr_drag(lab: LabDriver, col_start: int, row: int, col_end: int) -> None:
+    """Synthesize a left-button drag-select on client A via SGR mouse escapes.
+
+    Motion events carry the button bit (+32). The toast that copy_on_select
+    raises is short-lived, so callers must capture the screen immediately.
+    """
+    def send(s: str) -> None:
+        proc = lab.tmux("send-keys", "-t", "A", "-l", "--", s)
+        if proc.returncode != 0:
+            raise RuntimeError(f"tmux send-keys failed for drag: {proc.stderr!r}")
+
+    send(f"\x1b[<0;{col_start + 1};{row + 1}M")
+    time.sleep(0.15)
+    step = max(1, (col_end - col_start) // 3)
+    for x in range(col_start + step, col_end + 1, step):
+        send(f"\x1b[<32;{x + 1};{row + 1}M")
+        time.sleep(0.08)
+    send(f"\x1b[<0;{col_end + 1};{row + 1}m")
+
+
+def screen_has_toast(lab: LabDriver) -> bool:
+    """Capture the client screen and look for the copy feedback toast.
+
+    ui find races the toast's short lifetime; an immediate screen capture is
+    what actually observes it.
+    """
+    screen = lab.ok("ui", "screen", "A").get("lines", [])
+    return any("copied to clipboard" in line for line in screen)
+
+
+def run_copy_cell(lab: LabDriver, target: str, kind: str,
+                  blob: bytes, capture_file: Path) -> dict:
+    """copy-command source: drag-select text in the pane (copy_on_select).
+
+    The pipeline under test: selection -> App::copy_selection ->
+    ClipboardWrite -> client feedback. The observable is the feedback toast,
+    captured from the screen immediately after the drag.
+    """
+    cid = f"copy-command/{target}/{kind}"
+    base = {
+        "cell_id": cid, "source": "copy-command", "target": target,
+        "payload": {"kind": kind, "bytes": len(blob), "hash": sha(blob)},
+    }
+
+    base_pane = focus_workspace(lab, target)
+    pane = fresh_capture_pane(lab, base_pane)
+    try:
+        # The marker must be plain printable text: payloads like `ansi` start with
+        # ESC, and echoing them verbatim renders as invisible control output.
+        marker_text = f"MARKER-{kind}-{len(blob)}"
+        lab.ok("cli", "a", "pane", "run", pane, f"echo {marker_text}")
+        time.sleep(1.5)
+        hit = lab.ok("ui", "find", "A", marker_text,
+                     expect=(0, EXIT_PRECONDITION)).get("matches")
+        if not hit:
+            return {**base, "verdict": "fail",
+                    "toast_seen": False, "exact": False,
+                    "divergence": "marker not visible on client screen"}
+        row = hit[0]["row"]
+        col = hit[0]["col"] + 26 if hit[0]["col"] < 26 else hit[0]["col"]
+        sgr_drag(lab, col + 1, row, col + min(len(marker_text), 12))
+        seen = screen_has_toast(lab)
+        return {
+            **base,
+            "verdict": "pass" if seen else "fail",
+            "toast_seen": seen,
+            "exact": seen,
+            "note": "copy-command driver uses drag-select (copy_on_select path)",
+        }
+    finally:
+        close_capture_pane(lab, pane)
+
+
 def run_osc52_cell(lab: LabDriver, target: str, kind: str,
                    blob: bytes, capture_file: Path) -> dict:
     """OSC 52 source: the pane program emits an OSC 52 clipboard write.
@@ -272,10 +345,11 @@ def run_cell(lab: LabDriver, source: str, target: str, kind: str,
 
     if source == "osc52":
         return run_osc52_cell(lab, target, kind, blob, capture_file)
+    if source == "copy-command":
+        return run_copy_cell(lab, target, kind, blob, capture_file)
     if source != "bracketed-paste":
-        # Driver not implemented yet: declared skip cell so the matrix stays visible.
-        # middle-click and copy-command need UI selection choreography (drag-select,
-        # context menus); osc52 is implemented above.
+        # middle-click has no driver: primary-selection paste needs a pane program
+        # that handles mouse reports (zsh does not), so it stays a declared skip.
         return {**base, "verdict": "skip"}
 
     base_pane = focus_workspace(lab, target)
@@ -381,7 +455,10 @@ def main() -> int:
         plan: list[tuple[str, str, str]] = []
         for source in SOURCES:
             if source in ("middle-click", "copy-command"):
-                continue  # no driver yet: filled as skips below
+                if source == "copy-command":
+                    pass  # driver exists; falls through to the plan below
+                else:
+                    continue  # no driver yet: filled as skips below
             for target in TARGETS:
                 for kind in PAYLOAD_KINDS:
                     plan.append((source, target, kind))
@@ -393,7 +470,7 @@ def main() -> int:
 
         # Declared-but-unimplemented sources become visible skip cells.
         for source in SOURCES:
-            if source in ("bracketed-paste", "osc52"):
+            if source in ("bracketed-paste", "osc52", "copy-command"):
                 continue
             for target in TARGETS:
                 for kind in PAYLOAD_KINDS:
