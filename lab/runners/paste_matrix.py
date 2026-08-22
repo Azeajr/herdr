@@ -41,6 +41,8 @@ sys.path.insert(0, str(LAB_ROOT))
 import _common  # noqa: E402
 from lablib.envelope import Envelope, Provenance, validate_envelope  # noqa: E402
 
+EXIT_OK, EXIT_PRECONDITION, EXIT_TIMEOUT = 0, 2, 3
+
 SOURCES = ["osc52", "bracketed-paste", "middle-click", "copy-command"]
 TARGETS = ["local:a:p1", "peer:b:w1:p1"]
 PAYLOAD_KINDS = ["tiny", "large", "multibyte", "ansi"]
@@ -147,29 +149,48 @@ def open_peer_workspace(lab: LabDriver) -> None:
     raise RuntimeError(f"no peer-backed pane after opening workspace: {lab.ok('state', 'a')}")
 
 
-def focus_target(lab: LabDriver, target: str) -> str:
-    """Make the target pane the focused pane; pastes land where focus is.
+def focus_workspace(lab: LabDriver, target: str) -> str:
+    """Focus the target's workspace and return its base pane id.
 
     Local cells focus the local workspace; peer cells focus the peer workspace by
-    clicking its sidebar row. Returns the target pane id.
+    clicking its sidebar row. The base pane is what every cell then splits.
     """
     if target.startswith("local:"):
         lab.ok("cli", "a", "workspace", "focus", "w1")
-        pane = "w1:p1"
-    else:
-        # The peer workspace's sidebar row is labelled with the peer's root pane handle.
-        lab.ok("ui", "click", "A", "--text", "\u25be")
-        lab.ok("ui", "wait", "A", "--contains", "open workspace on", "--timeout", 15)
-        lab.ok("ui", "click", "A", "--text", "remote-ws")
-        time.sleep(1.0)
+        return "w1:p1"
+    lab.ok("ui", "click", "A", "--text", "\u25be")
+    lab.ok("ui", "wait", "A", "--contains", "open workspace on", "--timeout", 15)
+    lab.ok("ui", "click", "A", "--text", "remote-ws")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
         panes = [p for p in lab.ok("state", "a")["panes"] if p.get("peer") == "b"]
-        if not panes:
-            raise RuntimeError(f"peer pane missing when focusing: {lab.ok('state', 'a')}")
-        pane = panes[0]["pane_id"]
+        if panes:
+            return panes[0]["pane_id"]
+        time.sleep(0.5)
+    raise RuntimeError(f"peer pane missing when focusing: {lab.ok('state', 'a')}")
+
+
+def fresh_capture_pane(lab: LabDriver, base_pane: str) -> str:
+    """Split off a fresh pane, focused, for one cell's capture.
+
+    A cell must never reuse a pane across cells: the stty raw capture leaves the
+    pane's shell tty raw, and interleaved `pane run` command text then corrupts
+    later cells (the failure that produced the retracted wedge finding). Each
+    cell gets its own split, torn down after reading.
+    """
+    r = lab.ok("cli", "a", "pane", "split", base_pane,
+               "--direction", "down", "--ratio", "0.5", "--focus")
+    pane_id = r["result"]["pane"]["pane_id"]
     focused = next((p for p in lab.ok("state", "a")["panes"] if p.get("focused")), None)
-    if not focused or focused["pane_id"] != pane:
-        raise RuntimeError(f"focus did not land on {pane}: {focused}")
-    return pane
+    if not focused or focused["pane_id"] != pane_id:
+        raise RuntimeError(f"split pane {pane_id} did not take focus: {focused}")
+    return pane_id
+
+
+def close_capture_pane(lab: LabDriver, pane_id: str) -> None:
+    lab.ok("cli", "a", "pane", "run", pane_id, "exit",
+           expect=(0, EXIT_PRECONDITION))
+    time.sleep(1.0)
 
 
 def deliver(lab: LabDriver, wire: bytes) -> None:
@@ -183,7 +204,7 @@ def deliver(lab: LabDriver, wire: bytes) -> None:
 
 def run_cell(lab: LabDriver, source: str, target: str, kind: str,
              blob: bytes, capture_file: Path) -> dict:
-    """Deliver one paste into the target pane; hash what the pane process received."""
+    """Deliver one paste into a fresh target pane; hash what the pane received."""
     cid = f"{source}/{target}/{kind}"
     base = {
         "cell_id": cid, "source": source, "target": target,
@@ -194,8 +215,9 @@ def run_cell(lab: LabDriver, source: str, target: str, kind: str,
         # Driver not implemented yet: declared skip cell so the matrix stays visible.
         return {**base, "verdict": "skip"}
 
-    pane = focus_target(lab, target)
-    # Capture exactly len(blob) bytes inside the target pane. stty raw avoids the
+    base_pane = focus_workspace(lab, target)
+    pane = fresh_capture_pane(lab, base_pane)
+    # Capture exactly len(blob) bytes inside the fresh pane. stty raw avoids the
     # kernel's canonical-mode 4096-char line limit (longer lines are discarded);
     # head -c exits on byte count so no EOF keystroke is needed. herdr parses the
     # bracketed-paste markers before they reach the pane, so the pane's PTY carries
@@ -203,16 +225,19 @@ def run_cell(lab: LabDriver, source: str, target: str, kind: str,
     lab.ok("cli", "a", "pane", "run", pane,
            f"stty raw -echo; head -c {len(blob)} > {capture_file}")
 
-    time.sleep(1.5)  # let head start consuming stdin
-    deliver(lab, BRACKET_START + blob + BRACKET_END)
-    deadline = time.monotonic() + 20
-    got = b""
-    while time.monotonic() < deadline:
-        got = capture_file.read_bytes() if capture_file.exists() else b""
-        if len(got) >= len(blob):
-            break
-        time.sleep(0.5)
-    got = got[:len(blob)]
+    try:
+        time.sleep(1.5)  # let head start consuming stdin
+        deliver(lab, BRACKET_START + blob + BRACKET_END)
+        deadline = time.monotonic() + 20
+        got = b""
+        while time.monotonic() < deadline:
+            got = capture_file.read_bytes() if capture_file.exists() else b""
+            if len(got) >= len(blob):
+                break
+            time.sleep(0.5)
+        got = got[:len(blob)]
+    finally:
+        close_capture_pane(lab, pane)
     return {
         **base,
         "verdict": "pass" if got == blob else "fail",
