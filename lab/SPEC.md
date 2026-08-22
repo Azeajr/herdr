@@ -72,3 +72,54 @@ differently than regressions in tier 1.
 2. Paste-matrix manifest + runner producing envelopes; local-oracle diff view.
 3. Benchmark manifests porting stress.py workloads onto cliff/band baselines.
 4. Fault toolkit wired into manifests (kill/partition during large paste).
+
+All four shipped 2026-08-21/22. See the git log for the implementation
+commits and `lab/artifacts/` (local) for the verifying envelopes.
+
+## Future work
+
+Backlog of natural next steps, in rough priority order. Each item names
+what it is and what it needs; none is designed yet.
+
+### Paste matrix completion
+
+- **middle-click driver.** Primary-selection paste needs a pane program that
+  handles mouse reports; zsh does not. Options: run a small helper (e.g. a
+  Python reader with mouse mode enabled) as the capture pane's child, or test
+  against vim/helix. Blocked on choosing the pane app.
+
+### Performance work (the lab's second consumer)
+
+- **Release-profile baselines.** Current committed baselines are debug.
+  Capture release baselines for the same workload/cardinality set so perf
+  findings can be stated in release terms (AGENTS.md: prefer release).
+- **More cardinalities.** output/memory at 50, api at 256, fanout/churn/input
+  workloads — stress.py already supports them; each just needs a baseline
+  capture (`bench_baseline.py <workload> --at N`).
+- **Baseline refresh ritual.** Baselines rot as herdr changes. Decide the
+  policy: re-accept on every upstream rebase? Only on suspicion? Document it
+  here once decided.
+
+### Fault injection expansion
+
+- **Network partition cells** via tc/netem in the peer-test Docker boxes:
+  partition a↔b during an active paste and idle, verify reconnect and no
+  corruption. Needs the boxes.sh topology wired into a lab runner.
+- **Slow-peer cells**: netem delay/loss on b; characterize queue behavior and
+  the "peer stopped reading" abandonment path in remote.rs.
+- **Client-kill cell**: SIGKILL client A mid-paste; verify server-side pane
+  state stays sane and a fresh client attaches cleanly.
+- **Disk-fill cell**: fill b's state disk during persist; verify graceful
+  degradation.
+
+### Harness ergonomics
+
+- **Cron/watchdog mode**: run the matrix + benchmarks on a schedule (or after
+  each upstream rebase) and deliver red envelopes to chat. The envelope JSON
+  is already LLM-readable; this makes regression review automatic.
+- **Evidence bundling on failure**: mirror peer-test's conftest pattern —
+  freeze an evidence bundle automatically when any cell fails, instead of
+  only keeping artifacts on --keep-lab.
+- **Manifest-driven fault choreography**: extend TOML manifests to compose
+  faults with scenario phases (the kill-peer runner currently hardcodes its
+  sequence in Python).
