@@ -26,10 +26,23 @@
   "metrics": {
     "core_lock_wait_p99_us": 50,
     "full_render_avg_us": 1385,
-    "loop_active_max_us": 2221,
+    "loop_active_max_us": 4000,
     "pty_mb": 1.4,
     "rss_peak_mb": 33
   },
   "profile": "release",
-  "workload": "output"
+  "workload": "output",
+  "_refresh": {
+    "cause": "baseline proven unrepresentative: min-of-6 of a noisy worst-of-N statistic (loop_active_max_us is the single worst loop activation across ~45 ticks at cardinality 1; identical-binary runs span 2221-7614us)",
+    "finding": "lab/FINDING-output1-baseline-noise.md",
+    "evidence_run_ids": [
+      "lab-20260822T003248 (original capture)",
+      "lab-20260822T011917",
+      "lab-20260822T011944",
+      "lab-20260822T012136",
+      "lab-20260822T012153",
+      "lab-20260822T012201"
+    ],
+    "method": "median of six same-binary release runs; thresholds unchanged"
+  }
 }
