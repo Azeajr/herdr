@@ -1,0 +1,35 @@
+{
+  "_thresholds": {
+    "core_lock_wait_p99_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "full_render_avg_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "loop_active_max_us": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "pty_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    },
+    "rss_peak_mb": {
+      "band": 0.25,
+      "cliff": 1.0
+    }
+  },
+  "binary_hash": "218db7d2558a9d9186f69c9a9042726888f8bdc40e86b5d1b7cb52a639864886",
+  "concurrency": 15,
+  "metrics": {
+    "core_lock_wait_p99_us": 50,
+    "full_render_avg_us": 32576,
+    "loop_active_max_us": 1231649,
+    "pty_mb": 21.3,
+    "rss_peak_mb": 185
+  },
+  "profile": "debug",
+  "workload": "output"
+}
