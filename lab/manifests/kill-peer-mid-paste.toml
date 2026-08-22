@@ -1,0 +1,29 @@
+# Fault injection — kill peer mid-paste (deliverable #4).
+
+[scenario]
+id = "fault-kill-peer-mid-paste"
+family = "fault"
+determinism_tier = "seeded-simulated"
+
+[topology]
+servers = ["a", "b"]
+peer = "a->b"
+
+[[fault]]
+at = "one third through the paste stream"
+do = "kill"
+target = "server-b"
+params = { signal = "SIGKILL" }
+
+[recovery]
+method = "lab.py up (reboots the dead instance, re-wires the peer)"
+assertions = [
+  "server-b running again after reboot",
+  "peer view reconnected",
+  "paste into a fresh peer pane works after recovery",
+]
+
+[characterization]
+note = """In-flight paste bytes across the SIGKILL are recorded as data
+(interrupted_capture_bytes/hash in the envelope body), not asserted:
+what survives an abrupt kill is precisely what this cell characterizes."""
