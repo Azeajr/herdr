@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "herdr-lab/envelope-v1",
+  "title": "Herdr Lab result envelope v1",
+  "type": "object",
+  "required": ["envelope_version", "run_id", "provenance", "verdict", "artifacts"],
+  "properties": {
+    "envelope_version": { "const": 1 },
+    "run_id": { "type": "string", "description": "Unique per execution, e.g. lab-<ts>-<rand>" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "provenance": {
+      "type": "object",
+      "required": ["binary_path", "binary_hash", "profile", "host", "scenario_id", "determinism_tier", "parameters"],
+      "properties": {
+        "binary_path": { "type": "string" },
+        "binary_hash": { "type": "string", "description": "sha256 of the herdr binary under test" },
+        "profile": { "enum": ["debug", "release"] },
+        "host": {
+          "type": "object",
+          "properties": {
+            "hostname": { "type": "string" },
+            "os": { "type": "string" },
+            "arch": { "type": "string" }
+          }
+        },
+        "scenario_id": { "type": "string" },
+        "manifest_ref": { "type": "string", "description": "path to TOML manifest, if any" },
+        "manifest_hash": { "type": "string" },
+        "determinism_tier": { "enum": ["deterministic", "seeded-simulated", "live-real"] },
+        "seed": { "type": ["integer", "null"] },
+        "parameters": {
+          "type": "object",
+          "description": "Geometry/cardinality and scenario parameters: panes, tabs, workspaces, clients, payload size, topology, etc.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "verdict": {
+      "enum": ["pass", "fail", "error", "refused"],
+      "description": "refused = comparison/attempt not made, e.g. provenance mismatch against baseline"
+    },
+    "family": {
+      "enum": ["functional", "characterization", "stress", "benchmark", "fault"],
+      "description": "Which family body to expect"
+    },
+    "body": {
+      "oneOf": [
+        { "$ref": "#/$defs/functionalBody" },
+        { "$ref": "#/$defs/characterizationBody" },
+        { "$ref": "#/$defs/stressBody" },
+        { "$ref": "#/$defs/benchmarkBody" },
+        { "$ref": "#/$defs/faultBody" }
+      ]
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "kind"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "enum": ["log", "screen", "timeline", "state", "metric", "screenshot", "other"] },
+          "bytes": { "type": "integer" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  },
+  "$defs": {
+    "assertionResult": {
+      "type": "object",
+      "required": ["name", "verdict"],
+      "properties": {
+        "name": { "type": "string" },
+        "verdict": { "enum": ["pass", "fail", "skip"] },
+        "expected": {},
+        "actual": {},
+        "detail": { "type": "string" }
+      }
+    },
+    "functionalBody": {
+      "type": "object",
+      "required": ["assertions"],
+      "properties": {
+        "assertions": { "type": "array", "items": { "$ref": "#/assertionResult" } }
+      }
+    },
+    "characterizationBody": {
+      "type": "object",
+      "required": ["cells"],
+      "properties": {
+        "cells": {
+          "type": "array",
+          "description": "Paste-matrix cells; each compared against its local-oracle counterpart",
+          "items": {
+            "type": "object",
+            "required": ["cell_id", "source", "target", "payload", "verdict"],
+            "properties": {
+              "cell_id": { "type": "string" },
+              "source": { "enum": ["osc52", "bracketed-paste", "middle-click", "copy-command"] },
+              "target": { "type": "string", "description": "e.g. local:p1 or peer:a->b:w1:p1" },
+              "payload": {
+                "type": "object",
+                "properties": {
+                  "kind": { "enum": ["tiny", "large", "multibyte", "ansi"] },
+                  "bytes": { "type": "integer" },
+                  "hash": { "type": "string", "description": "sha256 of expected payload" }
+                }
+              },
+              "oracle_cell_id": { "type": ["string", "null"], "description": "local counterpart cell used as reference" },
+              "divergence": { "type": ["string", "null"], "description": "how the remote result differs from the oracle, null when equal" },
+              "verdict": { "enum": ["pass", "fail", "skip"] },
+              "assertions": { "type": "array", "items": { "$ref": "#/assertionResult" } }
+            }
+          }
+        }
+      }
+    },
+    "metricValue": {
+      "type": "object",
+      "required": ["name", "value", "unit"],
+      "properties": {
+        "name": { "type": "string" },
+        "value": { "type": "number" },
+        "unit": { "type": "string" },
+        "samples": { "type": "array", "items": { "type": "number" } },
+        "cardinality": { "type": "object", "description": "geometry this sample set was taken at" }
+      }
+    },
+    "stressBody": {
+      "type": "object",
+      "required": ["workload", "metrics"],
+      "properties": {
+        "workload": { "type": "string" },
+        "metrics": { "type": "array", "items": { "$ref": "#/metricValue" } },
+        "observations": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "benchmarkBody": {
+      "type": "object",
+      "required": ["metrics", "baseline"],
+      "properties": {
+        "metrics": { "type": "array", "items": { "$ref": "#/metricValue" } },
+        "baseline": {
+          "type": "object",
+          "description": "Comparison outcome vs committed baseline snapshot",
+          "required": ["ref", "status"],
+          "properties": {
+            "ref": { "type": "string", "description": "path/id of baseline envelope snapshot" },
+            "status": { "enum": ["compared", "no-baseline", "refused-provenance-mismatch"] },
+            "regressions": {
+              "type": "array",
+              "description": "metrics beyond cliff (hard) or band (drift)",
+              "items": {
+                "type": "object",
+                "required": ["metric", "severity"],
+                "properties": {
+                  "metric": { "type": "string" },
+                  "severity": { "enum": ["cliff", "band"] },
+                  "baseline_value": { "type": "number" },
+                  "current_value": { "type": "number" },
+                  "delta_pct": { "type": "number" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "faultBody": {
+      "type": "object",
+      "required": ["faults", "recovery_assertions"],
+      "properties": {
+        "faults": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["at", "do", "target"],
+            "properties": {
+              "at": { "type": "string", "description": "offset e.g. t+2s or event anchor" },
+              "do": { "enum": ["kill", "sigstop", "resume", "close-socket", "netem-partition", "netem-delay", "disk-fill"] },
+              "target": { "type": "string" },
+              "params": { "type": "object" }
+            }
+          }
+        },
+        "recovery_assertions": { "type": "array", "items": { "$ref": "#/assertionResult" } }
+      }
+    }
+  }
+}
