@@ -38,9 +38,15 @@ cells. Candidates:
 - Have the capture program itself set raw mode on its own stdin via a tiny
   script (`python3 -c 'import tty,...'`) instead of touching the shell's tty.
 
-## Disposition
+## Disposition — RESOLVED 2026-08-21
 
-- FINDING-peer-paste-wedge.md is retracted by this file.
-- The paste-matrix runner needs the capture redesign above before its peer
-  cells can be trusted. Local cells remain valid (they passed byte-exact).
-- No herdr code change is indicated by any evidence gathered so far.
+Adopted fix: per-cell capture panes. Each cell splits a fresh pane off the
+target workspace's base pane with `pane split --focus`, runs the capture
+inside it, and tears the pane down after reading. The pane's shell tty is
+never reused across cells, so the corruption mode above cannot recur.
+
+Result: all 8 implemented bracketed-paste cells (local and peer ×
+tiny/large/multibyte/ansi) pass byte-exact through the local oracle in a
+single 58s run (envelope `lab-20260821T214904-aff879dc`, commit 803bddd9).
+
+No herdr code change was ever indicated by this line of investigation.
