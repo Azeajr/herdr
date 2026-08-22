@@ -81,24 +81,32 @@ commits and `lab/artifacts/` (local) for the verifying envelopes.
 Backlog of natural next steps, in rough priority order. Each item names
 what it is and what it needs; none is designed yet.
 
+**Status as of 2026-08-22 (post-backlog-sweep commits 678d3d00, f606234a,
+5a4a7c0e, d38a7c0e):** release baselines for 15 workload/cardinality cells
+are committed under `lab/baselines/release/`; the baseline refresh policy is
+adopted (see below); the fault suite is manifest-driven
+(`manifests/fault-suite.toml` + `runners/fault_suite.py`) with kill-peer,
+client-kill, partition, slow-peer and evidence-bundle-test cells; evidence
+bundling on failure is automatic (`runners/evidence.py`). Remaining below.
+
 ### Paste matrix completion
 
 - **middle-click driver.** Primary-selection paste needs a pane program that
   handles mouse reports; zsh does not. Options: run a small helper (e.g. a
   Python reader with mouse mode enabled) as the capture pane's child, or test
   against vim/helix. Blocked on choosing the pane app.
+- **Partition/slow-peer fault cells need the Docker boxes.** The manifests
+  exist in `fault-suite.toml` (cells 3–4) but only run with
+  `fault_suite.py --remote`; local socket peering cannot netem. Verify them
+  against boxes.sh end to end at least once.
 
 ### Performance work (the lab's second consumer)
 
-- **Release-profile baselines.** Current committed baselines are debug.
-  Capture release baselines for the same workload/cardinality set so perf
-  findings can be stated in release terms (AGENTS.md: prefer release).
-- **More cardinalities.** output/memory at 50, api at 256, fanout/churn/input
-  workloads — stress.py already supports them; each just needs a baseline
-  capture (`bench_baseline.py <workload> --at N`).
-- **Baseline refresh ritual.** Baselines rot as herdr changes. Decide the
-  policy: re-accept on every upstream rebase? Only on suspicion? Document it
-  here once decided.
+- **Debug baselines beyond api/memory/output 1+15.** Release covers 15
+  cells; debug has 6. Capture the rest if debug comparisons are wanted.
+- **Baseline drift watch.** Release baselines are authoritative; re-check
+  them after upstream rebases touching src/render, src/terminal, src/pane,
+  or client fanout paths (per the adopted policy below).
 
 ### Baseline policy (adopted 2026-08-22)
 
@@ -142,13 +150,8 @@ only per the rules above — typically after an upstream rebase that touches
 
 ### Fault injection expansion
 
-- **Network partition cells** via tc/netem in the peer-test Docker boxes:
-  partition a↔b during an active paste and idle, verify reconnect and no
-  corruption. Needs the boxes.sh topology wired into a lab runner.
-- **Slow-peer cells**: netem delay/loss on b; characterize queue behavior and
-  the "peer stopped reading" abandonment path in remote.rs.
-- **Client-kill cell**: SIGKILL client A mid-paste; verify server-side pane
-  state stays sane and a fresh client attaches cleanly.
+- **Verify partition/slow-peer cells against the Docker boxes** (see paste
+  matrix completion above — manifests exist, end-to-end run pending).
 - **Disk-fill cell**: fill b's state disk during persist; verify graceful
   degradation.
 
@@ -157,9 +160,3 @@ only per the rules above — typically after an upstream rebase that touches
 - **Cron/watchdog mode**: run the matrix + benchmarks on a schedule (or after
   each upstream rebase) and deliver red envelopes to chat. The envelope JSON
   is already LLM-readable; this makes regression review automatic.
-- **Evidence bundling on failure**: mirror peer-test's conftest pattern —
-  freeze an evidence bundle automatically when any cell fails, instead of
-  only keeping artifacts on --keep-lab.
-- **Manifest-driven fault choreography**: extend TOML manifests to compose
-  faults with scenario phases (the kill-peer runner currently hardcodes its
-  sequence in Python).
