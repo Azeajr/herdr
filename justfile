@@ -130,6 +130,28 @@ install:
     printf 'installed source build to %s\n' "$install_dir/herdr"
     "$install_dir/herdr" --version
 
+# Remove the fork build `just install` put at $HERDR_INSTALL_DIR (default ~/.local/bin/herdr),
+# restoring PATH to whatever packaged herdr sits behind it (e.g. /usr/bin/herdr)
+[unix]
+uninstall:
+    #!/bin/sh
+    set -eu
+    install_dir="${HERDR_INSTALL_DIR:-$HOME/.local/bin}"
+    target="$install_dir/herdr"
+    if [ ! -e "$target" ]; then
+        printf 'nothing installed at %s\n' "$target"
+        exit 0
+    fi
+    herdr server stop 2>/dev/null || true
+    rm -f "$target"
+    printf 'removed %s\n' "$target"
+    if command -v herdr >/dev/null 2>&1; then
+        printf 'herdr now resolves to %s\n' "$(command -v herdr)"
+        herdr --version
+    else
+        printf 'warning: no herdr left on PATH\n'
+    fi
+
 # Non-gating full-render scaling profile for background workspaces and active panes
 bench-render-scale:
     cargo test --release --locked --bin herdr render_scale_profile -- --ignored --nocapture --test-threads=1
