@@ -392,12 +392,31 @@ mod tests {
         (handle, seen)
     }
 
+    /// A socket path is bounded by `sun_path` — 104 bytes on macOS, where
+    /// `TMPDIR` is a ~49-character per-user directory. A nanosecond stamp and
+    /// the derived `-client.sock` sibling do not both fit behind that, so the
+    /// unique part is a per-process counter and the base falls back to `/tmp`
+    /// the way `private_runtime_dir` does. Measured against the sibling, which
+    /// is the longer of the pair.
     fn unique_socket_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}.sock", std::process::id()))
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+        let file = format!(
+            "h-{name}-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mut bases = vec![std::env::temp_dir()];
+        let short_tmp = PathBuf::from("/tmp");
+        if bases.first() != Some(&short_tmp) {
+            bases.push(short_tmp);
+        }
+
+        bases
+            .into_iter()
+            .map(|base| base.join(&file))
+            .find(|path| client_socket_for(path).as_os_str().len() <= 103)
+            .unwrap_or_else(|| panic!("no temp dir leaves room for {file} and its client sibling"))
     }
 
     /// Stands in for a peer's terminal control socket: completes the handshake,

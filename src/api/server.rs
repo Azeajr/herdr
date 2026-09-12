@@ -1062,12 +1062,17 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Sockets bound under here spend a `sun_path` budget of 104 bytes on
+    /// macOS, where `TMPDIR` already takes ~49 of them. A 19-digit nanosecond
+    /// stamp does not fit behind that; a per-process counter does.
     fn unique_test_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        std::env::temp_dir().join(format!(
+            "h-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     fn read_line(stream: &mut LocalStream) -> String {

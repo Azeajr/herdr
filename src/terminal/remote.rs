@@ -1698,6 +1698,9 @@ fn read_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_TEST_SOCKET: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn backoff_grows_then_saturates() {
@@ -1772,10 +1775,12 @@ mod tests {
 
     impl MutePeer {
         fn start(name: &str, send_frame: bool) -> Self {
+            // Short by necessity: `sun_path` is 104 bytes on macOS and `TMPDIR`
+            // there already spends ~49 of them.
             let path = std::env::temp_dir().join(format!(
-                "herdr-mute-peer-{name}-{}-{:?}.sock",
+                "hmp-{name}-{}-{}.sock",
                 std::process::id(),
-                std::thread::current().id()
+                NEXT_TEST_SOCKET.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = std::fs::remove_file(&path);
             let listener = crate::ipc::bind_local_listener(&path).expect("bind mute peer");
@@ -2684,9 +2689,9 @@ mod tests {
     #[test]
     fn connecting_to_a_peer_that_never_answers_gives_up() {
         let path = std::env::temp_dir().join(format!(
-            "herdr-silent-peer-{}-{:?}.sock",
+            "hsp-{}-{}.sock",
             std::process::id(),
-            std::thread::current().id()
+            NEXT_TEST_SOCKET.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
         let listener = crate::ipc::bind_local_listener(&path).expect("bind silent peer");
