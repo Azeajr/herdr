@@ -3074,11 +3074,22 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    // `ssh_failed_to_authenticate` runs on every platform, so its tests do too;
+    // only the way an exit status is forged differs.
     fn ssh_output(code: i32, stderr: &str) -> Output {
-        use std::os::unix::process::ExitStatusExt;
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+
         Output {
-            status: std::process::ExitStatus::from_raw(code << 8),
+            status,
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
         }
@@ -3121,6 +3132,7 @@ mod tests {
 
     /// The key text reaches the remote shell as one quoted word, so a key
     /// comment containing spaces or quotes cannot break out of the assignment.
+    #[cfg(unix)]
     #[test]
     fn key_install_script_quotes_the_key() {
         let script = peer_ssh_key_install_script("ssh-ed25519 AAAA it's mine");
@@ -3129,6 +3141,7 @@ mod tests {
 
     /// A client is named by where it runs, not by the key it currently holds,
     /// so the comment still matches after the key is regenerated.
+    #[cfg(unix)]
     #[test]
     fn key_comment_names_the_client() {
         let comment = peer_ssh_key_comment();
@@ -3139,6 +3152,7 @@ mod tests {
 
     /// `awk -v` reads a backslash in a value as an escape, and a space would
     /// split the comment across `authorized_keys` fields.
+    #[cfg(unix)]
     #[test]
     fn identity_components_drop_characters_that_would_break_the_script() {
         assert_eq!(sanitized_identity_component("a b\\c'd", "fallback"), "abcd");
@@ -3155,6 +3169,7 @@ mod tests {
 
     /// Runs the install script against a throwaway `$HOME` and reports the
     /// `authorized_keys` it left behind.
+    #[cfg(unix)]
     fn run_key_install_script(name: &str, existing: &str, key_line: &str) -> String {
         let home = std::env::temp_dir().join(format!(
             "herdr-authorized-keys-{name}-{}-{}",
@@ -3190,6 +3205,7 @@ mod tests {
 
     /// The whole point of the rewrite: a client that regenerated its key takes
     /// the entry its previous key left with it instead of adding a second one.
+    #[cfg(unix)]
     #[test]
     fn key_install_replaces_this_clients_previous_entry() {
         let comment = peer_ssh_key_comment();
@@ -3204,6 +3220,7 @@ mod tests {
 
     /// Upgrading migrates the entry older herdr versions wrote rather than
     /// leaving it beside the new one with nothing able to remove it.
+    #[cfg(unix)]
     #[test]
     fn key_install_claims_the_legacy_entry() {
         let comment = peer_ssh_key_comment();
@@ -3218,6 +3235,7 @@ mod tests {
 
     /// Another machine's herdr key names that machine, and a hand-edited line
     /// carries options herdr never writes. Neither is this client's to remove.
+    #[cfg(unix)]
     #[test]
     fn key_install_leaves_entries_it_does_not_own() {
         let comment = peer_ssh_key_comment();
@@ -3238,6 +3256,7 @@ mod tests {
 
     /// Re-running setup with the key already installed is a no-op, including
     /// when an earlier run left it under a different comment.
+    #[cfg(unix)]
     #[test]
     fn key_install_is_idempotent() {
         let comment = peer_ssh_key_comment();
@@ -3258,6 +3277,7 @@ mod tests {
     }
 
     /// A file that was never there is created rather than reported missing.
+    #[cfg(unix)]
     #[test]
     fn key_install_creates_authorized_keys() {
         let comment = peer_ssh_key_comment();
@@ -3318,6 +3338,7 @@ mod tests {
     /// that answers and then stalls is held only by this. The wait has to end
     /// when the connection it serves does, or shutdown joins a thread that is
     /// parked on a host with no reason to ever reply.
+    #[cfg(unix)]
     #[test]
     fn a_peer_ssh_wait_ends_when_the_connection_stops() {
         let running = Arc::new(AtomicBool::new(true));
@@ -3374,6 +3395,7 @@ mod tests {
     /// The cancellable path drains both pipes rather than only polling for
     /// exit: a child that fills a pipe buffer blocks until it is read, so a
     /// poll that never read would hang on output instead of on the network.
+    #[cfg(unix)]
     #[test]
     fn a_cancellable_wait_still_collects_output() {
         let running = Arc::new(AtomicBool::new(true));
@@ -3402,6 +3424,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -3480,6 +3503,7 @@ mod tests {
             remote_herdr,
             socket.clone(),
             "default".to_string(),
+            BridgeSocket::Client,
             None,
         )
         .expect("start bridge listener");
@@ -3618,6 +3642,9 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
+            identity: None,
+            batch: false,
+            running: None,
         };
         let args = ssh
             .command()
@@ -3980,6 +4007,7 @@ mod tests {
     /// A peer's two bridged sockets have to sit in the same directory under the
     /// names the server's own derivation produces, or `resolve_peer_connection`
     /// would look for the client socket somewhere nothing is listening.
+    #[cfg(unix)]
     #[test]
     fn peer_socket_names_match_the_server_derivation() {
         let dir = Path::new("/tmp/herdr-peer-1-0");
@@ -3990,6 +4018,7 @@ mod tests {
         assert_eq!(derived, dir.join(PEER_CLIENT_SOCKET_NAME));
     }
 
+    #[cfg(unix)]
     #[test]
     fn peer_socket_dir_fits_the_socket_path_budget() {
         let dir = PrivateDir(private_peer_socket_dir().expect("create peer socket dir"));
@@ -4004,6 +4033,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn private_dir_is_removed_with_its_contents() {
         let path = {

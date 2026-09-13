@@ -1246,6 +1246,10 @@ mod tests {
         ));
     }
 
+    // Unix-only because the deadline is: `set_local_stream_send_timeout`
+    // reports `Unsupported` on a Windows named pipe and the caller swallows it,
+    // so there is no bound to assert and `write_all` parks forever.
+    #[cfg(unix)]
     #[test]
     fn a_write_to_a_client_that_never_reads_gives_up_instead_of_parking() {
         // The queue bound disconnects the client, but the writer thread is

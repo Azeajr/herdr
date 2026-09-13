@@ -1062,12 +1062,17 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    /// Sockets bound under here spend a `sun_path` budget of 104 bytes on
+    /// macOS, where `TMPDIR` already takes ~49 of them. A 19-digit nanosecond
+    /// stamp does not fit behind that; a per-process counter does.
     fn unique_test_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        std::env::temp_dir().join(format!(
+            "h-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
     }
 
     fn read_line(stream: &mut LocalStream) -> String {
@@ -1194,6 +1199,24 @@ mod tests {
         });
 
         refuse_overloaded_connection(&mut server, MAX_CONCURRENT_API_CONNECTIONS);
+
+        // That drain gives up after OVERLOAD_REQUEST_DRAIN_TIMEOUT, which a
+        // loaded machine can exhaust with the request still going out. The
+        // server then drops the socket and the client sees a broken pipe; here
+        // the socket has to stay open to read the response back, so the test
+        // finishes the drain itself rather than joining a thread still parked
+        // in `write_all`.
+        let mut scratch = [0u8; 64 * 1024];
+        while !handle.is_finished() {
+            match std::io::Read::read(&mut server, &mut scratch) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
 
         let response = handle.join().expect("client finishes its request");
         assert!(response.contains("server_overloaded"), "{response}");

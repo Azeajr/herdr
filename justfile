@@ -67,11 +67,21 @@ ci filter='all()': lint
     just integration-assets-test
     just plugin-marketplace-test
 
+# The second line is the one that matters after a rebase. Windows CI runs
+# `cargo test --bin herdr`, so it compiles the unit tests too, and clippy on the
+# bin alone never sees them — a unix-only test left ungated is green here and red
+# in CI. `--profile test` builds that same unit; `check` skips the link step,
+# which is what makes it runnable from Unix at all. Warnings stay undenied
+# because CI's `cargo test` does not deny them either. It compiles those tests
+# and cannot run them, so a test that only misbehaves on Windows — one asserting
+# a bound the platform does not offer, say — still reaches CI green from here.
+
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
 windows-lint:
     rustup target add x86_64-pc-windows-msvc
     LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
+    LIBGHOSTTY_VT_SIMD=false cargo check --bin herdr --locked --target x86_64-pc-windows-msvc --profile test
 
 # Capped like the scenario suites: this is the heaviest recipe in the repo — two clippy
 # passes, a Windows-target build and the whole nextest suite. One cgroup around the lot, so
