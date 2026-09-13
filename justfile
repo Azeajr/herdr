@@ -72,7 +72,9 @@ ci filter='all()': lint
 # bin alone never sees them — a unix-only test left ungated is green here and red
 # in CI. `--profile test` builds that same unit; `check` skips the link step,
 # which is what makes it runnable from Unix at all. Warnings stay undenied
-# because CI's `cargo test` does not deny them either.
+# because CI's `cargo test` does not deny them either. It compiles those tests
+# and cannot run them, so a test that only misbehaves on Windows — one asserting
+# a bound the platform does not offer, say — still reaches CI green from here.
 
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
 [unix]
