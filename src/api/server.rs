@@ -1200,6 +1200,24 @@ mod tests {
 
         refuse_overloaded_connection(&mut server, MAX_CONCURRENT_API_CONNECTIONS);
 
+        // That drain gives up after OVERLOAD_REQUEST_DRAIN_TIMEOUT, which a
+        // loaded machine can exhaust with the request still going out. The
+        // server then drops the socket and the client sees a broken pipe; here
+        // the socket has to stay open to read the response back, so the test
+        // finishes the drain itself rather than joining a thread still parked
+        // in `write_all`.
+        let mut scratch = [0u8; 64 * 1024];
+        while !handle.is_finished() {
+            match std::io::Read::read(&mut server, &mut scratch) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+
         let response = handle.join().expect("client finishes its request");
         assert!(response.contains("server_overloaded"), "{response}");
         let _ = std::fs::remove_file(path);
